@@ -1,0 +1,15 @@
+[project]
+name = "jarvis"
+version = "0.1.0"
+description = "Personal always-on voice assistant for the Mac mini"
+requires-python = ">=3.11"
+dependencies = [
+    "anthropic>=0.90",
+    "openai>=2.0",          # only used when llm.provider = openai_compatible
+    "pyyaml>=6.0",
+    "python-dotenv>=1.0",
+    "rich>=13.0",
+]
+
+[tool.setuptools]
+packages = { find = { include = ["src*"] } }

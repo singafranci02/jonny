@@ -1,0 +1,79 @@
+# ============================================================
+# Jarvis configuration — swap models/providers here, not in code
+# ============================================================
+
+llm:
+  # "anthropic" (default, Claude Sonnet 5) or "openai_compatible"
+  # (any OpenAI-style endpoint: DeepSeek, Qwen, Kimi, GLM, local Ollama...)
+  provider: anthropic
+
+  # How many past user/assistant turns to keep in the prompt
+  max_history_turns: 20
+
+  anthropic:
+    # Credentials: ANTHROPIC_API_KEY in .env
+    models:
+      # Everyday voice turns: thinking off for lowest latency
+      default:
+        id: claude-sonnet-5
+        thinking: "off"
+        max_tokens: 512
+      # Hard turns (code, multi-step analysis): adaptive thinking
+      hard:
+        id: claude-sonnet-5
+        thinking: adaptive
+        effort: high
+        max_tokens: 2048
+      # Cheaper alternative for the default tier if you want to cut cost
+      # further: id: claude-haiku-4-5  (thinking: "off", no effort support)
+    # USD per 1M tokens (Sonnet 5 intro pricing through 2026-08-31,
+    # then 3.00 / 15.00; cache write = 1.25x input, cache read = 0.1x)
+    pricing:
+      claude-sonnet-5:  { input: 2.00, output: 10.00, cache_write: 2.50, cache_read: 0.20 }
+      claude-haiku-4-5: { input: 1.00, output: 5.00,  cache_write: 1.25, cache_read: 0.10 }
+
+  openai_compatible:
+    base_url: https://api.deepseek.com
+    api_key_env: LLM_API_KEY
+    models:
+      default: { id: deepseek-chat, max_tokens: 512, temperature: 0.6 }
+      hard:    { id: deepseek-reasoner, max_tokens: 2048, temperature: 0.6 }
+    pricing: {}   # fill in if you want cost logging on this provider
+
+routing:
+  # A turn is routed to the "hard" model if it matches any of these.
+  min_words_hard: 80
+  hard_keywords:
+    - code
+    - script
+    - function
+    - refactor
+    - debug
+    - regex
+    - sql
+    - analyze
+    - analysis
+    - compare
+    - plan out
+    - step by step
+    - architecture
+    - spreadsheet
+    - calculate
+
+persona:
+  name: Jarvis
+  # Keep this file byte-stable: it is the cached prompt prefix.
+  system_prompt_file: prompts/system.md
+
+# --- placeholders for later phases ---
+stt:
+  model: large-v3-turbo
+tts:
+  engine: kokoro
+  fallback: say
+memory:
+  backend: mem0
+knowledge:
+  folder: knowledge
+  embed_model: nomic-embed-text
+  vector_store: chroma

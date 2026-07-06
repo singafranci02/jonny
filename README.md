@@ -1,0 +1,55 @@
+# Jarvis — personal voice assistant (Mac mini)
+
+A private, always-available voice assistant: local STT/TTS/memory/RAG, with only
+the LLM calls going to a paid API.
+
+**LLM:** Claude **Sonnet 5** (`claude-sonnet-5`) — near-Opus-4.8 quality at
+$2/$10 per 1M tokens (intro pricing through 2026-08-31, then $3/$15), and the
+cached system prompt bills at ~$0.20/1M on repeat turns. Swappable to any
+OpenAI-compatible provider (DeepSeek, Qwen, local Ollama...) by editing
+`config.yaml` only.
+
+## Quick start (Phase 1 — text chat)
+
+```sh
+make setup                 # venv + deps, copies .env.example -> .env
+# put ANTHROPIC_API_KEY=sk-ant-... in .env
+make run                   # interactive chat
+make test-once             # one scripted turn (smoke test)
+```
+
+Each reply prints the model used, token counts (incl. cache read/write), the
+turn cost, and the running session total.
+
+## Model routing
+
+Every turn defaults to Sonnet 5 with thinking **off** (fast, cheap voice
+replies). A keyword/length heuristic (`routing:` in `config.yaml`) promotes
+hard turns (code, multi-step analysis) to Sonnet 5 with **adaptive thinking +
+high effort**. To cut cost further, point the `default` tier at
+`claude-haiku-4-5` in `config.yaml`.
+
+## Swapping the LLM provider
+
+Set `llm.provider: openai_compatible` in `config.yaml`, fill in `base_url` +
+model ids, and put the key in `.env` (`LLM_API_KEY`). No code changes.
+
+## Build phases
+
+1. **Text loop** (this) — CLI chat, routing, cost logging ✅
+2. **Voice I/O** — faster-whisper/RealtimeSTT in, Kokoro (fallback `say`) out
+3. **Memory** — Mem0: retrieve before / extract-and-write after each turn
+4. **Knowledge/RAG** — `knowledge/` folder → Ollama embeddings → Chroma
+5. **Wake word + polish** — openWakeWord, LaunchAgent, graceful fallbacks
+
+## Layout
+
+```
+config.yaml          models, routing, pricing — the one file you edit
+prompts/system.md    persona (cached prompt prefix — keep byte-stable)
+src/llm/             LLMClient interface + anthropic / openai_compatible backends
+src/context.py       prompt assembly (memory/knowledge slots ready for Phases 3-4)
+src/main.py          async chat loop
+knowledge/           drop notes/PDFs here (Phase 4)
+data/                vector DB + memory store (gitignored)
+```
