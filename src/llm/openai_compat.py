@@ -19,7 +19,8 @@ class OpenAICompatibleLLM(LLMClient):
         ocfg = cfg["llm"]["openai_compatible"]
         self.models = ocfg["models"]
         self.pricing = ocfg.get("pricing", {})
-        api_key = os.environ.get(ocfg.get("api_key_env", "LLM_API_KEY"), "")
+        # local endpoints (Ollama) ignore the key, but the SDK requires one
+        api_key = os.environ.get(ocfg.get("api_key_env", "LLM_API_KEY")) or "not-needed"
         self.client = AsyncOpenAI(base_url=ocfg["base_url"], api_key=api_key)
 
     async def chat(

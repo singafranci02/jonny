@@ -36,6 +36,7 @@ class Session:
         self.conversation = Conversation(self.cfg["llm"].get("max_history_turns", 20))
         self.total_cost = 0.0
         self._writebacks: set[asyncio.Task] = set()
+        self._fallback_llm = None
         self._watcher = None
         if self.cfg.get("knowledge", {}).get("watch", True):
             from .config import ROOT
@@ -54,9 +55,19 @@ class Session:
         self.conversation.add_user(
             build_user_content(user_message, memories=memories, knowledge=knowledge)
         )
-        resp = await self.llm.chat(
-            self.system_prompt, self.conversation.messages, tier=tier
-        )
+        try:
+            resp = await self.llm.chat(
+                self.system_prompt, self.conversation.messages, tier=tier
+            )
+        except Exception:
+            fallback = self._local_fallback()
+            if fallback is None:
+                self.conversation.messages.pop()  # keep history consistent
+                raise
+            console.print("[yellow]cloud API failed — using local model[/yellow]")
+            resp = await fallback.chat(
+                self.system_prompt, self.conversation.messages, tier="default"
+            )
         self.conversation.add_assistant(resp.text)
         if resp.cost_usd is not None:
             self.total_cost += resp.cost_usd
@@ -68,6 +79,30 @@ class Session:
         self._writebacks.add(t)
         t.add_done_callback(self._writebacks.discard)
         return resp
+
+    def _local_fallback(self):
+        """Ollama-backed LLM used when the cloud API errors; None if disabled."""
+        fb = self.cfg["llm"].get("local_fallback", {})
+        if not fb.get("enabled"):
+            return None
+        if self._fallback_llm is None:
+            from .llm.openai_compat import OpenAICompatibleLLM
+
+            model = {"id": fb.get("model", "llama3.2:3b"), "max_tokens": 512}
+            self._fallback_llm = OpenAICompatibleLLM(
+                {
+                    "llm": {
+                        "openai_compatible": {
+                            "base_url": fb.get(
+                                "ollama_url", "http://localhost:11434/v1"
+                            ),
+                            "api_key_env": "OLLAMA_API_KEY",  # unused; any string works
+                            "models": {"default": model, "hard": model},
+                        }
+                    }
+                }
+            )
+        return self._fallback_llm
 
     async def flush(self) -> None:
         """Wait for pending memory write-backs (call before process exit)."""
@@ -119,23 +154,30 @@ async def repl(session: Session) -> None:
 async def voice_loop(session: Session) -> None:
     from .stt import make_stt_engine
     from .tts import make_tts_engine
+    from .wakeword import TranscriptGate
 
     console.print("[dim]loading speech-to-text model (first run downloads it)...[/dim]")
     loop = asyncio.get_event_loop()
     stt = await loop.run_in_executor(None, make_stt_engine, session.cfg)
     tts = await loop.run_in_executor(None, make_tts_engine, session.cfg)
-    console.print(
-        Panel(
-            "Jarvis — voice mode\nSpeak when ready. Ctrl-C to exit.",
-            style="cyan",
-        )
+    gate = TranscriptGate(session.cfg)
+    hint = (
+        f"Say \"{session.cfg.get('wakeword', {}).get('phrase', 'hey jarvis')}\" to start."
+        if gate.enabled
+        else "Speak when ready."
     )
+    console.print(Panel(f"Jarvis — voice mode\n{hint} Ctrl-C to exit.", style="cyan"))
     try:
         while True:
             console.print("[dim]listening...[/dim]")
-            user_message = await loop.run_in_executor(None, stt.listen)
-            if not user_message:
+            transcript = await loop.run_in_executor(None, stt.listen)
+            if not transcript:
                 continue
+            respond, user_message = gate.should_respond(transcript)
+            if not respond:
+                console.print(f"[dim]ignored (no wake phrase): {transcript}[/dim]")
+                continue
+            gate.mark_exchange()
             console.print(f"[bold green]you>[/bold green] {user_message}")
             try:
                 resp = await session.turn(user_message)
@@ -148,6 +190,7 @@ async def voice_loop(session: Session) -> None:
             console.print(f"[bold cyan]jarvis>[/bold cyan] {resp.text}")
             session.print_usage_line(resp)
             await loop.run_in_executor(None, tts.speak, resp.text)
+            gate.mark_exchange()  # window starts when Jarvis finishes talking
     except (KeyboardInterrupt, asyncio.CancelledError):
         pass
     finally:

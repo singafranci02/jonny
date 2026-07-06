@@ -46,7 +46,36 @@ model ids, and put the key in `.env` (`LLM_API_KEY`). No code changes.
 2. **Voice I/O** — faster-whisper/RealtimeSTT in, Kokoro (fallback `say`) out ✅
 3. **Memory** — Mem0: retrieve before / extract-and-write after each turn ✅
 4. **Knowledge/RAG** — `knowledge/` folder → Ollama embeddings → Chroma ✅
-5. **Wake word + polish** — openWakeWord, LaunchAgent, graceful fallbacks
+5. **Wake word + polish** — transcript gate, LaunchAgent, local fallback ✅
+
+## Wake word ("hey jarvis")
+
+In voice mode Jarvis transcribes everything locally but only responds when
+the transcript contains the wake phrase — or within 60s of the last
+exchange, so follow-up questions don't need it repeated. Tune under
+`wakeword:` in `config.yaml`, or set `enabled: false` to respond to
+everything. (openWakeWord was the original plan but is unmaintained and
+silently broken on numpy 2.x; gating on the Whisper transcript is more
+accurate anyway.)
+
+## Always on
+
+```sh
+make install-agent     # launchd starts Jarvis on login and keeps it alive
+tail -f data/jarvis.log
+make uninstall-agent
+```
+
+macOS will ask for microphone permission for the python binary on first
+launch. If the agent shows no mic prompt, run `make voice` once in a
+terminal first and grant it there.
+
+## Graceful degradation
+
+- Cloud API down → the turn retries on a local Ollama model
+  (`ollama pull llama3.2:3b` once to enable; `llm.local_fallback` in config).
+- Kokoro fails to load → speech falls back to macOS `say`.
+- Memory extraction failures log and never break a turn.
 
 ## Memory
 
@@ -93,7 +122,9 @@ src/stt/             STTEngine interface + RealtimeSTT (faster-whisper) wrapper
 src/tts/             TTSEngine interface + Kokoro and macOS `say` backends
 src/memory/          MemoryStore interface + Mem0 backend + CLI
 src/knowledge/       KnowledgeIndex: chunker, Ollama embeddings, Chroma, watcher
+src/wakeword/        transcript gate (wake phrase + conversation window)
 src/context.py       prompt assembly (persona + memories + knowledge + history)
+scripts/             LaunchAgent plist template
 src/main.py          async chat + voice loops
 knowledge/           drop notes/PDFs here (Phase 4)
 data/                vector DB + memory store (gitignored)

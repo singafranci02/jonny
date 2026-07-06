@@ -4,7 +4,7 @@ VENV := .venv
 PIP := $(VENV)/bin/pip
 PY := $(VENV)/bin/python
 
-.PHONY: setup setup-voice run chat voice memory ingest test-once clean
+.PHONY: setup setup-voice run chat voice memory ingest install-agent uninstall-agent test-once clean
 
 setup:
 	$(PYTHON) -m venv $(VENV)
@@ -34,6 +34,22 @@ memory:
 # index the knowledge/ folder (incremental; ARGS="--force" to re-embed all)
 ingest:
 	$(PY) -m src.knowledge.cli $(ARGS)
+
+AGENT_ID := com.francescotomatis.jarvis
+AGENT_PLIST := $(HOME)/Library/LaunchAgents/$(AGENT_ID).plist
+
+# start Jarvis on login and keep it alive (logs -> data/jarvis.log)
+install-agent:
+	mkdir -p $(HOME)/Library/LaunchAgents
+	sed "s|__ROOT__|$(CURDIR)|g" scripts/$(AGENT_ID).plist > $(AGENT_PLIST)
+	launchctl unload $(AGENT_PLIST) 2>/dev/null || true
+	launchctl load $(AGENT_PLIST)
+	@echo "Installed. Watch it: tail -f data/jarvis.log"
+
+uninstall-agent:
+	launchctl unload $(AGENT_PLIST) 2>/dev/null || true
+	rm -f $(AGENT_PLIST)
+	@echo "Removed."
 
 test-once:
 	$(PY) -m src.main --once "Say hello in one short sentence."

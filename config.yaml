@@ -32,6 +32,13 @@ llm:
       claude-sonnet-5:  { input: 2.00, output: 10.00, cache_write: 2.50, cache_read: 0.20 }
       claude-haiku-4-5: { input: 1.00, output: 5.00,  cache_write: 1.25, cache_read: 0.10 }
 
+  # If the cloud API fails, retry the turn on a local Ollama model
+  # (only if you've pulled it: `ollama pull llama3.2:3b`)
+  local_fallback:
+    enabled: true
+    model: llama3.2:3b
+    ollama_url: http://localhost:11434/v1
+
   openai_compatible:
     base_url: https://api.deepseek.com
     api_key_env: LLM_API_KEY
@@ -59,6 +66,12 @@ routing:
     - architecture
     - spreadsheet
     - calculate
+
+wakeword:
+  enabled: true             # require the phrase before responding (voice mode)
+  phrase: hey jarvis
+  aliases: [jarvis, hey travis, hey jervis]   # common mis-transcriptions
+  active_window: 60         # seconds after an exchange where no phrase is needed
 
 persona:
   name: Jarvis
