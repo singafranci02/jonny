@@ -45,7 +45,7 @@ model ids, and put the key in `.env` (`LLM_API_KEY`). No code changes.
 1. **Text loop** — CLI chat, routing, cost logging ✅
 2. **Voice I/O** — faster-whisper/RealtimeSTT in, Kokoro (fallback `say`) out ✅
 3. **Memory** — Mem0: retrieve before / extract-and-write after each turn ✅
-4. **Knowledge/RAG** — `knowledge/` folder → Ollama embeddings → Chroma
+4. **Knowledge/RAG** — `knowledge/` folder → Ollama embeddings → Chroma ✅
 5. **Wake word + polish** — openWakeWord, LaunchAgent, graceful fallbacks
 
 ## Memory
@@ -66,6 +66,23 @@ make memory ARGS="forget <id>"     # or ARGS="forget --all"
 Requires Ollama running (`brew services start ollama`) with
 `ollama pull nomic-embed-text` done once.
 
+## Knowledge (RAG over your documents)
+
+Drop `.md` / `.txt` / `.pdf` files into `knowledge/`. They get chunked,
+embedded locally (Ollama), and stored in Chroma under `data/knowledge/`.
+Relevant chunks are injected into every turn with their source file, and
+Jarvis names the file when it uses one ("according to your
+mareluna-project notes...").
+
+```sh
+make ingest                    # incremental index (only new/changed files)
+make ingest ARGS="--force"     # re-embed everything
+make ingest ARGS='--search "tide app"'   # test retrieval
+```
+
+While Jarvis runs, a file watcher re-indexes automatically ~2s after you
+save a file into `knowledge/`; it also catches up at startup.
+
 ## Layout
 
 ```
@@ -75,7 +92,8 @@ src/llm/             LLMClient interface + anthropic / openai_compatible backend
 src/stt/             STTEngine interface + RealtimeSTT (faster-whisper) wrapper
 src/tts/             TTSEngine interface + Kokoro and macOS `say` backends
 src/memory/          MemoryStore interface + Mem0 backend + CLI
-src/context.py       prompt assembly (knowledge slot ready for Phase 4)
+src/knowledge/       KnowledgeIndex: chunker, Ollama embeddings, Chroma, watcher
+src/context.py       prompt assembly (persona + memories + knowledge + history)
 src/main.py          async chat + voice loops
 knowledge/           drop notes/PDFs here (Phase 4)
 data/                vector DB + memory store (gitignored)

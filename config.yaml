@@ -90,8 +90,14 @@ memory:
   ollama_url: http://localhost:11434
   data_dir: data/mem0
 
-# --- placeholder for Phase 4 ---
 knowledge:
-  folder: knowledge
+  backend: chroma           # chroma | none
+  folder: knowledge         # drop .md/.txt/.pdf files here
+  top_k: 4                  # chunks injected per turn
+  max_distance: 0.75        # cosine distance cutoff; higher = looser matching
+  chunk_size: 1500          # chars per chunk
+  chunk_overlap: 200
   embed_model: nomic-embed-text
-  vector_store: chroma
+  ollama_url: http://localhost:11434
+  data_dir: data/knowledge
+  watch: true               # re-index automatically when files change

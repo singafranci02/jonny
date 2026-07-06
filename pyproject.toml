@@ -12,6 +12,8 @@ dependencies = [
     "mem0ai>=2.0",
     "chromadb>=1.0",
     "ollama>=0.4",
+    "pypdf>=5.0",
+    "watchdog>=5.0",
 ]
 
 [project.optional-dependencies]

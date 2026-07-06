@@ -18,6 +18,8 @@ from .config import load_config, load_system_prompt
 from .context import Conversation, build_user_content
 from .llm import make_llm_client
 from .llm.base import LLMResponse
+from .knowledge import make_knowledge_index
+from .knowledge.watcher import start_watcher
 from .llm.router import pick_tier
 from .memory import make_memory_store
 
@@ -30,16 +32,28 @@ class Session:
         self.system_prompt = load_system_prompt(self.cfg)
         self.llm = make_llm_client(self.cfg)
         self.memory = make_memory_store(self.cfg)
+        self.knowledge = make_knowledge_index(self.cfg)
         self.conversation = Conversation(self.cfg["llm"].get("max_history_turns", 20))
         self.total_cost = 0.0
         self._writebacks: set[asyncio.Task] = set()
+        self._watcher = None
+        if self.cfg.get("knowledge", {}).get("watch", True):
+            from .config import ROOT
+
+            folder = ROOT / self.cfg["knowledge"].get("folder", "knowledge")
+            self.knowledge.ingest()  # catch up on files added while offline
+            self._watcher = start_watcher(self.knowledge, folder)
 
     async def turn(self, user_message: str) -> LLMResponse:
         loop = asyncio.get_event_loop()
         tier = pick_tier(user_message, self.cfg.get("routing", {}))
         memories = await loop.run_in_executor(None, self.memory.search, user_message)
-        # Phase 4 will pass knowledge= here too.
-        self.conversation.add_user(build_user_content(user_message, memories=memories))
+        knowledge = await loop.run_in_executor(
+            None, self.knowledge.search, user_message
+        )
+        self.conversation.add_user(
+            build_user_content(user_message, memories=memories, knowledge=knowledge)
+        )
         resp = await self.llm.chat(
             self.system_prompt, self.conversation.messages, tier=tier
         )
