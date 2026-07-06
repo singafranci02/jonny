@@ -65,12 +65,23 @@ persona:
   # Keep this file byte-stable: it is the cached prompt prefix.
   system_prompt_file: prompts/system.md
 
-# --- placeholders for later phases ---
 stt:
-  model: large-v3-turbo
+  engine: realtime_stt
+  model: large-v3-turbo     # faster-whisper model; try "small.en" if too slow
+  language: en              # "" for auto-detect
+  device: cpu               # ctranslate2 has no Metal backend; cpu + int8 is the Apple Silicon path
+  compute_type: int8
+  silence_duration: 0.8     # seconds of silence that end an utterance
+
 tts:
-  engine: kokoro
-  fallback: say
+  engine: kokoro            # kokoro | say (auto-falls back to say on failure)
+  voice: af_heart           # kokoro voice
+  speed: 1.0
+  lang_code: a              # 'a' = American English
+  say_voice: ""             # macOS say fallback; "" = system default
+  say_rate: 190
+
+# --- placeholders for later phases ---
 memory:
   backend: mem0
 knowledge:

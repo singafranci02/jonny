@@ -1,7 +1,8 @@
-"""Phase 1: text chat loop with model routing and per-turn cost logging.
+"""Jarvis entry point: text chat (Phase 1) and voice loop (Phase 2).
 
-    python -m src.main                # interactive REPL
+    python -m src.main                # interactive text REPL
     python -m src.main --once "hi"    # single turn, then exit (for testing)
+    python -m src.main --voice        # mic -> STT -> LLM -> TTS -> speaker
 """
 
 from __future__ import annotations
@@ -83,6 +84,46 @@ async def repl(session: Session) -> None:
     console.print(f"[dim]session total: ${session.total_cost:.6f}[/dim]")
 
 
+async def voice_loop(session: Session) -> None:
+    from .stt import make_stt_engine
+    from .tts import make_tts_engine
+
+    console.print("[dim]loading speech-to-text model (first run downloads it)...[/dim]")
+    loop = asyncio.get_event_loop()
+    stt = await loop.run_in_executor(None, make_stt_engine, session.cfg)
+    tts = await loop.run_in_executor(None, make_tts_engine, session.cfg)
+    console.print(
+        Panel(
+            "Jarvis — voice mode\nSpeak when ready. Ctrl-C to exit.",
+            style="cyan",
+        )
+    )
+    try:
+        while True:
+            console.print("[dim]listening...[/dim]")
+            user_message = await loop.run_in_executor(None, stt.listen)
+            if not user_message:
+                continue
+            console.print(f"[bold green]you>[/bold green] {user_message}")
+            try:
+                resp = await session.turn(user_message)
+            except Exception as e:
+                console.print(f"[red]error:[/red] {e}")
+                await loop.run_in_executor(
+                    None, tts.speak, "Sorry, I hit an error talking to the model."
+                )
+                continue
+            console.print(f"[bold cyan]jarvis>[/bold cyan] {resp.text}")
+            session.print_usage_line(resp)
+            await loop.run_in_executor(None, tts.speak, resp.text)
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        pass
+    finally:
+        tts.stop()
+        stt.shutdown()
+        console.print(f"\n[dim]session total: ${session.total_cost:.6f}[/dim]")
+
+
 async def once(session: Session, message: str) -> int:
     try:
         resp = await session.turn(message)
@@ -97,11 +138,18 @@ async def once(session: Session, message: str) -> int:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Jarvis text chat")
     parser.add_argument("--once", metavar="MSG", help="send one message and exit")
+    parser.add_argument("--voice", action="store_true", help="voice mode (mic + speaker)")
     args = parser.parse_args()
 
     session = Session()
     if args.once:
         sys.exit(asyncio.run(once(session, args.once)))
+    if args.voice:
+        try:
+            asyncio.run(voice_loop(session))
+        except KeyboardInterrupt:
+            pass
+        return
     asyncio.run(repl(session))
 
 

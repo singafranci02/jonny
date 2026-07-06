@@ -9,14 +9,20 @@ cached system prompt bills at ~$0.20/1M on repeat turns. Swappable to any
 OpenAI-compatible provider (DeepSeek, Qwen, local Ollama...) by editing
 `config.yaml` only.
 
-## Quick start (Phase 1 — text chat)
+## Quick start
 
 ```sh
-make setup                 # venv + deps, copies .env.example -> .env
+make setup-voice           # venv + deps + brew portaudio/espeak-ng
 # put ANTHROPIC_API_KEY=sk-ant-... in .env
-make run                   # interactive chat
+make voice                 # talk to it (mic + speaker); Ctrl-C to exit
+make chat                  # text-only REPL
 make test-once             # one scripted turn (smoke test)
 ```
+
+First `make voice` run downloads the Whisper STT model and Kokoro TTS
+weights, and macOS will ask for microphone permission for your terminal.
+If Kokoro fails to load for any reason, Jarvis speaks through the built-in
+macOS `say` voice instead.
 
 Each reply prints the model used, token counts (incl. cache read/write), the
 turn cost, and the running session total.
@@ -36,8 +42,8 @@ model ids, and put the key in `.env` (`LLM_API_KEY`). No code changes.
 
 ## Build phases
 
-1. **Text loop** (this) — CLI chat, routing, cost logging ✅
-2. **Voice I/O** — faster-whisper/RealtimeSTT in, Kokoro (fallback `say`) out
+1. **Text loop** — CLI chat, routing, cost logging ✅
+2. **Voice I/O** — faster-whisper/RealtimeSTT in, Kokoro (fallback `say`) out ✅
 3. **Memory** — Mem0: retrieve before / extract-and-write after each turn
 4. **Knowledge/RAG** — `knowledge/` folder → Ollama embeddings → Chroma
 5. **Wake word + polish** — openWakeWord, LaunchAgent, graceful fallbacks
@@ -48,8 +54,10 @@ model ids, and put the key in `.env` (`LLM_API_KEY`). No code changes.
 config.yaml          models, routing, pricing — the one file you edit
 prompts/system.md    persona (cached prompt prefix — keep byte-stable)
 src/llm/             LLMClient interface + anthropic / openai_compatible backends
+src/stt/             STTEngine interface + RealtimeSTT (faster-whisper) wrapper
+src/tts/             TTSEngine interface + Kokoro and macOS `say` backends
 src/context.py       prompt assembly (memory/knowledge slots ready for Phases 3-4)
-src/main.py          async chat loop
+src/main.py          async chat + voice loops
 knowledge/           drop notes/PDFs here (Phase 4)
 data/                vector DB + memory store (gitignored)
 ```
