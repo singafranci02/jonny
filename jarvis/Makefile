@@ -4,7 +4,7 @@ VENV := .venv
 PIP := $(VENV)/bin/pip
 PY := $(VENV)/bin/python
 
-.PHONY: setup setup-voice run chat voice memory ingest install-agent uninstall-agent test-once clean
+.PHONY: setup setup-voice run chat voice memory ingest install-agent uninstall-agent push test-once clean
 
 setup:
 	$(PYTHON) -m venv $(VENV)
@@ -50,6 +50,13 @@ uninstall-agent:
 	launchctl unload $(AGENT_PLIST) 2>/dev/null || true
 	rm -f $(AGENT_PLIST)
 	@echo "Removed."
+
+# publish committed Jarvis work into the shared jonny repo (jarvis/ subtree)
+JONNY_REPO := $(HOME)/jonny
+push:
+	cd $(JONNY_REPO) && git pull -q && \
+	git subtree pull --prefix=jarvis $(CURDIR) main -m "Update jarvis/ from local work" && \
+	git push
 
 test-once:
 	$(PY) -m src.main --once "Say hello in one short sentence."
