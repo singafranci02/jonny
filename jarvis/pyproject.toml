@@ -1,0 +1,29 @@
+[project]
+name = "jarvis"
+version = "0.1.0"
+description = "Personal always-on voice assistant for the Mac mini"
+requires-python = ">=3.11"
+dependencies = [
+    "anthropic>=0.90",
+    "openai>=2.0",          # only used when llm.provider = openai_compatible
+    "pyyaml>=6.0",
+    "python-dotenv>=1.0",
+    "rich>=13.0",
+    "mem0ai>=2.0",
+    "chromadb>=1.0",
+    "ollama>=0.4",
+    "pypdf>=5.0",
+    "watchdog>=5.0",
+]
+
+[project.optional-dependencies]
+voice = [
+    "RealtimeSTT>=1.0",
+    "faster-whisper>=1.1",
+    "kokoro>=0.9",
+    "sounddevice>=0.5",
+    "soundfile>=0.12",
+]
+
+[tool.setuptools]
+packages = { find = { include = ["src*"] } }
