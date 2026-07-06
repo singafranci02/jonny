@@ -9,6 +9,9 @@ dependencies = [
     "pyyaml>=6.0",
     "python-dotenv>=1.0",
     "rich>=13.0",
+    "mem0ai>=2.0",
+    "chromadb>=1.0",
+    "ollama>=0.4",
 ]
 
 [project.optional-dependencies]

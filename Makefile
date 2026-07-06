@@ -4,7 +4,7 @@ VENV := .venv
 PIP := $(VENV)/bin/pip
 PY := $(VENV)/bin/python
 
-.PHONY: setup setup-voice run chat voice test-once clean
+.PHONY: setup setup-voice run chat voice memory test-once clean
 
 setup:
 	$(PYTHON) -m venv $(VENV)
@@ -26,6 +26,10 @@ chat:
 
 voice:
 	$(PY) -m src.main --voice
+
+# usage: make memory ARGS="list" | ARGS='search "grant deadline"' | ARGS='forget --all'
+memory:
+	$(PY) -m src.memory.cli $(ARGS)
 
 test-once:
 	$(PY) -m src.main --once "Say hello in one short sentence."

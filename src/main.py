@@ -19,6 +19,7 @@ from .context import Conversation, build_user_content
 from .llm import make_llm_client
 from .llm.base import LLMResponse
 from .llm.router import pick_tier
+from .memory import make_memory_store
 
 console = Console()
 
@@ -28,20 +29,36 @@ class Session:
         self.cfg = load_config()
         self.system_prompt = load_system_prompt(self.cfg)
         self.llm = make_llm_client(self.cfg)
+        self.memory = make_memory_store(self.cfg)
         self.conversation = Conversation(self.cfg["llm"].get("max_history_turns", 20))
         self.total_cost = 0.0
+        self._writebacks: set[asyncio.Task] = set()
 
     async def turn(self, user_message: str) -> LLMResponse:
+        loop = asyncio.get_event_loop()
         tier = pick_tier(user_message, self.cfg.get("routing", {}))
-        # Phase 3/4 will pass memories= / knowledge= here.
-        self.conversation.add_user(build_user_content(user_message))
+        memories = await loop.run_in_executor(None, self.memory.search, user_message)
+        # Phase 4 will pass knowledge= here too.
+        self.conversation.add_user(build_user_content(user_message, memories=memories))
         resp = await self.llm.chat(
             self.system_prompt, self.conversation.messages, tier=tier
         )
         self.conversation.add_assistant(resp.text)
         if resp.cost_usd is not None:
             self.total_cost += resp.cost_usd
+        # fact extraction happens in the background: never adds turn latency
+        task = loop.run_in_executor(
+            None, self.memory.add_turn, user_message, resp.text
+        )
+        t = asyncio.ensure_future(task)
+        self._writebacks.add(t)
+        t.add_done_callback(self._writebacks.discard)
         return resp
+
+    async def flush(self) -> None:
+        """Wait for pending memory write-backs (call before process exit)."""
+        if self._writebacks:
+            await asyncio.gather(*self._writebacks, return_exceptions=True)
 
     def print_usage_line(self, resp: LLMResponse) -> None:
         cost = f"${resp.cost_usd:.6f}" if resp.cost_usd is not None else "n/a"
@@ -81,6 +98,7 @@ async def repl(session: Session) -> None:
             continue
         console.print(f"[bold cyan]jarvis>[/bold cyan] {resp.text}")
         session.print_usage_line(resp)
+    await session.flush()
     console.print(f"[dim]session total: ${session.total_cost:.6f}[/dim]")
 
 
@@ -121,6 +139,7 @@ async def voice_loop(session: Session) -> None:
     finally:
         tts.stop()
         stt.shutdown()
+        await session.flush()
         console.print(f"\n[dim]session total: ${session.total_cost:.6f}[/dim]")
 
 
@@ -132,6 +151,7 @@ async def once(session: Session, message: str) -> int:
         return 1
     console.print(resp.text)
     session.print_usage_line(resp)
+    await session.flush()
     return 0
 
 

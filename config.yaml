@@ -81,9 +81,16 @@ tts:
   say_voice: ""             # macOS say fallback; "" = system default
   say_rate: 190
 
-# --- placeholders for later phases ---
 memory:
-  backend: mem0
+  backend: mem0             # mem0 | none
+  user_id: francesco
+  top_k: 5                  # memories injected per turn
+  extraction_llm: claude-haiku-4-5   # cheap model that distills facts after each turn
+  embed_model: nomic-embed-text      # local via Ollama, free
+  ollama_url: http://localhost:11434
+  data_dir: data/mem0
+
+# --- placeholder for Phase 4 ---
 knowledge:
   folder: knowledge
   embed_model: nomic-embed-text

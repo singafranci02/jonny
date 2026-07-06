@@ -44,9 +44,27 @@ model ids, and put the key in `.env` (`LLM_API_KEY`). No code changes.
 
 1. **Text loop** — CLI chat, routing, cost logging ✅
 2. **Voice I/O** — faster-whisper/RealtimeSTT in, Kokoro (fallback `say`) out ✅
-3. **Memory** — Mem0: retrieve before / extract-and-write after each turn
+3. **Memory** — Mem0: retrieve before / extract-and-write after each turn ✅
 4. **Knowledge/RAG** — `knowledge/` folder → Ollama embeddings → Chroma
 5. **Wake word + polish** — openWakeWord, LaunchAgent, graceful fallbacks
+
+## Memory
+
+Facts you mention get distilled by Claude Haiku after each turn (in the
+background, no added latency) and stored locally: Ollama `nomic-embed-text`
+embeddings in Chroma under `data/mem0/`. Mem0 decides ADD/UPDATE/DELETE per
+fact, so corrections supersede stale facts. Before every turn the top
+relevant memories are injected into the prompt.
+
+```sh
+make memory ARGS="list"
+make memory ARGS='search "birthday"'
+make memory ARGS='add "I prefer metric units"'
+make memory ARGS="forget <id>"     # or ARGS="forget --all"
+```
+
+Requires Ollama running (`brew services start ollama`) with
+`ollama pull nomic-embed-text` done once.
 
 ## Layout
 
@@ -56,7 +74,8 @@ prompts/system.md    persona (cached prompt prefix — keep byte-stable)
 src/llm/             LLMClient interface + anthropic / openai_compatible backends
 src/stt/             STTEngine interface + RealtimeSTT (faster-whisper) wrapper
 src/tts/             TTSEngine interface + Kokoro and macOS `say` backends
-src/context.py       prompt assembly (memory/knowledge slots ready for Phases 3-4)
+src/memory/          MemoryStore interface + Mem0 backend + CLI
+src/context.py       prompt assembly (knowledge slot ready for Phase 4)
 src/main.py          async chat + voice loops
 knowledge/           drop notes/PDFs here (Phase 4)
 data/                vector DB + memory store (gitignored)
