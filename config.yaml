@@ -3,48 +3,52 @@
 # ============================================================
 
 llm:
-  # "anthropic" (default, Claude Sonnet 5) or "openai_compatible"
-  # (any OpenAI-style endpoint: DeepSeek, Qwen, Kimi, GLM, local Ollama...)
-  provider: anthropic
-
   # How many past user/assistant turns to keep in the prompt
   max_history_turns: 20
 
-  anthropic:
-    # Credentials: ANTHROPIC_API_KEY in .env
-    models:
-      # Everyday voice turns: thinking off for lowest latency
-      default:
-        id: claude-sonnet-5
-        thinking: "off"
-        max_tokens: 512
-      # Hard turns (code, multi-step analysis): adaptive thinking
-      hard:
-        id: claude-sonnet-5
-        thinking: adaptive
-        effort: high
-        max_tokens: 2048
-      # Cheaper alternative for the default tier if you want to cut cost
-      # further: id: claude-haiku-4-5  (thinking: "off", no effort support)
-    # USD per 1M tokens (Sonnet 5 intro pricing through 2026-08-31,
-    # then 3.00 / 15.00; cache write = 1.25x input, cache read = 0.1x)
-    pricing:
-      claude-sonnet-5:  { input: 2.00, output: 10.00, cache_write: 2.50, cache_read: 0.20 }
-      claude-haiku-4-5: { input: 1.00, output: 5.00,  cache_write: 1.25, cache_read: 0.10 }
+  # Hybrid brain: each tier picks its own provider + model.
+  # provider: ollama (local, free, private) | anthropic | openai_compatible
+  tiers:
+    # Everyday voice turns: local qwen3, $0
+    default:
+      provider: ollama
+      model: qwen3:8b
+      max_tokens: 512
+    # Hard turns (code, multi-step analysis): Claude Sonnet 5
+    hard:
+      provider: anthropic
+      model: claude-sonnet-5
+      thinking: adaptive
+      effort: high
+      max_tokens: 2048
+    # Deep-research synthesis (cited reports)
+    research:
+      provider: anthropic
+      model: claude-sonnet-5
+      thinking: adaptive
+      effort: high
+      max_tokens: 4096
+    # Research page-note distillation: local, free
+    summarize:
+      provider: ollama
+      model: qwen3:8b
+      max_tokens: 700
 
-  # If the cloud API fails, retry the turn on a local Ollama model
-  # (only if you've pulled it: `ollama pull llama3.2:3b`)
-  local_fallback:
-    enabled: true
-    model: llama3.2:3b
-    ollama_url: http://localhost:11434/v1
+  ollama:
+    url: http://localhost:11434
+    keep_alive: 30m         # keep the local model resident between turns
 
+  # USD per 1M tokens (Sonnet 5 intro pricing through 2026-08-31,
+  # then 3.00 / 15.00; cache write = 1.25x input, cache read = 0.1x)
+  pricing:
+    claude-sonnet-5:  { input: 2.00, output: 10.00, cache_write: 2.50, cache_read: 0.20 }
+    claude-haiku-4-5: { input: 1.00, output: 5.00,  cache_write: 1.25, cache_read: 0.10 }
+
+  # Escape hatch: point any tier at an OpenAI-style endpoint
+  # (DeepSeek, Qwen cloud, Kimi, GLM...). Text-only, no tool calling.
   openai_compatible:
     base_url: https://api.deepseek.com
     api_key_env: LLM_API_KEY
-    models:
-      default: { id: deepseek-chat, max_tokens: 512, temperature: 0.6 }
-      hard:    { id: deepseek-reasoner, max_tokens: 2048, temperature: 0.6 }
     pricing: {}   # fill in if you want cost logging on this provider
 
 routing:
@@ -66,6 +70,10 @@ routing:
     - architecture
     - spreadsheet
     - calculate
+
+research:
+  results_per_query: 3      # search hits considered per sub-query
+  pages_per_query: 2        # pages actually read per sub-query
 
 wakeword:
   enabled: true             # require the phrase before responding (voice mode)

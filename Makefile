@@ -4,7 +4,7 @@ VENV := .venv
 PIP := $(VENV)/bin/pip
 PY := $(VENV)/bin/python
 
-.PHONY: setup setup-voice run chat voice memory ingest install-agent uninstall-agent push test-once clean
+.PHONY: setup setup-voice run chat voice memory ingest research install-agent uninstall-agent push test-once clean
 
 setup:
 	$(PYTHON) -m venv $(VENV)
@@ -17,6 +17,8 @@ setup-voice: setup
 	brew list portaudio >/dev/null 2>&1 || brew install portaudio
 	brew list espeak-ng >/dev/null 2>&1 || brew install espeak-ng
 	$(PIP) install -e ".[voice]" -q
+	ollama list | grep -q "^qwen3:8b" || ollama pull qwen3:8b
+	ollama list | grep -q "^nomic-embed-text" || ollama pull nomic-embed-text
 	@echo "Voice stack installed. Run: make voice"
 
 run: voice
@@ -34,6 +36,10 @@ memory:
 # index the knowledge/ folder (incremental; ARGS="--force" to re-embed all)
 ingest:
 	$(PY) -m src.knowledge.cli $(ARGS)
+
+# deep research: make research ARGS="best tide prediction APIs"
+research:
+	$(PY) -m src.research.cli $(ARGS)
 
 AGENT_ID := com.francescotomatis.jarvis
 AGENT_PLIST := $(HOME)/Library/LaunchAgents/$(AGENT_ID).plist

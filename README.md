@@ -1,13 +1,18 @@
 # Jarvis — personal voice assistant (Mac mini)
 
-A private, always-available voice assistant: local STT/TTS/memory/RAG, with only
-the LLM calls going to a paid API.
+A private, always-available voice assistant with a **hybrid brain**:
+everyday turns run on a **local model** (qwen3:8b via Ollama — free,
+private, offline), hard turns (code, analysis, research synthesis) go to
+**Claude Sonnet 5**. Everything else — speech, memory, documents — runs
+locally.
 
-**LLM:** Claude **Sonnet 5** (`claude-sonnet-5`) — near-Opus-4.8 quality at
-$2/$10 per 1M tokens (intro pricing through 2026-08-31, then $3/$15), and the
-cached system prompt bills at ~$0.20/1M on repeat turns. Swappable to any
-OpenAI-compatible provider (DeepSeek, Qwen, local Ollama...) by editing
-`config.yaml` only.
+Jarvis has **tools** (agent loop): web search (DuckDuckGo → Wikipedia
+fallback), page reading, date/time, exact arithmetic, and lookups into its
+own memory and knowledge stores. It also has a **deep research** mode and
+**streaming voice** with interrupts.
+
+Every tier is one block in `config.yaml` — point any of them at anthropic,
+ollama, or any OpenAI-compatible endpoint.
 
 ## Quick start
 
@@ -27,18 +32,41 @@ macOS `say` voice instead.
 Each reply prints the model used, token counts (incl. cache read/write), the
 turn cost, and the running session total.
 
-## Model routing
+## Model routing (hybrid brain)
 
-Every turn defaults to Sonnet 5 with thinking **off** (fast, cheap voice
-replies). A keyword/length heuristic (`routing:` in `config.yaml`) promotes
-hard turns (code, multi-step analysis) to Sonnet 5 with **adaptive thinking +
-high effort**. To cut cost further, point the `default` tier at
-`claude-haiku-4-5` in `config.yaml`.
+Four tiers in `config.yaml`, each with its own provider + model:
 
-## Swapping the LLM provider
+| tier | default | used for |
+|---|---|---|
+| `default` | ollama / qwen3:8b | everyday voice turns ($0) |
+| `hard` | anthropic / claude-sonnet-5 | code, multi-step analysis (keyword/length router) |
+| `research` | anthropic / claude-sonnet-5 | research planning + report synthesis |
+| `summarize` | ollama / qwen3:8b | research page-notes ($0) |
 
-Set `llm.provider: openai_compatible` in `config.yaml`, fill in `base_url` +
-model ids, and put the key in `.env` (`LLM_API_KEY`). No code changes.
+If a cloud tier fails (API down), the turn degrades to the local default
+automatically. Any tier can point at `openai_compatible` (DeepSeek, Qwen
+cloud...) — `base_url` + key in `.env`, no code changes.
+
+## Tools (agent loop)
+
+The model decides when to call: `web_search`, `fetch_page`, `get_datetime`,
+`calculate`, `search_knowledge`, `search_memory`, `remember`. Up to five
+tool rounds per turn; each call is printed, and the usage line shows
+`tools xN`.
+
+## Deep research
+
+"Hey Jarvis, research the best e-ink tablets" or:
+
+```sh
+make research ARGS='"best tide prediction APIs"'
+```
+
+Plans sub-queries (Claude) → searches and reads pages, distilling notes
+with the free local model → synthesizes a cited markdown report (Claude) →
+saves it to `knowledge/research/`, where it's auto-indexed so future
+questions answer from it. In voice mode it runs in the background and
+Jarvis announces the summary when done.
 
 ## Build phases
 
@@ -57,6 +85,14 @@ exchange, so follow-up questions don't need it repeated. Tune under
 everything. (openWakeWord was the original plan but is unmaintained and
 silently broken on numpy 2.x; gating on the Whisper transcript is more
 accurate anyway.)
+
+## Streaming voice + interrupts
+
+Replies are spoken sentence-by-sentence while the model is still
+generating, so Jarvis starts talking after the first sentence. The mic
+stays open during playback: say **"stop"** to cut it off, or barge in with
+the wake phrase to ask something new. An echo filter (fuzzy match against
+what Jarvis just said) keeps it from hearing itself.
 
 ## Always on
 
