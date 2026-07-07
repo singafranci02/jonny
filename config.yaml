@@ -96,8 +96,9 @@ stt:
 
 tts:
   engine: kokoro            # kokoro | say (auto-falls back to say on failure)
-  voice: af_heart           # kokoro voice
-  speed: 1.0
+  voice: am_onyx            # deep, warm American male. Others: am_michael, am_adam,
+                            # am_eric, am_fenrir, am_liam / female af_heart, af_bella...
+  speed: 0.95               # <1 = more relaxed cadence
   lang_code: a              # 'a' = American English
   say_voice: ""             # macOS say fallback; "" = system default
   say_rate: 190
