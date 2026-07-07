@@ -1,7 +1,8 @@
-"""OpenAI-compatible backend: DeepSeek, Qwen, Kimi, GLM, local Ollama...
+"""OpenAI-compatible escape hatch: DeepSeek, Qwen cloud, Kimi, GLM...
 
-Selected via config.yaml (llm.provider: openai_compatible). Point
-base_url + model ids at any OpenAI-style endpoint; no code changes.
+Point a tier at provider: openai_compatible in config.yaml to use it.
+Text chat only (no tool calling) — the anthropic/ollama backends are the
+first-class citizens.
 """
 
 from __future__ import annotations
@@ -17,7 +18,6 @@ from .cost import compute_cost
 class OpenAICompatibleLLM(LLMClient):
     def __init__(self, cfg: dict):
         ocfg = cfg["llm"]["openai_compatible"]
-        self.models = ocfg["models"]
         self.pricing = ocfg.get("pricing", {})
         # local endpoints (Ollama) ignore the key, but the SDK requires one
         api_key = os.environ.get(ocfg.get("api_key_env", "LLM_API_KEY")) or "not-needed"
@@ -27,13 +27,19 @@ class OpenAICompatibleLLM(LLMClient):
         self,
         system: str,
         messages: list[dict],
+        model_cfg: dict,
         tier: str = "default",
+        tools: list | None = None,
+        on_text=None,
     ) -> LLMResponse:
-        m = self.models[tier]
+        if tools:
+            raise NotImplementedError(
+                "tool calling is not implemented for openai_compatible"
+            )
         response = await self.client.chat.completions.create(
-            model=m["id"],
-            max_tokens=m.get("max_tokens", 512),
-            temperature=m.get("temperature", 0.6),
+            model=model_cfg["model"],
+            max_tokens=model_cfg.get("max_tokens", 512),
+            temperature=model_cfg.get("temperature", 0.6),
             # System prompt first and byte-identical across calls, so
             # providers with automatic prefix caching (DeepSeek etc.) hit it.
             messages=[{"role": "system", "content": system}, *messages],
@@ -43,7 +49,7 @@ class OpenAICompatibleLLM(LLMClient):
 
         result = LLMResponse(
             text=(response.choices[0].message.content or "").strip(),
-            model=m["id"],
+            model=model_cfg["model"],
             tier=tier,
             stop_reason=response.choices[0].finish_reason,
             input_tokens=(usage.prompt_tokens or 0) - cached,
@@ -52,3 +58,6 @@ class OpenAICompatibleLLM(LLMClient):
         )
         result.cost_usd = compute_cost(result, self.pricing)
         return result
+
+    def tool_result_messages(self, response, results):
+        raise NotImplementedError

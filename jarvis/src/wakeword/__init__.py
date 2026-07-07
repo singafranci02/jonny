@@ -44,5 +44,9 @@ class TranscriptGate:
             return True, transcript
         return False, transcript
 
+    def contains_phrase(self, transcript: str) -> bool:
+        norm = self._norm(transcript)
+        return any(p in norm for p in self.phrases)
+
     def mark_exchange(self) -> None:
         self._last_exchange = time.monotonic()

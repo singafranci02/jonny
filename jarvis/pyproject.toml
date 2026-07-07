@@ -14,6 +14,8 @@ dependencies = [
     "ollama>=0.4",
     "pypdf>=5.0",
     "watchdog>=5.0",
+    "ddgs>=9.0",
+    "trafilatura>=2.0",
 ]
 
 [project.optional-dependencies]
