@@ -4,7 +4,7 @@ VENV := .venv
 PIP := $(VENV)/bin/pip
 PY := $(VENV)/bin/python
 
-.PHONY: setup setup-voice run chat voice memory ingest research serve install-agent uninstall-agent install-web uninstall-web push test-once clean
+.PHONY: setup setup-voice run chat voice memory ingest research serve install-agent uninstall-agent install-web uninstall-web install-tunnel uninstall-tunnel push test-once clean
 
 setup:
 	$(PYTHON) -m venv $(VENV)
@@ -81,6 +81,25 @@ install-web:
 uninstall-web:
 	launchctl unload $(WEB_AGENT_PLIST) 2>/dev/null || true
 	rm -f $(WEB_AGENT_PLIST)
+	@echo "Removed."
+
+TUNNEL_AGENT_ID := com.francescotomatis.jarvis-tunnel
+TUNNEL_AGENT_PLIST := $(HOME)/Library/LaunchAgents/$(TUNNEL_AGENT_ID).plist
+
+# keep the ngrok tunnel up on login so the permanent URL is always served.
+# usage: make install-tunnel NGROK_URL=your-domain.ngrok-free.app
+install-tunnel:
+	@test -n "$(NGROK_URL)" || (echo 'Pass your reserved domain: make install-tunnel NGROK_URL=xxx.ngrok-free.app'; exit 1)
+	mkdir -p $(HOME)/Library/LaunchAgents
+	sed -e "s|__ROOT__|$(CURDIR)|g" -e "s|__NGROK_URL__|$(NGROK_URL)|g" \
+		scripts/$(TUNNEL_AGENT_ID).plist > $(TUNNEL_AGENT_PLIST)
+	launchctl unload $(TUNNEL_AGENT_PLIST) 2>/dev/null || true
+	launchctl load $(TUNNEL_AGENT_PLIST)
+	@echo "Tunnel runs on login now. Public URL: https://$(NGROK_URL)"
+
+uninstall-tunnel:
+	launchctl unload $(TUNNEL_AGENT_PLIST) 2>/dev/null || true
+	rm -f $(TUNNEL_AGENT_PLIST)
 	@echo "Removed."
 
 # publish committed Jarvis work into the shared jonny repo (jarvis/ subtree)

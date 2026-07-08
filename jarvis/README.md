@@ -141,16 +141,21 @@ make install-web               # brain auto-starts on login and stays up
 ```
 
 Then a **stable tunnel** so the URL never changes (invisible plumbing — only
-Vercel uses it). Easiest free option is Tailscale:
+Vercel uses it). Use ngrok (a plain background program — unlike the Mac App
+Store Tailscale, whose sandbox can't run Funnel):
 
 ```sh
-brew install --cask tailscale  # sign in once (e.g. Google)
-tailscale funnel --bg 8765     # permanent https://<mac>.<tailnet>.ts.net URL
+brew install ngrok
+# 1. sign up free at ngrok.com, copy your authtoken:
+ngrok config add-authtoken <token>
+# 2. in the ngrok dashboard -> Domains, create a free static domain, then:
+make install-tunnel NGROK_URL=your-domain.ngrok-free.app
 ```
 
-In Vercel (once): set `MAC_BRAIN_URL` to that ts.net URL and `JARVIS_TOKEN` to
-the value from `.env`, then redeploy. Point **jonnybot.xyz** at the Vercel
-project (its DNS is already on Vercel) so you just visit jonnybot.xyz to talk.
+In Vercel (once): set `MAC_BRAIN_URL` to `https://your-domain.ngrok-free.app`
+and `JARVIS_TOKEN` to the value from `.env`, then redeploy. Point
+**jonnybot.xyz** at the Vercel project (its DNS is already on Vercel) so you
+just visit jonnybot.xyz to talk.
 
 After that the Mac (always on) starts everything itself — no terminals, no
 Vercel edits. Quick manual alternative for testing: `make serve` +
