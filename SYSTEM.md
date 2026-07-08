@@ -40,14 +40,23 @@ sends your voice to the Mac and plays back what the Mac produces.
 
 ---
 
-## 2. The two faces
+## 2. The three faces
 
 ### Face A — the Mac (`make voice`)
 Runs entirely on the Mac. Microphone → local Whisper → the brain → Kokoro
 voice out. Has a wake word ("hey Jarvis") and interruption ("stop"). This is
 `src/main.py`'s `voice_loop`.
 
-### Face B — the website (Jonny)
+### Face B — the native client (`make talk`) — fastest
+A thin Python app (`clients/voice_cli.py`) that opens a WebSocket **straight
+to the brain** — no browser, no Vercel, no ngrok. Over **Tailscale** from your
+laptop/phone (`make talk`), or localhost at the Mac (`make talk LOCAL=1`,
+lowest latency of all). It streams your mic up and plays the reply back; the
+Mac does all the VAD/turn-taking. Measured ~2.4s to first word over Tailscale.
+Auth: it mints the same short-lived ticket the website uses, from
+`JARVIS_TOKEN`. This is the daily-driver face.
+
+### Face C — the website (Jonny)
 A small Next.js app deployed on **Vercel** (repo: `github.com/singafranci02/jonny`,
 the whole Jarvis brain lives inside it under `jarvis/`). It is a **thin
 client**: every request is forwarded to the Mac. It holds no AI itself.
@@ -289,7 +298,9 @@ Jarvis/  (the brain)
     context.py           assembles profile + memories + knowledge into the prompt
     wakeword/            "hey jarvis" gate + conversation window
     audio/echo.py        stops it hearing its own voice
-  scripts/               LaunchAgent service files + ngrok tunnel
+  clients/voice_cli.py   native voice client (make talk) — fastest face
+  src/ops/               watchdog + doctor/status
+  scripts/               LaunchAgent files, ngrok tunnel, mac-liveness.sh
 
 jonny/  (the website — same repo, deployed on Vercel)
   app/page.tsx           the orb + voice-first UI
