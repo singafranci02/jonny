@@ -20,7 +20,7 @@ from .llm import make_llm_client
 from .llm.base import LLMResponse
 from .knowledge import make_knowledge_index
 from .knowledge.watcher import start_watcher
-from .llm.router import detect_research, is_simple, pick_tier
+from .llm.router import detect_research, is_simple, is_smalltalk, pick_tier
 from .memory import make_memory_store
 
 console = Console()
@@ -64,11 +64,17 @@ class Session:
         tier = pick_tier(user_message, self.cfg.get("routing", {}))
         from .profile import profile_for_prompt
 
-        memories, knowledge, profile = await asyncio.gather(
-            loop.run_in_executor(None, self.memory.search, user_message),
-            loop.run_in_executor(None, self.knowledge.search, user_message),
-            loop.run_in_executor(None, profile_for_prompt, self.cfg),
-        )
+        smalltalk = is_smalltalk(user_message)
+        if smalltalk:
+            # greetings get no injected notes/memories — just talk
+            memories, knowledge = [], []
+            profile = await loop.run_in_executor(None, profile_for_prompt, self.cfg)
+        else:
+            memories, knowledge, profile = await asyncio.gather(
+                loop.run_in_executor(None, self.memory.search, user_message),
+                loop.run_in_executor(None, self.knowledge.search, user_message),
+                loop.run_in_executor(None, profile_for_prompt, self.cfg),
+            )
         t_retrieve = time.monotonic() - t0
         # history keeps only the bare message; profile/memories/knowledge are
         # injected transiently into THIS call, so prompts don't balloon

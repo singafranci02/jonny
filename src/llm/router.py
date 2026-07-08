@@ -26,6 +26,20 @@ TOOL_HINTS = (
 )
 
 
+_SMALLTALK = re.compile(
+    r"^(hey|hi|hello|yo|sup|what'?s up|how are you|how's it going|good (morning|afternoon|evening|night)|"
+    r"thanks?|thank you|ok(ay)?|cool|nice|yes|no|yeah|nah|bye|goodbye|see you|cheers)\b",
+    re.IGNORECASE,
+)
+
+
+def is_smalltalk(user_message: str) -> bool:
+    """Greetings/acknowledgements: answer directly, inject no notes/memories
+    (retrieval on 'hey what's up' only drags in irrelevant context)."""
+    words = user_message.split()
+    return len(words) <= 7 and bool(_SMALLTALK.match(user_message.strip()))
+
+
 def is_simple(user_message: str, tier: str) -> bool:
     """Short chit-chat that needs no tools: answer on the slim fast path
     (skipping tool schemas roughly halves local prefill time)."""
