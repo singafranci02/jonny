@@ -48,9 +48,10 @@ class AnthropicLLM(LLMClient):
             kwargs["thinking"] = {"type": "adaptive"}
             if model_cfg.get("effort"):
                 kwargs["output_config"] = {"effort": model_cfg["effort"]}
-        else:
+        elif "sonnet-5" in model_cfg["model"]:
             # Sonnet 5 runs adaptive thinking when the field is omitted;
-            # voice turns want the explicit fast path.
+            # voice turns want the explicit fast path. Older models (Haiku
+            # 4.5...) default to no thinking when the field is absent.
             kwargs["thinking"] = {"type": "disabled"}
         if tools:
             kwargs["tools"] = [t.anthropic_schema() for t in tools]

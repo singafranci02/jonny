@@ -20,7 +20,7 @@ from .llm import make_llm_client
 from .llm.base import LLMResponse
 from .knowledge import make_knowledge_index
 from .knowledge.watcher import start_watcher
-from .llm.router import detect_research, pick_tier
+from .llm.router import detect_research, is_simple, pick_tier
 from .memory import make_memory_store
 
 console = Console()
@@ -85,15 +85,20 @@ class Session:
             if on_text is not None:
                 on_text(delta)
 
-        scratch = [
-            *self.conversation.messages[:-1],
-            {"role": "user", "content": enriched},
-        ]
+        fast = is_simple(user_message, tier)
+        history = self.conversation.messages[:-1]
+        if fast:
+            history = history[-6:]  # slim context: recent turns only
+        scratch = [*history, {"role": "user", "content": enriched}]
         try:
-            resp = await self._agent_loop(tier, scratch, on_text=timed_on_text)
+            resp = await self._agent_loop(
+                tier, scratch, on_text=timed_on_text, use_tools=not fast
+            )
         except Exception:
             self.conversation.messages.pop()  # keep history consistent
             raise
+        if fast:
+            resp.extra["path"] = "fast"
         resp.extra["timings"] = {
             "retrieve": t_retrieve,
             "first_token": first_token[0],
@@ -114,7 +119,12 @@ class Session:
         return resp
 
     async def _agent_loop(
-        self, tier: str, scratch: list[dict], max_rounds: int = 5, on_text=None
+        self,
+        tier: str,
+        scratch: list[dict],
+        max_rounds: int = 5,
+        on_text=None,
+        use_tools: bool = True,
     ) -> LLMResponse:
         """Call the LLM with tools; execute tool calls until it answers.
 
@@ -127,8 +137,9 @@ class Session:
         loop = asyncio.get_event_loop()
         totals = {"input": 0, "output": 0, "cost": 0.0, "rounds": 0}
 
+        tools = self.tools if use_tools else None
         resp = await self.llm.chat(
-            self.system_prompt, scratch, tier=tier, tools=self.tools, on_text=on_text
+            self.system_prompt, scratch, tier=tier, tools=tools, on_text=on_text
         )
         while resp.tool_calls and totals["rounds"] < max_rounds:
             totals["rounds"] += 1
@@ -144,7 +155,7 @@ class Session:
                 results.append((call, output, is_error))
             scratch.extend(self.llm.tool_messages(resp, results))
             resp = await self.llm.chat(
-                self.system_prompt, scratch, tier=tier, tools=self.tools, on_text=on_text
+                self.system_prompt, scratch, tier=tier, tools=tools, on_text=on_text
             )
 
         resp.input_tokens += totals["input"]
@@ -161,20 +172,22 @@ class Session:
         loop = asyncio.get_event_loop()
 
         async def _warm_llm():
-            try:
-                tier_cfg = self.cfg["llm"]["tiers"]["default"]
-                if tier_cfg.get("provider") == "ollama":
-                    backend, model_cfg = self.llm.backend_for("default")
-                    # use the REAL system prompt + tools so ollama's prompt
-                    # prefix cache is hot for the actual first turn
+            # keep whichever local tier exists loaded (fast fallback/offline)
+            for name in ("default", "fallback_local"):
+                tier_cfg = self.cfg["llm"]["tiers"].get(name, {})
+                if tier_cfg.get("provider") != "ollama":
+                    continue
+                try:
+                    backend, model_cfg = self.llm.backend_for(name)
                     await backend.chat(
                         self.system_prompt,
                         [{"role": "user", "content": "hi"}],
                         {**model_cfg, "max_tokens": 1},
                         tools=self.tools,
                     )
-            except Exception:
-                pass
+                except Exception:
+                    pass
+                break
 
         def _warm_stores():
             try:
@@ -385,11 +398,33 @@ async def voice_loop(session: Session) -> None:
                 continue
 
             speaker.reset()
+
+            # if the answer is slow, acknowledge instantly ("One sec.")
+            import random
+
+            tcfg = session.cfg.get("tts", {})
+            acks = tcfg.get("acks") or []
+            ack_after = tcfg.get("ack_after", 1.6)
+            sentences_before = len(speaker.recent_sentences)
+
+            async def maybe_ack() -> None:
+                await asyncio.sleep(ack_after)
+                # nothing spoken yet this turn -> bridge the silence
+                if (
+                    acks
+                    and len(speaker.recent_sentences) == sentences_before
+                    and not speaker.speaking
+                ):
+                    speaker.feed(random.choice(acks) + " ")
+
+            ack_task = asyncio.ensure_future(maybe_ack())
             try:
                 # deltas stream into the speaker: Jarvis starts talking on
                 # the first complete sentence while the rest generates
                 resp = await session.turn(user_message, on_text=speaker.feed)
+                ack_task.cancel()
             except Exception as e:
+                ack_task.cancel()
                 console.print(f"[red]error:[/red] {e}")
                 speaker.reset()
                 await loop.run_in_executor(

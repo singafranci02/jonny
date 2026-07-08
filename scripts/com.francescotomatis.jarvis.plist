@@ -13,6 +13,8 @@
     </array>
     <key>WorkingDirectory</key>
     <string>__ROOT__</string>
+    <key>ProcessType</key>
+    <string>Interactive</string>
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
