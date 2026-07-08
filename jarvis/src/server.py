@@ -16,8 +16,12 @@ import io
 import os
 import uuid
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Response
+import base64
+import json
+
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from .config import load_config
@@ -158,6 +162,138 @@ def _encode_mp3(audio, sample_rate: int) -> bytes:
     encoder.set_channels(1)
     encoder.set_quality(2)
     return bytes(encoder.encode(pcm16) + encoder.flush())
+
+
+@app.post("/stt", dependencies=[Depends(require_token)])
+async def stt(request: Request) -> dict:
+    """Transcribe browser audio (webm/opus, wav...) with faster-whisper —
+    the same accurate model the Mac voice mode uses."""
+    audio_bytes = await request.body()
+    if not audio_bytes or len(audio_bytes) > 25_000_000:
+        raise HTTPException(400, "bad audio")
+
+    if _state.get("whisper") is None:
+        from faster_whisper import WhisperModel
+
+        scfg = _state["session"].cfg["stt"]
+        _state["whisper"] = WhisperModel(
+            scfg.get("model", "large-v3-turbo"),
+            device=scfg.get("device", "cpu"),
+            compute_type=scfg.get("compute_type", "int8"),
+        )
+
+    def transcribe() -> str:
+        scfg = _state["session"].cfg["stt"]
+        segments, _info = _state["whisper"].transcribe(
+            io.BytesIO(audio_bytes),
+            language=(scfg.get("language") or None),
+            beam_size=scfg.get("beam_size", 2),
+            vad_filter=True,
+        )
+        return " ".join(s.text.strip() for s in segments).strip()
+
+    loop = asyncio.get_event_loop()
+    text = await loop.run_in_executor(None, transcribe)
+    return {"text": text}
+
+
+@app.post("/chat_stream", dependencies=[Depends(require_token)])
+async def chat_stream(body: ChatIn) -> StreamingResponse:
+    """SSE turn: text deltas stream immediately; each completed sentence is
+    synthesized (Kokoro) and pushed as base64 MP3 while the model is still
+    generating — the browser starts speaking after sentence one."""
+    from .tts import make_tts_engine
+    from .tts.kokoro_tts import SAMPLE_RATE, KokoroTTS
+
+    session: Session = _state["session"]
+    if _state.get("tts") is None:
+        _state["tts"] = make_tts_engine(session.cfg)
+    engine = _state["tts"]
+    can_speak = isinstance(engine, KokoroTTS)
+
+    events: asyncio.Queue = asyncio.Queue()
+    loop = asyncio.get_event_loop()
+
+    async def produce() -> None:
+        sentence_buf = [""]
+        pending: list[str] = []
+        seq = [0]
+
+        async def emit_sentence(sentence: str) -> None:
+            if not can_speak or not sentence.strip():
+                return
+            audio = await loop.run_in_executor(None, engine.synthesize, sentence)
+            mp3 = await loop.run_in_executor(None, _encode_mp3, audio, SAMPLE_RATE)
+            await events.put(
+                {
+                    "type": "audio",
+                    "seq": seq[0],
+                    "text": sentence,
+                    "mp3": base64.b64encode(mp3).decode(),
+                }
+            )
+            seq[0] += 1
+
+        import re
+
+        def on_text(delta: str) -> None:
+            events.put_nowait({"type": "delta", "text": delta})
+            sentence_buf[0] += delta
+            # eager split: ship the FIRST sentence as soon as it exists
+            # (>=20 chars), be less choppy afterwards (>=60)
+            min_len = 20 if seq[0] == 0 and not pending else 60
+            parts = re.split(r"(?<=[.!?…])\s+", sentence_buf[0])
+            while len(parts) > 1 and len(parts[0]) >= min_len:
+                pending.append(parts.pop(0))
+            sentence_buf[0] = " ".join(parts)
+
+        try:
+            async with _lock:
+                turn_task = asyncio.ensure_future(
+                    session.turn(body.message, on_text=on_text)
+                )
+                # synthesize sentences as they complete, while the LLM runs
+                while not turn_task.done() or pending:
+                    if pending:
+                        await emit_sentence(pending.pop(0))
+                    else:
+                        await asyncio.sleep(0.05)
+                resp = await turn_task
+                if sentence_buf[0].strip():
+                    await emit_sentence(sentence_buf[0])
+                research_job = None
+                if session.pending_research:
+                    topic, session.pending_research = session.pending_research, None
+                    research_job = _start_research(topic)
+            if resp.cost_usd:
+                session.total_cost += resp.cost_usd
+            await events.put(
+                {
+                    "type": "done",
+                    "text": resp.text,
+                    "model": resp.model,
+                    "tier": resp.tier,
+                    "research_job_id": research_job,
+                }
+            )
+        except Exception as e:
+            await events.put({"type": "error", "error": str(e)})
+        await events.put(None)  # stream end
+
+    asyncio.ensure_future(produce())
+
+    async def sse():
+        while True:
+            event = await events.get()
+            if event is None:
+                break
+            yield f"data: {json.dumps(event)}\n\n"
+
+    return StreamingResponse(
+        sse(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 @app.post("/tts", dependencies=[Depends(require_token)])
