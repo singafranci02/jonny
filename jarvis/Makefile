@@ -4,7 +4,7 @@ VENV := .venv
 PIP := $(VENV)/bin/pip
 PY := $(VENV)/bin/python
 
-.PHONY: setup setup-voice run chat voice memory ingest research serve install-agent uninstall-agent install-web uninstall-web install-tunnel uninstall-tunnel install-watchdog uninstall-watchdog doctor status push test-once clean
+.PHONY: setup setup-voice run chat voice talk memory ingest research serve install-agent uninstall-agent install-web uninstall-web install-tunnel uninstall-tunnel install-watchdog uninstall-watchdog doctor status push test-once clean
 
 setup:
 	$(PYTHON) -m venv $(VENV)
@@ -40,6 +40,14 @@ ingest:
 # deep research: make research ARGS="best tide prediction APIs"
 research:
 	$(PY) -m src.research.cli $(ARGS)
+
+# native voice client (fastest face). LOCAL=1 for localhost at the Mac.
+talk:
+ifeq ($(LOCAL),1)
+	$(PY) clients/voice_cli.py --local
+else
+	$(PY) clients/voice_cli.py
+endif
 
 # diagnose listening problems (ARGS="--devices" lists microphones)
 mic-test:
