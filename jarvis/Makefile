@@ -4,7 +4,7 @@ VENV := .venv
 PIP := $(VENV)/bin/pip
 PY := $(VENV)/bin/python
 
-.PHONY: setup setup-voice run chat voice memory ingest research install-agent uninstall-agent push test-once clean
+.PHONY: setup setup-voice run chat voice memory ingest research serve install-agent uninstall-agent push test-once clean
 
 setup:
 	$(PYTHON) -m venv $(VENV)
@@ -44,6 +44,10 @@ research:
 # diagnose listening problems (ARGS="--devices" lists microphones)
 mic-test:
 	$(PY) -m src.stt.mictest $(ARGS)
+
+# run the brain as a server so the web app can reach it (needs JARVIS_TOKEN in .env)
+serve:
+	$(PY) -m src.server
 
 AGENT_ID := com.francescotomatis.jarvis
 AGENT_PLIST := $(HOME)/Library/LaunchAgents/$(AGENT_ID).plist

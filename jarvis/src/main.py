@@ -62,13 +62,18 @@ class Session:
         loop = asyncio.get_event_loop()
         t0 = time.monotonic()
         tier = pick_tier(user_message, self.cfg.get("routing", {}))
-        memories, knowledge = await asyncio.gather(
+        from .profile import profile_for_prompt
+
+        memories, knowledge, profile = await asyncio.gather(
             loop.run_in_executor(None, self.memory.search, user_message),
             loop.run_in_executor(None, self.knowledge.search, user_message),
+            loop.run_in_executor(None, profile_for_prompt, self.cfg),
         )
         t_retrieve = time.monotonic() - t0
         self.conversation.add_user(
-            build_user_content(user_message, memories=memories, knowledge=knowledge)
+            build_user_content(
+                user_message, profile=profile, memories=memories, knowledge=knowledge
+            )
         )
 
         first_token = [None]
