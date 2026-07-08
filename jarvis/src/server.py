@@ -259,7 +259,8 @@ async def stt(request: Request) -> dict:
         segments, _info = _ensure_whisper().transcribe(
             io.BytesIO(audio_bytes),
             language=(scfg.get("language") or None),
-            beam_size=scfg.get("beam_size", 2),
+            beam_size=scfg.get("beam_size", 5),
+            initial_prompt=_stt_initial_prompt(),
             vad_filter=True,
         )
         return " ".join(s.text.strip() for s in segments).strip()
@@ -389,6 +390,38 @@ async def chat_stream(body: ChatIn) -> StreamingResponse:
     )
 
 
+def _stt_initial_prompt() -> str:
+    """Bias whisper toward names it would otherwise mishear — the configured
+    vocabulary plus proper nouns pulled from the About-Me profile, so it
+    adapts as you edit your profile."""
+    import re
+
+    from .profile import load_profile
+
+    scfg = _state["session"].cfg["stt"]
+    terms = [t.strip() for t in scfg.get("vocabulary", "").split(",") if t.strip()]
+    try:
+        profile = load_profile(_state["session"].cfg)
+        # capitalised words in the profile are likely names/projects
+        found = re.findall(r"\b[A-Z][a-zA-Z][a-zA-Z']+\b", profile)
+        terms += [w for w in found if w.lower() not in _COMMON_CAPS]
+    except Exception:
+        pass
+    seen, uniq = set(), []
+    for t in terms:
+        if t.lower() not in seen:
+            seen.add(t.lower())
+            uniq.append(t)
+    vocab = ". ".join(uniq[:24])
+    return f"Hey Jarvis. {vocab}." if vocab else "Hey Jarvis."
+
+
+_COMMON_CAPS = {
+    "about", "current", "how", "preferences", "the", "i", "my", "me", "write",
+    "projects", "favourites", "favorites", "he", "she", "they", "what", "when",
+}
+
+
 def _ensure_whisper():
     if _state.get("whisper") is None:
         from faster_whisper import WhisperModel
@@ -412,7 +445,8 @@ def _transcribe_pcm(pcm: bytes) -> tuple[str, bool]:
     segments, _info = _ensure_whisper().transcribe(
         audio,
         language=(scfg.get("language") or None),
-        beam_size=scfg.get("beam_size", 2),
+        beam_size=scfg.get("beam_size", 5),
+        initial_prompt=_stt_initial_prompt(),
         vad_filter=False,  # our VAD already segmented the utterance
     )
     segs = list(segments)
