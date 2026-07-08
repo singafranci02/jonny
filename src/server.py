@@ -265,8 +265,8 @@ async def chat_stream(body: ChatIn) -> StreamingResponse:
             events.put_nowait({"type": "delta", "text": delta})
             sentence_buf[0] += delta
             # eager split: ship the FIRST sentence as soon as it exists
-            # (>=20 chars), be less choppy afterwards (>=60)
-            min_len = 20 if seq[0] == 0 and not pending else 60
+            # (>=12 chars), be less choppy afterwards (>=60)
+            min_len = 12 if seq[0] == 0 and not pending else 60
             parts = re.split(r"(?<=[.!?…])\s+", sentence_buf[0])
             while len(parts) > 1 and len(parts[0]) >= min_len:
                 pending.append(parts.pop(0))

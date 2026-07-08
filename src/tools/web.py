@@ -8,19 +8,25 @@ from . import Tool
 
 
 def web_search(query: str, max_results: int = 5) -> str:
-    # primary: DuckDuckGo
+    # primary: DuckDuckGo — and auto-fetch the top pages so one call
+    # returns actual content, not just snippets (isair/jarvis pattern)
     try:
         from ddgs import DDGS
 
         results = list(DDGS().text(query, max_results=max_results))
         if results:
-            return json.dumps(
-                [
-                    {"title": r.get("title"), "url": r.get("href"), "snippet": r.get("body")}
-                    for r in results
-                ],
-                ensure_ascii=False,
-            )
+            hits = [
+                {"title": r.get("title"), "url": r.get("href"), "snippet": r.get("body")}
+                for r in results
+            ]
+            for hit in hits[:2]:  # read the top two pages
+                try:
+                    text = fetch_page(hit["url"], max_chars=2500)
+                    if not text.startswith(("could not fetch", "no readable")):
+                        hit["page_content"] = text
+                except Exception:
+                    pass
+            return json.dumps(hits, ensure_ascii=False)
     except Exception:
         pass
     # fallback: Wikipedia search API
@@ -70,7 +76,11 @@ def build(cfg: dict) -> list[Tool]:
     return [
         Tool(
             name="web_search",
-            description="Web search. Call for current events, prices, weather, news, or anything you don't reliably know.",
+            description=(
+                "Web search. Call for current events, prices, weather, news, "
+                "or anything you don't reliably know. Results include the top "
+                "pages' actual content — answer from it directly."
+            ),
             parameters={
                 "type": "object",
                 "properties": {"query": {"type": "string"}},

@@ -18,7 +18,7 @@ llm:
     default:
       provider: anthropic
       model: claude-haiku-4-5
-      max_tokens: 512
+      max_tokens: 300
     # Free local fallback used automatically when the cloud tier errors
     fallback_local:
       provider: ollama
@@ -112,7 +112,7 @@ stt:
   device: cpu               # ctranslate2 has no Metal backend; cpu + int8 is the Apple Silicon path
   compute_type: int8
   beam_size: 2              # 1-2 = much faster decode; 5 = max accuracy
-  silence_duration: 0.8     # seconds of silence that end an utterance (raise if it cuts you off)
+  silence_duration: 0.7     # seconds of silence that end an utterance (raise if it cuts you off)
   initial_prompt: "Hey Jarvis."   # biases Whisper toward hearing the wake phrase
   input_device_index: null  # null = system default mic; `make mic-test` lists devices
 
@@ -125,7 +125,7 @@ tts:
   device: ""                # cpu: kokoro on MPS fights qwen for the GPU
   # spoken instantly when the real answer takes longer than ack_after seconds
   acks: ["One sec.", "Hmm, let me think.", "On it.", "Right, give me a moment."]
-  ack_after: 1.2
+  ack_after: 0.9
   say_voice: ""             # macOS say fallback; "" = system default
   say_rate: 190
 
