@@ -113,7 +113,7 @@ export default function Home() {
         }
 
         const done =
-          (speechStarted && silentMs >= 1100) || // finished talking
+          (speechStarted && silentMs >= 750) || // finished talking
           (!speechStarted && elapsedMs >= 9000) || // nobody spoke
           elapsedMs >= 30000 || // hard cap
           !activeRef.current;
