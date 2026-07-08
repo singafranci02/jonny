@@ -144,10 +144,24 @@ async def put_profile(body: ProfileIn) -> dict:
     return {"ok": True}
 
 
+def _encode_mp3(audio, sample_rate: int) -> bytes:
+    # LAME (standard MP3 encoder) — ~8x smaller than WAV and universally
+    # playable. Keeps tunnel bandwidth tiny (ngrok's 1GB/mo then covers
+    # tens of thousands of replies).
+    import lameenc
+    import numpy as np
+
+    pcm16 = (np.clip(audio, -1, 1) * 32767).astype(np.int16).tobytes()
+    encoder = lameenc.Encoder()
+    encoder.set_bit_rate(64)
+    encoder.set_in_sample_rate(sample_rate)
+    encoder.set_channels(1)
+    encoder.set_quality(2)
+    return bytes(encoder.encode(pcm16) + encoder.flush())
+
+
 @app.post("/tts", dependencies=[Depends(require_token)])
 async def tts(body: TTSIn) -> Response:
-    import soundfile as sf
-
     from .tts import make_tts_engine
     from .tts.kokoro_tts import SAMPLE_RATE, KokoroTTS
 
@@ -160,9 +174,8 @@ async def tts(body: TTSIn) -> Response:
 
     loop = asyncio.get_event_loop()
     audio = await loop.run_in_executor(None, engine.synthesize, body.text)
-    buf = io.BytesIO()
-    sf.write(buf, audio, SAMPLE_RATE, format="WAV")
-    return Response(content=buf.getvalue(), media_type="audio/wav")
+    mp3 = await loop.run_in_executor(None, _encode_mp3, audio, SAMPLE_RATE)
+    return Response(content=mp3, media_type="audio/mpeg")
 
 
 def main() -> None:
