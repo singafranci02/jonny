@@ -19,7 +19,15 @@ import uuid
 import base64
 import json
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
+from fastapi import (
+    Depends,
+    FastAPI,
+    Header,
+    HTTPException,
+    Request,
+    Response,
+    WebSocket,
+)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
@@ -50,6 +58,31 @@ def require_token(authorization: str = Header(default="")) -> None:
     token = authorization.removeprefix("Bearer ").strip()
     if token != expected:
         raise HTTPException(401, "unauthorized")
+
+
+def _valid_ticket(ticket: str) -> bool:
+    """A ticket is 'base64url(payload).hex(hmac_sha256(payload, TOKEN))', with
+    payload = {"exp": <unix seconds>}. The web app mints it (holding the
+    token); the browser only ever carries this short-lived derived ticket."""
+    import hashlib
+    import hmac
+    import time as _time
+
+    secret = os.environ.get("JARVIS_TOKEN", "")
+    if not secret or "." not in ticket:
+        return False
+    payload_b64, sig = ticket.rsplit(".", 1)
+    expected = hmac.new(
+        secret.encode(), payload_b64.encode(), hashlib.sha256
+    ).hexdigest()
+    if not hmac.compare_digest(sig, expected):
+        return False
+    try:
+        pad = "=" * (-len(payload_b64) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(payload_b64 + pad))
+        return float(payload.get("exp", 0)) > _time.time()
+    except Exception:
+        return False
 
 
 @app.on_event("startup")
@@ -197,19 +230,9 @@ async def stt(request: Request) -> dict:
     if not audio_bytes or len(audio_bytes) > 25_000_000:
         raise HTTPException(400, "bad audio")
 
-    if _state.get("whisper") is None:
-        from faster_whisper import WhisperModel
-
-        scfg = _state["session"].cfg["stt"]
-        _state["whisper"] = WhisperModel(
-            scfg.get("web_model") or scfg.get("model", "large-v3-turbo"),
-            device=scfg.get("device", "cpu"),
-            compute_type=scfg.get("compute_type", "int8"),
-        )
-
     def transcribe() -> str:
         scfg = _state["session"].cfg["stt"]
-        segments, _info = _state["whisper"].transcribe(
+        segments, _info = _ensure_whisper().transcribe(
             io.BytesIO(audio_bytes),
             language=(scfg.get("language") or None),
             beam_size=scfg.get("beam_size", 2),
@@ -222,11 +245,14 @@ async def stt(request: Request) -> dict:
     return {"text": text}
 
 
-@app.post("/chat_stream", dependencies=[Depends(require_token)])
-async def chat_stream(body: ChatIn) -> StreamingResponse:
-    """SSE turn: text deltas stream immediately; each completed sentence is
-    synthesized (Kokoro) and pushed as base64 MP3 while the model is still
-    generating — the browser starts speaking after sentence one."""
+async def _stream_turn(message: str, events: asyncio.Queue) -> None:
+    """Run one turn, putting events onto `events`: text deltas, per-sentence
+    audio (base64 MP3) as the model generates, a slow-answer ack, and a final
+    `done`. Shared by the SSE endpoint and the websocket. Ends with None."""
+    import random
+    import re
+    import time as _time
+
     from .tts import make_tts_engine
     from .tts.kokoro_tts import SAMPLE_RATE, KokoroTTS
 
@@ -235,94 +261,86 @@ async def chat_stream(body: ChatIn) -> StreamingResponse:
         _state["tts"] = make_tts_engine(session.cfg)
     engine = _state["tts"]
     can_speak = isinstance(engine, KokoroTTS)
-
-    events: asyncio.Queue = asyncio.Queue()
     loop = asyncio.get_event_loop()
 
-    async def produce() -> None:
-        sentence_buf = [""]
-        pending: list[str] = []
-        seq = [0]
+    sentence_buf = [""]
+    pending: list[str] = []
+    seq = [0]
 
-        async def emit_sentence(sentence: str) -> None:
-            if not can_speak or not sentence.strip():
-                return
-            audio = await loop.run_in_executor(None, engine.synthesize, sentence)
-            mp3 = await loop.run_in_executor(None, _encode_mp3, audio, SAMPLE_RATE)
-            await events.put(
-                {
-                    "type": "audio",
-                    "seq": seq[0],
-                    "text": sentence,
-                    "mp3": base64.b64encode(mp3).decode(),
-                }
-            )
-            seq[0] += 1
+    async def emit_sentence(sentence: str) -> None:
+        if not can_speak or not sentence.strip():
+            return
+        audio = await loop.run_in_executor(None, engine.synthesize, sentence)
+        mp3 = await loop.run_in_executor(None, _encode_mp3, audio, SAMPLE_RATE)
+        await events.put(
+            {
+                "type": "audio",
+                "seq": seq[0],
+                "text": sentence,
+                "mp3": base64.b64encode(mp3).decode(),
+            }
+        )
+        seq[0] += 1
 
-        import re
+    def on_text(delta: str) -> None:
+        events.put_nowait({"type": "delta", "text": delta})
+        sentence_buf[0] += delta
+        min_len = 12 if seq[0] == 0 and not pending else 60
+        parts = re.split(r"(?<=[.!?…])\s+", sentence_buf[0])
+        while len(parts) > 1 and len(parts[0]) >= min_len:
+            pending.append(parts.pop(0))
+        sentence_buf[0] = " ".join(parts)
 
-        def on_text(delta: str) -> None:
-            events.put_nowait({"type": "delta", "text": delta})
-            sentence_buf[0] += delta
-            # eager split: ship the FIRST sentence as soon as it exists
-            # (>=12 chars), be less choppy afterwards (>=60)
-            min_len = 12 if seq[0] == 0 and not pending else 60
-            parts = re.split(r"(?<=[.!?…])\s+", sentence_buf[0])
-            while len(parts) > 1 and len(parts[0]) >= min_len:
-                pending.append(parts.pop(0))
-            sentence_buf[0] = " ".join(parts)
+    try:
+        async with _lock:
+            turn_task = asyncio.ensure_future(session.turn(message, on_text=on_text))
+            ack_after = session.cfg.get("tts", {}).get("ack_after", 1.2)
+            started = _time.monotonic()
+            ack_sent = False
+            while not turn_task.done() or pending:
+                if (
+                    not ack_sent
+                    and seq[0] == 0
+                    and not pending
+                    and _state.get("acks")
+                    and _time.monotonic() - started > ack_after
+                ):
+                    await events.put(
+                        {"type": "audio", "seq": -1, **random.choice(_state["acks"])}
+                    )
+                    ack_sent = True
+                if pending:
+                    await emit_sentence(pending.pop(0))
+                else:
+                    await asyncio.sleep(0.05)
+            resp = await turn_task
+            if sentence_buf[0].strip():
+                await emit_sentence(sentence_buf[0])
+            research_job = None
+            if session.pending_research:
+                topic, session.pending_research = session.pending_research, None
+                research_job = _start_research(topic)
+        if resp.cost_usd:
+            session.total_cost += resp.cost_usd
+        await events.put(
+            {
+                "type": "done",
+                "text": resp.text,
+                "model": resp.model,
+                "tier": resp.tier,
+                "research_job_id": research_job,
+            }
+        )
+    except Exception as e:
+        await events.put({"type": "error", "error": str(e)})
+    await events.put(None)
 
-        try:
-            async with _lock:
-                turn_task = asyncio.ensure_future(
-                    session.turn(body.message, on_text=on_text)
-                )
-                # if the answer is slow, speak a pre-synthesized ack instantly
-                import random
-                import time as _time
 
-                ack_after = session.cfg.get("tts", {}).get("ack_after", 1.6)
-                started = _time.monotonic()
-                ack_sent = False
-                # synthesize sentences as they complete, while the LLM runs
-                while not turn_task.done() or pending:
-                    if (
-                        not ack_sent
-                        and seq[0] == 0
-                        and not pending
-                        and _state.get("acks")
-                        and _time.monotonic() - started > ack_after
-                    ):
-                        ack = random.choice(_state["acks"])
-                        await events.put({"type": "audio", "seq": -1, **ack})
-                        ack_sent = True
-                    if pending:
-                        await emit_sentence(pending.pop(0))
-                    else:
-                        await asyncio.sleep(0.05)
-                resp = await turn_task
-                if sentence_buf[0].strip():
-                    await emit_sentence(sentence_buf[0])
-                research_job = None
-                if session.pending_research:
-                    topic, session.pending_research = session.pending_research, None
-                    research_job = _start_research(topic)
-            if resp.cost_usd:
-                session.total_cost += resp.cost_usd
-            await events.put(
-                {
-                    "type": "done",
-                    "text": resp.text,
-                    "model": resp.model,
-                    "tier": resp.tier,
-                    "research_job_id": research_job,
-                }
-            )
-        except Exception as e:
-            await events.put({"type": "error", "error": str(e)})
-        await events.put(None)  # stream end
-
-    asyncio.ensure_future(produce())
+@app.post("/chat_stream", dependencies=[Depends(require_token)])
+async def chat_stream(body: ChatIn) -> StreamingResponse:
+    """SSE turn (fallback path): text deltas + per-sentence MP3."""
+    events: asyncio.Queue = asyncio.Queue()
+    asyncio.ensure_future(_stream_turn(body.message, events))
 
     async def sse():
         while True:
@@ -336,6 +354,95 @@ async def chat_stream(body: ChatIn) -> StreamingResponse:
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+def _ensure_whisper():
+    if _state.get("whisper") is None:
+        from faster_whisper import WhisperModel
+
+        scfg = _state["session"].cfg["stt"]
+        _state["whisper"] = WhisperModel(
+            scfg.get("web_model") or scfg.get("model", "large-v3-turbo"),
+            device=scfg.get("device", "cpu"),
+            compute_type=scfg.get("compute_type", "int8"),
+        )
+    return _state["whisper"]
+
+
+def _transcribe_pcm(pcm: bytes) -> str:
+    import numpy as np
+
+    audio = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
+    scfg = _state["session"].cfg["stt"]
+    segments, _info = _ensure_whisper().transcribe(
+        audio,
+        language=(scfg.get("language") or None),
+        beam_size=scfg.get("beam_size", 2),
+        vad_filter=False,  # our VAD already segmented the utterance
+    )
+    return " ".join(s.text.strip() for s in segments).strip()
+
+
+@app.websocket("/ws")
+async def ws(websocket: WebSocket) -> None:
+    """Real-time voice: the browser streams 16kHz PCM16 as you talk; a VAD
+    cuts utterances the instant you stop (no upload wait); we transcribe the
+    already-present audio and stream the spoken reply back on the same socket.
+    Auth: first text message is a short-lived HMAC ticket from the web app."""
+    from .audio.vad import VadSegmenter
+
+    await websocket.accept()
+    try:
+        ticket = await asyncio.wait_for(websocket.receive_text(), timeout=10)
+    except Exception:
+        await websocket.close(code=1008)
+        return
+    if not _valid_ticket(ticket):
+        await websocket.send_json({"type": "error", "error": "unauthorized"})
+        await websocket.close(code=1008)
+        return
+
+    await websocket.send_json({"type": "ready"})
+    seg = VadSegmenter()
+    loop = asyncio.get_event_loop()
+    turn_lock = asyncio.Lock()  # one turn at a time per socket
+    speaking = {"on": False}
+
+    async def run_turn(pcm: bytes) -> None:
+        async with turn_lock:
+            text = await loop.run_in_executor(None, _transcribe_pcm, pcm)
+            if not text.strip():
+                return
+            await websocket.send_json({"type": "transcript", "text": text})
+            events: asyncio.Queue = asyncio.Queue()
+            asyncio.ensure_future(_stream_turn(text, events))
+            speaking["on"] = True
+            while True:
+                event = await events.get()
+                if event is None:
+                    break
+                await websocket.send_json(event)
+            speaking["on"] = False
+
+    try:
+        while True:
+            msg = await websocket.receive()
+            if msg.get("type") == "websocket.disconnect":
+                break
+            if (data := msg.get("bytes")) is not None:
+                # barge-in: if you start talking while it's speaking, tell the
+                # browser to stop playback immediately
+                was_speaking = seg.speaking
+                for utter in seg.add(data):
+                    asyncio.ensure_future(run_turn(utter))
+                if seg.speaking and not was_speaking and speaking["on"]:
+                    await websocket.send_json({"type": "interrupt"})
+            elif (txt := msg.get("text")) is not None:
+                if txt == "stop":  # client asked to end the current utterance
+                    if (utter := seg.flush()) is not None:
+                        asyncio.ensure_future(run_turn(utter))
+    except Exception:
+        pass
 
 
 @app.post("/tts", dependencies=[Depends(require_token)])
