@@ -92,6 +92,16 @@ async def _startup() -> None:
     _state["session"] = session
     _state["tts"] = None  # lazily built on first /tts call
     asyncio.ensure_future(_prepare_acks())
+    # load the turn-completion model in the background (heuristic until ready)
+    asyncio.ensure_future(
+        asyncio.get_event_loop().run_in_executor(None, _load_turn_model)
+    )
+
+
+def _load_turn_model() -> None:
+    from .audio import turndetect
+
+    turndetect.load()
 
 
 async def _synth_clips(phrases: list[str]) -> list[dict]:
@@ -299,9 +309,18 @@ async def _stream_turn(message: str, events: asyncio.Queue) -> None:
     def on_text(delta: str) -> None:
         events.put_nowait({"type": "delta", "text": delta})
         sentence_buf[0] += delta
-        min_len = 12 if seq[0] == 0 and not pending else 60
+        # ship the FIRST chunk as early as possible so speech starts sooner:
+        # on the first chunk, break at a clause (comma / "and" / "but") too,
+        # not just sentence-enders (Ankur2606 TextChunker idea).
+        first = seq[0] == 0 and not pending
+        if first:
+            m = re.search(r"^.{18,}?[.!?…]|^.{25,}?(?:,| and | but | so )", sentence_buf[0])
+            if m:
+                pending.append(m.group(0).rstrip(" ,"))
+                sentence_buf[0] = sentence_buf[0][m.end():].lstrip()
+                return
         parts = re.split(r"(?<=[.!?…])\s+", sentence_buf[0])
-        while len(parts) > 1 and len(parts[0]) >= min_len:
+        while len(parts) > 1 and len(parts[0]) >= 60:
             pending.append(parts.pop(0))
         sentence_buf[0] = " ".join(parts)
 

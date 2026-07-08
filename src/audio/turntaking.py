@@ -34,34 +34,60 @@ _TRAILING = {
 }
 
 
+# words a sentence grammatically cannot end on — force "incomplete" even if
+# whisper stuck a period on the fragment
+_STRICT = {
+    "the", "a", "an", "my", "your", "our", "their", "his", "its", "and", "or",
+    "but", "so", "to", "of", "for", "with", "at", "by", "from", "in", "on",
+    "about", "into", "than", "as", "is", "are", "was", "were", "am", "be",
+    "will", "would", "could", "should", "can", "may", "might", "do", "does",
+    "did", "have", "has", "had", "gonna", "wanna", "gotta", "let", "very",
+    "i", "we", "they",
+}
+
+
 def _last_word(text: str) -> str:
     words = re.findall(r"[a-z']+", text.lower())
     return words[-1] if words else ""
 
 
 def classify(text: str) -> str:
-    """'hold' | 'incomplete' | 'complete'."""
+    """'hold' | 'incomplete' | 'complete'.
+
+    Uses the DistilBERT completion model when it's loaded, combined with
+    whisper's punctuation (which is authoritative for sentence ends and
+    covers the few phrases the model over-holds). Falls back to a pure
+    heuristic when the model isn't available."""
     stripped = text.strip()
     if not stripped:
         return "incomplete"
     if _HOLD.match(stripped):
         return "hold"
-    # ended cleanly on . ! ? and isn't dangling → done
-    ends_clean = stripped[-1] in ".!?"
+
+    from . import turndetect
+
+    terminal = stripped[-1] in ".!?"
     last = _last_word(stripped)
-    if last in _TRAILING:
+    dangling = last in _TRAILING
+    prob = turndetect.completion_probability(stripped)
+
+    # a sentence literally can't end on "to/the/and…" — hold it whatever the
+    # punctuation, unless the model is near-certain otherwise
+    if last in _STRICT and (prob is None or prob < 0.9):
         return "incomplete"
-    if stripped[-1] == "," or stripped.endswith("-"):
+
+    if prob is not None:
+        # whisper marks a sentence end -> finished, unless it trails on a
+        # dangling word AND the model is quite sure it's not done
+        if terminal and not (dangling and prob < 0.3):
+            return "complete"
+        # no terminal punctuation -> trust the model's judgement
+        if not terminal and prob >= 0.6:
+            return "complete"
         return "incomplete"
-    # very short with no terminal punctuation is usually a mid-thought fragment,
-    # unless it's a normal short reply/command (yes/no/stop/thanks…)
-    if not ends_clean and len(stripped.split()) <= 2 and last not in _SHORT_OK:
+
+    # ---- heuristic fallback (model not loaded) ----
+    if dangling or stripped[-1] == "," or stripped.endswith("-"):
         return "incomplete"
     return "complete"
 
-
-_SHORT_OK = {
-    "yes", "yeah", "yep", "no", "nope", "nah", "stop", "thanks", "thank",
-    "cheers", "ok", "okay", "sure", "hi", "hey", "hello", "bye", "goodbye",
-    "please", "correct", "right", "wrong", "next", "continue", "go", "done",
-}
