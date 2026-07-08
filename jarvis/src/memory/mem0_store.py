@@ -24,6 +24,7 @@ class Mem0Store(MemoryStore):
 
         self.user_id = mcfg.get("user_id", "francesco")
         self.top_k = mcfg.get("top_k", 5)
+        self.min_score = mcfg.get("min_score", 0.45)
         self.memory = Memory.from_config(
             {
                 "llm": {
@@ -64,7 +65,11 @@ class Mem0Store(MemoryStore):
         raw = self.memory.search(
             query, top_k=self.top_k, filters={"user_id": self.user_id}
         )
-        return [r["memory"] for r in self._results(raw) if r.get("memory")]
+        return [
+            r["memory"]
+            for r in self._results(raw)
+            if r.get("memory") and (r.get("score") or 1.0) >= self.min_score
+        ]
 
     def add_turn(self, user_message: str, assistant_message: str) -> None:
         self.memory.add(
