@@ -94,28 +94,42 @@ async def _startup() -> None:
     asyncio.ensure_future(_prepare_acks())
 
 
+async def _synth_clips(phrases: list[str]) -> list[dict]:
+    from .tts.kokoro_tts import SAMPLE_RATE
+
+    loop = asyncio.get_event_loop()
+    engine = _state["tts"]
+    clips = []
+    for phrase in phrases:
+        audio = await loop.run_in_executor(None, engine.synthesize, phrase)
+        mp3 = await loop.run_in_executor(None, _encode_mp3, audio, SAMPLE_RATE)
+        clips.append({"text": phrase, "mp3": base64.b64encode(mp3).decode()})
+    return clips
+
+
 async def _prepare_acks() -> None:
-    """Pre-synthesize short acknowledgment clips so they can be spoken with
-    zero latency while a slow answer is still being generated."""
+    """Pre-synthesize short clips (acknowledgments + 'didn't catch that'
+    reprompts) so they can be spoken instantly."""
     from .tts import make_tts_engine
-    from .tts.kokoro_tts import SAMPLE_RATE, KokoroTTS
+    from .tts.kokoro_tts import KokoroTTS
 
     try:
         session: Session = _state["session"]
         if _state.get("tts") is None:
             _state["tts"] = make_tts_engine(session.cfg)
-        engine = _state["tts"]
-        if not isinstance(engine, KokoroTTS):
+        if not isinstance(_state["tts"], KokoroTTS):
             return
-        loop = asyncio.get_event_loop()
-        clips = []
-        for phrase in session.cfg.get("tts", {}).get("acks", ["One sec."]):
-            audio = await loop.run_in_executor(None, engine.synthesize, phrase)
-            mp3 = await loop.run_in_executor(None, _encode_mp3, audio, SAMPLE_RATE)
-            clips.append({"text": phrase, "mp3": base64.b64encode(mp3).decode()})
-        _state["acks"] = clips
+        tcfg = session.cfg.get("tts", {})
+        _state["acks"] = await _synth_clips(tcfg.get("acks", ["One sec."]))
+        _state["reprompts"] = await _synth_clips(
+            tcfg.get(
+                "reprompts",
+                ["Sorry, I didn't catch that.", "Come again?", "Say that once more?"],
+            )
+        )
     except Exception:
         _state["acks"] = []
+        _state["reprompts"] = []
 
 
 class ChatIn(BaseModel):
@@ -369,7 +383,9 @@ def _ensure_whisper():
     return _state["whisper"]
 
 
-def _transcribe_pcm(pcm: bytes) -> str:
+def _transcribe_pcm(pcm: bytes) -> tuple[str, bool]:
+    """Returns (text, low_confidence). Low confidence = probably misheard →
+    the caller asks you to repeat instead of answering garbage."""
     import numpy as np
 
     audio = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
@@ -380,7 +396,16 @@ def _transcribe_pcm(pcm: bytes) -> str:
         beam_size=scfg.get("beam_size", 2),
         vad_filter=False,  # our VAD already segmented the utterance
     )
-    return " ".join(s.text.strip() for s in segments).strip()
+    segs = list(segments)
+    text = " ".join(s.text.strip() for s in segs).strip()
+    if not segs or not text:
+        return "", True
+    avg_logprob = sum(s.avg_logprob for s in segs) / len(segs)
+    no_speech = max(s.no_speech_prob for s in segs)
+    lp_floor = scfg.get("min_avg_logprob", -1.0)
+    ns_ceil = scfg.get("max_no_speech", 0.6)
+    low = avg_logprob < lp_floor or no_speech > ns_ceil
+    return text, low
 
 
 @app.websocket("/ws")
@@ -388,7 +413,14 @@ async def ws(websocket: WebSocket) -> None:
     """Real-time voice: the browser streams 16kHz PCM16 as you talk; a VAD
     cuts utterances the instant you stop (no upload wait); we transcribe the
     already-present audio and stream the spoken reply back on the same socket.
-    Auth: first text message is a short-lived HMAC ticket from the web app."""
+
+    Smart turn-taking: if what you said looks unfinished (trailing "and…",
+    "let me finish", a mid-thought pause), it stays quiet and waits for the
+    rest instead of jumping in. Low-confidence audio → it asks you to repeat
+    rather than guessing. Auth: first message is a short-lived HMAC ticket."""
+    import random
+
+    from .audio.turntaking import classify
     from .audio.vad import VadSegmenter
 
     await websocket.accept()
@@ -405,44 +437,106 @@ async def ws(websocket: WebSocket) -> None:
     await websocket.send_json({"type": "ready"})
     seg = VadSegmenter()
     loop = asyncio.get_event_loop()
-    turn_lock = asyncio.Lock()  # one turn at a time per socket
+    cfg = _state["session"].cfg.get("turn", {})
+    cont_timeout = cfg.get("continuation_timeout", 2.5)
+
     speaking = {"on": False}
+    abort = {"on": False}
+    pending = {"text": ""}
+    flush = {"task": None}
+    utter_q: asyncio.Queue = asyncio.Queue()
 
-    async def run_turn(pcm: bytes) -> None:
-        async with turn_lock:
-            text = await loop.run_in_executor(None, _transcribe_pcm, pcm)
-            if not text.strip():
-                return
-            await websocket.send_json({"type": "transcript", "text": text})
-            events: asyncio.Queue = asyncio.Queue()
-            asyncio.ensure_future(_stream_turn(text, events))
-            speaking["on"] = True
-            while True:
-                event = await events.get()
-                if event is None:
-                    break
-                await websocket.send_json(event)
-            speaking["on"] = False
+    async def respond(text: str) -> None:
+        abort["on"] = False
+        await websocket.send_json({"type": "transcript", "text": text})
+        events: asyncio.Queue = asyncio.Queue()
+        asyncio.ensure_future(_stream_turn(text, events))
+        speaking["on"] = True
+        while True:
+            event = await events.get()
+            if event is None:
+                break
+            if abort["on"]:  # you talked over it — stop forwarding the reply
+                continue
+            await websocket.send_json(event)
+        speaking["on"] = False
 
+    def cancel_flush() -> None:
+        if flush["task"]:
+            flush["task"].cancel()
+            flush["task"] = None
+
+    def schedule_flush() -> None:
+        cancel_flush()
+
+        async def _later() -> None:
+            try:
+                await asyncio.sleep(cont_timeout)
+                if pending["text"]:
+                    txt, pending["text"] = pending["text"], ""
+                    await respond(txt)
+            except asyncio.CancelledError:
+                pass
+
+        flush["task"] = asyncio.ensure_future(_later())
+
+    async def handle_utterance(pcm: bytes) -> None:
+        cancel_flush()
+        text, low_conf = await loop.run_in_executor(None, _transcribe_pcm, pcm)
+        if not text.strip():
+            if pending["text"]:
+                schedule_flush()
+            return
+        # clearly misheard, with nothing buffered → ask, don't guess
+        if low_conf and not pending["text"] and _state.get("reprompts"):
+            clip = random.choice(_state["reprompts"])
+            await websocket.send_json({"type": "audio", "seq": 0, **clip})
+            await websocket.send_json({"type": "done", "text": clip["text"]})
+            return
+
+        merged = f"{pending['text']} {text}".strip()
+        kind = classify(merged if pending["text"] else text)
+        if kind == "hold":
+            # "let me finish" — drop it, keep listening
+            await websocket.send_json({"type": "partial", "text": pending["text"]})
+            if pending["text"]:
+                schedule_flush()
+            return
+        if kind == "incomplete":
+            pending["text"] = merged
+            await websocket.send_json({"type": "partial", "text": merged})
+            schedule_flush()
+            return
+        pending["text"] = ""
+        await respond(merged)
+
+    async def consumer() -> None:
+        while True:
+            pcm = await utter_q.get()
+            await handle_utterance(pcm)
+
+    consumer_task = asyncio.ensure_future(consumer())
     try:
         while True:
             msg = await websocket.receive()
             if msg.get("type") == "websocket.disconnect":
                 break
             if (data := msg.get("bytes")) is not None:
-                # barge-in: if you start talking while it's speaking, tell the
-                # browser to stop playback immediately
                 was_speaking = seg.speaking
                 for utter in seg.add(data):
-                    asyncio.ensure_future(run_turn(utter))
+                    utter_q.put_nowait(utter)
+                # barge-in: you started talking while it's speaking → cut it off
                 if seg.speaking and not was_speaking and speaking["on"]:
+                    abort["on"] = True
                     await websocket.send_json({"type": "interrupt"})
             elif (txt := msg.get("text")) is not None:
-                if txt == "stop":  # client asked to end the current utterance
-                    if (utter := seg.flush()) is not None:
-                        asyncio.ensure_future(run_turn(utter))
+                if txt == "flush" and (utter := seg.flush()) is not None:
+                    utter_q.put_nowait(utter)
     except Exception:
         pass
+    finally:
+        cancel_flush()
+        consumer_task.cancel()
 
 
 @app.post("/tts", dependencies=[Depends(require_token)])
