@@ -85,6 +85,11 @@ research:
   results_per_query: 3      # search hits considered per sub-query
   pages_per_query: 2        # pages actually read per sub-query
 
+turn:
+  # if you pause mid-thought it waits this long for you to continue before
+  # answering what it has (raise if it still jumps in; lower if it lags)
+  continuation_timeout: 2.5
+
 profile:
   file: data/profile.md     # your hand-edited "About Me" (gitignored, private)
 
@@ -112,6 +117,8 @@ stt:
   device: cpu               # ctranslate2 has no Metal backend; cpu + int8 is the Apple Silicon path
   compute_type: int8
   beam_size: 2              # 1-2 = much faster decode; 5 = max accuracy
+  min_avg_logprob: -1.0     # below this = probably misheard → ask to repeat
+  max_no_speech: 0.6        # above this = probably wasn't real speech
   silence_duration: 0.7     # seconds of silence that end an utterance (raise if it cuts you off)
   initial_prompt: "Hey Jarvis."   # biases Whisper toward hearing the wake phrase
   input_device_index: null  # null = system default mic; `make mic-test` lists devices
@@ -126,6 +133,8 @@ tts:
   # spoken instantly when the real answer takes longer than ack_after seconds
   acks: ["One sec.", "Hmm, let me think.", "On it.", "Right, give me a moment."]
   ack_after: 0.9
+  # spoken when it can't make out what you said (instead of guessing)
+  reprompts: ["Sorry, I didn't catch that.", "Come again?", "Say that once more?"]
   say_voice: ""             # macOS say fallback; "" = system default
   say_rate: 190
 
