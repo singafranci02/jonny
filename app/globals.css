@@ -175,10 +175,30 @@ button:disabled {
 
 /* ---------- about / profile ---------- */
 
-.profile-link {
+.corner-links {
   position: fixed;
   top: 1.2rem;
   right: 1.4rem;
+  display: flex;
+  gap: 0.6rem;
+}
+
+.ghost-btn {
+  background: transparent;
+  color: var(--dim);
+  font-size: 0.9rem;
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  border-radius: 8px;
+  padding: 0.4rem 0.8rem;
+  cursor: pointer;
+}
+
+.ghost-btn:hover {
+  color: var(--fg);
+  border-color: var(--glow-idle);
+}
+
+.profile-link {
   color: var(--dim);
   text-decoration: none;
   font-size: 0.9rem;

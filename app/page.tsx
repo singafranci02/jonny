@@ -21,6 +21,8 @@ export default function Home() {
   const [lastYou, setLastYou] = useState("");
   const [lastJonny, setLastJonny] = useState("");
   const [error, setError] = useState("");
+  const [showTranscript, setShowTranscript] = useState(false);
+  const [working, setWorking] = useState(false); // long task in flight
 
   const activeRef = useRef(false);
   const streamRef = useRef<MediaStream | null>(null);
@@ -113,7 +115,7 @@ export default function Home() {
         }
 
         const done =
-          (speechStarted && silentMs >= 750) || // finished talking
+          (speechStarted && silentMs >= 600) || // finished talking
           (!speechStarted && elapsedMs >= 9000) || // nobody spoke
           elapsedMs >= 30000 || // hard cap
           !activeRef.current;
@@ -164,6 +166,7 @@ export default function Home() {
 
       // stream the reply; audio starts on the first sentence
       let researchJobId: string | null = null;
+      const workingTimer = setTimeout(() => setWorking(true), 2500);
       try {
         abortRef.current = new AbortController();
         const res = await fetch("/api/chat-stream", {
@@ -193,6 +196,8 @@ export default function Home() {
               shownText += event.text;
               setLastJonny(shownText);
             } else if (event.type === "audio") {
+              clearTimeout(workingTimer);
+              setWorking(false);
               enqueueAudio(event.mp3);
             } else if (event.type === "done") {
               setLastJonny(event.text);
@@ -203,11 +208,15 @@ export default function Home() {
           }
         }
       } catch {
+        clearTimeout(workingTimer);
+        setWorking(false);
         setError("Can't reach the Mac — is it on and the tunnel running?");
         setLastJonny("");
         await new Promise((r) => setTimeout(r, 1500));
         continue;
       }
+      clearTimeout(workingTimer);
+      setWorking(false);
 
       await waitForPlaybackDrained();
       if (researchJobId) pollResearch(researchJobId);
@@ -292,11 +301,15 @@ export default function Home() {
         title={active ? "Click to stop" : "Click to talk"}
       />
       <h1>Jonny</h1>
-      <p className="status">{active ? STATUS[orbState] : STATUS.idle}</p>
-      <div className="transcript">
-        {lastYou && <p className="you">you: {lastYou}</p>}
-        {lastJonny && <p className="jonny">{lastJonny}</p>}
-      </div>
+      <p className="status">
+        {working ? "working on it…" : active ? STATUS[orbState] : STATUS.idle}
+      </p>
+      {showTranscript && (
+        <div className="transcript">
+          {lastYou && <p className="you">you: {lastYou}</p>}
+          {lastJonny && <p className="jonny">{lastJonny}</p>}
+        </div>
+      )}
       {error && <p className="error">{error}</p>}
       {!active && (
         <p className="hint">
@@ -304,9 +317,18 @@ export default function Home() {
           click the light and talk.
         </p>
       )}
-      <a className="profile-link" href="/about">
-        About me
-      </a>
+      <div className="corner-links">
+        <button
+          className="ghost-btn"
+          onClick={() => setShowTranscript((s) => !s)}
+          title="Show or hide the conversation text"
+        >
+          {showTranscript ? "hide text" : "show text"}
+        </button>
+        <a className="profile-link" href="/about">
+          About me
+        </a>
+      </div>
     </main>
   );
 }
