@@ -127,6 +127,10 @@ export default function Home() {
             }
             break;
           }
+          case "partial": // still talking / paused mid-thought — keep listening
+            if (event.text) setLastYou(event.text);
+            setOrbState("listening");
+            break;
           case "transcript":
             setLastYou(event.text);
             setLastJonny("");
