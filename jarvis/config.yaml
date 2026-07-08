@@ -10,11 +10,17 @@ llm:
   # Hybrid brain: each tier picks its own provider + model.
   # provider: ollama (local, free, private) | anthropic | openai_compatible
   tiers:
-    # Everyday voice turns: local qwen3, $0. (~1-2s warm on 16GB.)
-    # Don't use qwen3:4b — its no-think switch is broken in Ollama and it
-    # rambles reasoning out loud. If local ever feels slow, the instant
-    # option is: provider: anthropic, model: claude-haiku-4-5 (pennies/day).
+    # Everyday voice turns: Haiku = answers start in ~1-2s (~$2-4/month at
+    # heavy use). If the cloud is unreachable this degrades automatically to
+    # the free local model below. For $0-but-slower (~5-9s), swap this tier
+    # back to: provider: ollama, model: qwen3:8b.
+    # (Don't use qwen3:4b — broken no-think in Ollama, rambles out loud.)
     default:
+      provider: anthropic
+      model: claude-haiku-4-5
+      max_tokens: 512
+    # Free local fallback used automatically when the cloud tier errors
+    fallback_local:
       provider: ollama
       model: qwen3:8b
       max_tokens: 512
@@ -100,12 +106,13 @@ persona:
 
 stt:
   engine: realtime_stt
-  model: large-v3-turbo     # faster-whisper model; try "small.en" if too slow
+  model: large-v3-turbo     # faster-whisper model for `make voice`
+  web_model: distil-small.en  # server /stt: 0.9s vs ~5s, word-accurate, 1GB less RAM
   language: en              # "" for auto-detect
   device: cpu               # ctranslate2 has no Metal backend; cpu + int8 is the Apple Silicon path
   compute_type: int8
   beam_size: 2              # 1-2 = much faster decode; 5 = max accuracy
-  silence_duration: 1.0     # seconds of silence that end an utterance (raise if it cuts you off)
+  silence_duration: 0.8     # seconds of silence that end an utterance (raise if it cuts you off)
   initial_prompt: "Hey Jarvis."   # biases Whisper toward hearing the wake phrase
   input_device_index: null  # null = system default mic; `make mic-test` lists devices
 
@@ -115,7 +122,10 @@ tts:
                             # bm_lewis / American: am_onyx, am_michael...
   speed: 1.1                # >1 = brisker delivery
   lang_code: b              # 'b' = British English, 'a' = American
-  device: mps               # Apple GPU; blank = cpu
+  device: ""                # cpu: kokoro on MPS fights qwen for the GPU
+  # spoken instantly when the real answer takes longer than ack_after seconds
+  acks: ["One sec.", "Hmm, let me think.", "On it.", "Right, give me a moment."]
+  ack_after: 1.2
   say_voice: ""             # macOS say fallback; "" = system default
   say_rate: 190
 

@@ -48,10 +48,18 @@ class TieredLLM:
         try:
             resp = await backend.chat(system, messages, model_cfg, tier, tools, on_text)
         except Exception:
-            fallback = self.tiers.get("default", {})
-            if model_cfg["provider"] == "ollama" or fallback.get("provider") != "ollama":
+            # cloud failure -> degrade to the local tier (offline resilience)
+            fb_name = next(
+                (
+                    name
+                    for name in ("fallback_local", "default")
+                    if self.tiers.get(name, {}).get("provider") == "ollama"
+                ),
+                None,
+            )
+            if model_cfg["provider"] == "ollama" or fb_name is None:
                 raise
-            backend, model_cfg = self.backend_for("default")
+            backend, model_cfg = self.backend_for(fb_name)
             resp = await backend.chat(system, messages, model_cfg, tier, tools, on_text)
             resp.extra["degraded"] = True
         resp.extra["provider"] = model_cfg["provider"]

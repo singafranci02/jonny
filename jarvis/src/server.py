@@ -58,6 +58,31 @@ async def _startup() -> None:
     await session.warmup()
     _state["session"] = session
     _state["tts"] = None  # lazily built on first /tts call
+    asyncio.ensure_future(_prepare_acks())
+
+
+async def _prepare_acks() -> None:
+    """Pre-synthesize short acknowledgment clips so they can be spoken with
+    zero latency while a slow answer is still being generated."""
+    from .tts import make_tts_engine
+    from .tts.kokoro_tts import SAMPLE_RATE, KokoroTTS
+
+    try:
+        session: Session = _state["session"]
+        if _state.get("tts") is None:
+            _state["tts"] = make_tts_engine(session.cfg)
+        engine = _state["tts"]
+        if not isinstance(engine, KokoroTTS):
+            return
+        loop = asyncio.get_event_loop()
+        clips = []
+        for phrase in session.cfg.get("tts", {}).get("acks", ["One sec."]):
+            audio = await loop.run_in_executor(None, engine.synthesize, phrase)
+            mp3 = await loop.run_in_executor(None, _encode_mp3, audio, SAMPLE_RATE)
+            clips.append({"text": phrase, "mp3": base64.b64encode(mp3).decode()})
+        _state["acks"] = clips
+    except Exception:
+        _state["acks"] = []
 
 
 class ChatIn(BaseModel):
@@ -177,7 +202,7 @@ async def stt(request: Request) -> dict:
 
         scfg = _state["session"].cfg["stt"]
         _state["whisper"] = WhisperModel(
-            scfg.get("model", "large-v3-turbo"),
+            scfg.get("web_model") or scfg.get("model", "large-v3-turbo"),
             device=scfg.get("device", "cpu"),
             compute_type=scfg.get("compute_type", "int8"),
         )
@@ -252,8 +277,25 @@ async def chat_stream(body: ChatIn) -> StreamingResponse:
                 turn_task = asyncio.ensure_future(
                     session.turn(body.message, on_text=on_text)
                 )
+                # if the answer is slow, speak a pre-synthesized ack instantly
+                import random
+                import time as _time
+
+                ack_after = session.cfg.get("tts", {}).get("ack_after", 1.6)
+                started = _time.monotonic()
+                ack_sent = False
                 # synthesize sentences as they complete, while the LLM runs
                 while not turn_task.done() or pending:
+                    if (
+                        not ack_sent
+                        and seq[0] == 0
+                        and not pending
+                        and _state.get("acks")
+                        and _time.monotonic() - started > ack_after
+                    ):
+                        ack = random.choice(_state["acks"])
+                        await events.put({"type": "audio", "seq": -1, **ack})
+                        ack_sent = True
                     if pending:
                         await emit_sentence(pending.pop(0))
                     else:

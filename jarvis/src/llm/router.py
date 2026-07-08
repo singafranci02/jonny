@@ -17,6 +17,26 @@ RESEARCH_TRIGGERS = [
 _NON_TOPICS = {"it", "this", "that", "them", "these", "those", "him", "her"}
 
 
+# hints that a turn probably needs tools (time, web, memory, math...)
+TOOL_HINTS = (
+    "time", "date", "today", "tomorrow", "weather", "news", "latest",
+    "price", "stock", "search", "look up", "google", "remember", "remind",
+    "calculate", "convert", "my notes", "notes say", "knowledge",
+    "research", "investigate",
+)
+
+
+def is_simple(user_message: str, tier: str) -> bool:
+    """Short chit-chat that needs no tools: answer on the slim fast path
+    (skipping tool schemas roughly halves local prefill time)."""
+    if tier != "default":
+        return False
+    if len(user_message.split()) > 14:
+        return False
+    lower = user_message.lower()
+    return not any(h in lower for h in TOOL_HINTS)
+
+
 def pick_tier(user_message: str, routing_cfg: dict) -> str:
     text = user_message.lower()
     if any(kw in text for kw in routing_cfg.get("hard_keywords", [])):
