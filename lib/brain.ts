@@ -6,10 +6,12 @@
 // JARVIS_TOKEN    — same long random string set in the Mac's .env
 
 export function brainConfig(): { url: string; token: string } | null {
-  const url = process.env.MAC_BRAIN_URL;
-  const token = process.env.JARVIS_TOKEN;
+  let url = process.env.MAC_BRAIN_URL?.trim();
+  const token = process.env.JARVIS_TOKEN?.trim();
   if (!url || !token) return null;
-  return { url: url.replace(/\/$/, ""), token };
+  // tolerate a URL entered without a scheme or with a trailing slash
+  if (!/^https?:\/\//i.test(url)) url = `https://${url}`;
+  return { url: url.replace(/\/+$/, ""), token };
 }
 
 export async function brainFetch(
