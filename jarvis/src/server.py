@@ -87,6 +87,9 @@ def _valid_ticket(ticket: str) -> bool:
 
 @app.on_event("startup")
 async def _startup() -> None:
+    import time as _time
+
+    _state["started_at"] = _time.time()
     session = Session()
     await session.warmup()
     _state["session"] = session
@@ -160,7 +163,41 @@ class ResearchIn(BaseModel):
 
 @app.get("/health")
 async def health() -> dict:
-    return {"status": "ok", "ready": "session" in _state}
+    """Liveness + readiness detail for the watchdog and `make doctor`."""
+    import time as _time
+
+    import httpx
+
+    ready = "session" in _state
+    ollama_up = False
+    if ready:
+        url = _state["session"].cfg["llm"].get("ollama", {}).get(
+            "url", "http://localhost:11434"
+        )
+        try:
+            async with httpx.AsyncClient() as c:
+                ollama_up = (await c.get(f"{url}/api/version", timeout=2)).status_code == 200
+        except Exception:
+            ollama_up = False
+    started = _state.get("started_at")
+    return {
+        "status": "ok" if ready else "starting",
+        "ready": ready,
+        "ollama_up": ollama_up,
+        "whisper_warm": _state.get("whisper") is not None,
+        "voice_ready": bool(_state.get("acks")),
+        "turn_model_loaded": _turn_model_loaded(),
+        "uptime_s": round(_time.time() - started) if started else 0,
+    }
+
+
+def _turn_model_loaded() -> bool:
+    try:
+        from .audio import turndetect
+
+        return bool(turndetect._state.get("loaded"))
+    except Exception:
+        return False
 
 
 @app.post("/chat", dependencies=[Depends(require_token)])
