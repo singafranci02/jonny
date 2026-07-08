@@ -1,6 +1,8 @@
 import { NextRequest, NextResponse } from "next/server";
 import { brainFetch } from "@/lib/brain";
 
+export const maxDuration = 60;
+
 // Streams the Mac's Kokoro voice back to the browser (same voice as the
 // Mac). If it fails, the client falls back to the browser's built-in voice.
 
