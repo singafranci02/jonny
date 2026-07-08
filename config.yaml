@@ -112,11 +112,16 @@ persona:
 stt:
   engine: realtime_stt
   model: large-v3-turbo     # faster-whisper model for `make voice`
-  web_model: distil-small.en  # server /stt: 0.9s vs ~5s, word-accurate, 1GB less RAM
+  # web/voice-server model. small.en (~1.2s) gets your names right with the
+  # vocabulary bias below; bump to medium.en for flawless-but-3x-slower.
+  web_model: small.en
   language: en              # "" for auto-detect
   device: cpu               # ctranslate2 has no Metal backend; cpu + int8 is the Apple Silicon path
   compute_type: int8
-  beam_size: 2              # 1-2 = much faster decode; 5 = max accuracy
+  beam_size: 5              # higher = more accurate (small model, still fast)
+  # proper nouns Whisper otherwise mangles ("Mareluna" -> "marijuana"). Names
+  # from your About-Me profile are added automatically; add more here.
+  vocabulary: "Mareluna, Giulia, Ligurian, Jarvis, Jonny"
   min_avg_logprob: -1.0     # below this = probably misheard → ask to repeat
   max_no_speech: 0.6        # above this = probably wasn't real speech
   silence_duration: 0.7     # seconds of silence that end an utterance (raise if it cuts you off)
