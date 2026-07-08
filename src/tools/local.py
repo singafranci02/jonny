@@ -47,28 +47,16 @@ def build() -> list[Tool]:
     return [
         Tool(
             name="get_datetime",
-            description=(
-                "Get the current local date, time, and weekday. Call this "
-                "whenever the answer depends on today's date or the time."
-            ),
+            description="Current local date, time and weekday. Call when the answer depends on today's date or time.",
             parameters={"type": "object", "properties": {}, "required": []},
             func=get_datetime,
         ),
         Tool(
             name="calculate",
-            description=(
-                "Evaluate an arithmetic expression exactly (+ - * / // % **). "
-                "Call this for any non-trivial arithmetic instead of computing "
-                "it yourself."
-            ),
+            description="Exact arithmetic (+ - * / // % **). Call for any non-trivial math instead of computing it yourself.",
             parameters={
                 "type": "object",
-                "properties": {
-                    "expression": {
-                        "type": "string",
-                        "description": "e.g. (1250 * 0.22) + 340",
-                    }
-                },
+                "properties": {"expression": {"type": "string"}},
                 "required": ["expression"],
             },
             func=calculate,

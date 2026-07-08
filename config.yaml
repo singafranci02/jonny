@@ -9,7 +9,10 @@ llm:
   # Hybrid brain: each tier picks its own provider + model.
   # provider: ollama (local, free, private) | anthropic | openai_compatible
   tiers:
-    # Everyday voice turns: local qwen3, $0
+    # Everyday voice turns: local qwen3, $0. (~1-2s warm on 16GB.)
+    # Don't use qwen3:4b — its no-think switch is broken in Ollama and it
+    # rambles reasoning out loud. If local ever feels slow, the instant
+    # option is: provider: anthropic, model: claude-haiku-4-5 (pennies/day).
     default:
       provider: ollama
       model: qwen3:8b
@@ -92,21 +95,24 @@ stt:
   language: en              # "" for auto-detect
   device: cpu               # ctranslate2 has no Metal backend; cpu + int8 is the Apple Silicon path
   compute_type: int8
-  silence_duration: 0.8     # seconds of silence that end an utterance
+  beam_size: 2              # 1-2 = much faster decode; 5 = max accuracy
+  silence_duration: 1.0     # seconds of silence that end an utterance (raise if it cuts you off)
+  initial_prompt: "Hey Jarvis."   # biases Whisper toward hearing the wake phrase
+  input_device_index: null  # null = system default mic; `make mic-test` lists devices
 
 tts:
   engine: kokoro            # kokoro | say (auto-falls back to say on failure)
-  voice: am_onyx            # deep, warm American male. Others: am_michael, am_adam,
-                            # am_eric, am_fenrir, am_liam / female af_heart, af_bella...
-  speed: 0.95               # <1 = more relaxed cadence
-  lang_code: a              # 'a' = American English
+  voice: bm_george          # deep British male. Others: bm_fable, bm_daniel,
+                            # bm_lewis / American: am_onyx, am_michael...
+  speed: 1.1                # >1 = brisker delivery
+  lang_code: b              # 'b' = British English, 'a' = American
   say_voice: ""             # macOS say fallback; "" = system default
   say_rate: 190
 
 memory:
   backend: mem0             # mem0 | none
   user_id: francesco
-  top_k: 5                  # memories injected per turn
+  top_k: 3                  # memories injected per turn (smaller = faster local prefill)
   extraction_llm: claude-haiku-4-5   # cheap model that distills facts after each turn
   embed_model: nomic-embed-text      # local via Ollama, free
   ollama_url: http://localhost:11434
@@ -115,8 +121,8 @@ memory:
 knowledge:
   backend: chroma           # chroma | none
   folder: knowledge         # drop .md/.txt/.pdf files here
-  top_k: 4                  # chunks injected per turn
-  max_distance: 0.75        # cosine distance cutoff; higher = looser matching
+  top_k: 3                  # chunks injected per turn (smaller = faster local prefill)
+  max_distance: 0.65        # cosine distance cutoff; higher = looser matching
   chunk_size: 1500          # chars per chunk
   chunk_overlap: 200
   embed_model: nomic-embed-text

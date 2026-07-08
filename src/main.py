@@ -35,7 +35,16 @@ class Session:
         self.knowledge = make_knowledge_index(self.cfg)
         from .tools import make_tools
 
-        self.tools = make_tools(self.cfg, self.memory, self.knowledge)
+        # the model can request research itself; the active loop picks it up
+        self.pending_research: str | None = None
+
+        def _request_research(topic: str) -> str:
+            self.pending_research = topic
+            return "research started in the background; the user will be told when it's ready"
+
+        self.tools = make_tools(
+            self.cfg, self.memory, self.knowledge, request_research=_request_research
+        )
         self.conversation = Conversation(self.cfg["llm"].get("max_history_turns", 20))
         self.total_cost = 0.0
         self._writebacks: set[asyncio.Task] = set()
@@ -48,20 +57,38 @@ class Session:
             self._watcher = start_watcher(self.knowledge, folder)
 
     async def turn(self, user_message: str, on_text=None) -> LLMResponse:
+        import time
+
         loop = asyncio.get_event_loop()
+        t0 = time.monotonic()
         tier = pick_tier(user_message, self.cfg.get("routing", {}))
-        memories = await loop.run_in_executor(None, self.memory.search, user_message)
-        knowledge = await loop.run_in_executor(
-            None, self.knowledge.search, user_message
+        memories, knowledge = await asyncio.gather(
+            loop.run_in_executor(None, self.memory.search, user_message),
+            loop.run_in_executor(None, self.knowledge.search, user_message),
         )
+        t_retrieve = time.monotonic() - t0
         self.conversation.add_user(
             build_user_content(user_message, memories=memories, knowledge=knowledge)
         )
+
+        first_token = [None]
+
+        def timed_on_text(delta: str) -> None:
+            if first_token[0] is None:
+                first_token[0] = time.monotonic() - t0
+            if on_text is not None:
+                on_text(delta)
+
         try:
-            resp = await self._agent_loop(tier, on_text=on_text)
+            resp = await self._agent_loop(tier, on_text=timed_on_text)
         except Exception:
             self.conversation.messages.pop()  # keep history consistent
             raise
+        resp.extra["timings"] = {
+            "retrieve": t_retrieve,
+            "first_token": first_token[0],
+            "total": time.monotonic() - t0,
+        }
         if resp.extra.get("degraded"):
             console.print("[yellow]cloud API failed — answered with local model[/yellow]")
         self.conversation.add_assistant(resp.text)
@@ -119,6 +146,38 @@ class Session:
             resp.text = "Sorry, I couldn't finish working that one out."
         return resp
 
+    async def warmup(self) -> None:
+        """Pay all the lazy-init costs up front (mem0 ~5s, local model load
+        ~10s) so the first spoken turn is as fast as the rest."""
+        loop = asyncio.get_event_loop()
+
+        async def _warm_llm():
+            try:
+                tier_cfg = self.cfg["llm"]["tiers"]["default"]
+                if tier_cfg.get("provider") == "ollama":
+                    backend, model_cfg = self.llm.backend_for("default")
+                    # use the REAL system prompt + tools so ollama's prompt
+                    # prefix cache is hot for the actual first turn
+                    await backend.chat(
+                        self.system_prompt,
+                        [{"role": "user", "content": "hi"}],
+                        {**model_cfg, "max_tokens": 1},
+                        tools=self.tools,
+                    )
+            except Exception:
+                pass
+
+        def _warm_stores():
+            try:
+                self.memory.search("warmup")
+                self.knowledge.search("warmup")
+            except Exception:
+                pass
+
+        await asyncio.gather(
+            _warm_llm(), loop.run_in_executor(None, _warm_stores)
+        )
+
     async def research(self, topic: str, progress=lambda m: None):
         """Run the deep-research pipeline; returns (report_path, summary)."""
         from .research.pipeline import ResearchPipeline
@@ -140,11 +199,20 @@ class Session:
         cost = f"${resp.cost_usd:.6f}" if resp.cost_usd is not None else "n/a"
         rounds = resp.extra.get("tool_rounds", 0)
         tool_note = f" | tools x{rounds}" if rounds else ""
+        timings = resp.extra.get("timings") or {}
+        timing_note = ""
+        if timings.get("total"):
+            ft = timings.get("first_token")
+            timing_note = (
+                f" | {timings['total']:.1f}s"
+                + (f" (first word {ft:.1f}s)" if ft else "")
+                + f" retrieve {timings.get('retrieve', 0):.1f}s"
+            )
         console.print(
             f"[dim]{resp.model} ({resp.tier}) | "
             f"in {resp.input_tokens} / out {resp.output_tokens} | "
             f"cache read {resp.cache_read_tokens} / write {resp.cache_write_tokens}"
-            f"{tool_note} | turn {cost} | session ${self.total_cost:.6f}[/dim]"
+            f"{tool_note}{timing_note} | turn {cost} | session ${self.total_cost:.6f}[/dim]"
         )
 
 
@@ -157,6 +225,7 @@ async def repl(session: Session) -> None:
         )
     )
     loop = asyncio.get_event_loop()
+    warm = asyncio.ensure_future(session.warmup())
     while True:
         try:
             user_message = await loop.run_in_executor(
@@ -184,6 +253,16 @@ async def repl(session: Session) -> None:
             continue
         console.print(f"[bold cyan]jarvis>[/bold cyan] {resp.text}")
         session.print_usage_line(resp)
+        if session.pending_research:  # model called the deep_research tool
+            topic, session.pending_research = session.pending_research, None
+            try:
+                path, summary = await session.research(
+                    topic, progress=lambda m: console.print(f"[dim]{m}[/dim]")
+                )
+                console.print(f"[bold cyan]jarvis>[/bold cyan] {summary}")
+                console.print(f"[dim]report saved: {path}[/dim]")
+            except Exception as e:
+                console.print(f"[red]research error:[/red] {e}")
     await session.flush()
     console.print(f"[dim]session total: ${session.total_cost:.6f}[/dim]")
 
@@ -197,10 +276,12 @@ async def voice_loop(session: Session) -> None:
     from .tts.streamer import SentenceSpeaker
     from .wakeword import TranscriptGate
 
-    console.print("[dim]loading speech-to-text model (first run downloads it)...[/dim]")
+    console.print("[dim]loading models (speech + memory + local llm)...[/dim]")
     loop = asyncio.get_event_loop()
+    warm = asyncio.ensure_future(session.warmup())  # overlaps with STT load
     stt = await loop.run_in_executor(None, make_stt_engine, session.cfg)
     tts = await loop.run_in_executor(None, make_tts_engine, session.cfg)
+    await warm
     speaker = SentenceSpeaker(tts)
     gate = TranscriptGate(session.cfg)
     hint = (
@@ -254,16 +335,15 @@ async def voice_loop(session: Session) -> None:
             gate.mark_exchange()
             console.print(f"[bold green]you>[/bold green] {user_message}")
 
-            topic = detect_research(user_message)
-            if topic:
-                speaker.reset()
-                await loop.run_in_executor(
-                    None,
-                    speaker.speak_now,
-                    "On it. I'll let you know when the research is done.",
-                )
-
-                async def _bg_research(t=topic):
+            def launch_research(t: str, announce: bool) -> None:
+                async def _bg_research():
+                    if announce:
+                        speaker.reset()
+                        await loop.run_in_executor(
+                            None,
+                            speaker.speak_now,
+                            "On it. I'll let you know when the research is done.",
+                        )
                     try:
                         path, summary = await session.research(
                             t, progress=lambda m: console.print(f"[dim]research: {m}[/dim]")
@@ -278,6 +358,10 @@ async def voice_loop(session: Session) -> None:
                     gate.mark_exchange()
 
                 asyncio.ensure_future(_bg_research())
+
+            topic = detect_research(user_message)
+            if topic:
+                launch_research(topic, announce=True)
                 continue
 
             speaker.reset()
@@ -296,6 +380,9 @@ async def voice_loop(session: Session) -> None:
             session.print_usage_line(resp)
             await loop.run_in_executor(None, speaker.finish)
             gate.mark_exchange()  # window starts when Jarvis finishes talking
+            if session.pending_research:  # model called the deep_research tool
+                topic, session.pending_research = session.pending_research, None
+                launch_research(topic, announce=False)
     except (KeyboardInterrupt, asyncio.CancelledError):
         pass
     finally:
@@ -314,6 +401,17 @@ async def once(session: Session, message: str) -> int:
         return 1
     console.print(resp.text)
     session.print_usage_line(resp)
+    if session.pending_research:  # model called the deep_research tool
+        topic, session.pending_research = session.pending_research, None
+        try:
+            path, summary = await session.research(
+                topic, progress=lambda m: console.print(f"[dim]{m}[/dim]")
+            )
+            console.print(summary)
+            console.print(f"[dim]report saved: {path}[/dim]")
+        except Exception as e:
+            console.print(f"[red]research error:[/red] {e}")
+            return 1
     await session.flush()
     return 0
 

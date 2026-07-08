@@ -29,8 +29,20 @@ weights, and macOS will ask for microphone permission for your terminal.
 If Kokoro fails to load for any reason, Jarvis speaks through the built-in
 macOS `say` voice instead.
 
-Each reply prints the model used, token counts (incl. cache read/write), the
-turn cost, and the running session total.
+Each reply prints the model used, token counts, timings (`6.5s (first word
+3.9s) retrieve 0.1s`), the turn cost, and the running session total.
+
+**If it hears you wrong or not at all:** run `make mic-test` — it shows
+exactly what Whisper hears and how long transcription takes; `make mic-test
+ARGS="--devices"` lists microphones (set `stt.input_device_index` in
+`config.yaml` if the wrong one is used). If it clips you mid-sentence,
+raise `stt.silence_duration`.
+
+**If replies feel slow:** local qwen3:8b takes ~4s to the first spoken word
+on 16GB. For near-instant replies, switch the `default` tier in
+`config.yaml` to `provider: anthropic, model: claude-haiku-4-5`
+(pennies/day). Don't use qwen3:4b — its no-think switch is broken in
+Ollama and it rambles its reasoning out loud.
 
 ## Model routing (hybrid brain)
 

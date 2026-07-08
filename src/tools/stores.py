@@ -24,12 +24,7 @@ def build(memory, knowledge) -> list[Tool]:
     return [
         Tool(
             name="search_memory",
-            description=(
-                "Search long-term memories about Francesco (projects, "
-                "preferences, people, deadlines). Call this when the question "
-                "involves something he may have told you before that isn't "
-                "already in the MEMORIES context."
-            ),
+            description="Search stored facts about Francesco. Call when the question involves something he told you before that isn't in MEMORIES.",
             parameters={
                 "type": "object",
                 "properties": {"query": {"type": "string"}},
@@ -39,10 +34,7 @@ def build(memory, knowledge) -> list[Tool]:
         ),
         Tool(
             name="remember",
-            description=(
-                "Store a durable fact about Francesco. Call this when he "
-                "explicitly asks you to remember something."
-            ),
+            description="Store a durable fact when Francesco asks you to remember something.",
             parameters={
                 "type": "object",
                 "properties": {"fact": {"type": "string"}},
@@ -52,12 +44,7 @@ def build(memory, knowledge) -> list[Tool]:
         ),
         Tool(
             name="search_knowledge",
-            description=(
-                "Search Francesco's own notes and documents (the knowledge "
-                "folder). Call this when the question is about his projects, "
-                "research, or files and the KNOWLEDGE context doesn't already "
-                "answer it. Cite the source file in your answer."
-            ),
+            description="Search Francesco's notes and documents. Call when the question is about his projects or files and KNOWLEDGE doesn't answer it. Cite the source file.",
             parameters={
                 "type": "object",
                 "properties": {"query": {"type": "string"}},
