@@ -3,7 +3,6 @@
 import { useEffect, useRef, useState } from "react";
 
 type OrbState = "idle" | "listening" | "thinking" | "speaking";
-type ChatMessage = { role: "user" | "assistant"; content: string };
 
 const STATUS: Record<OrbState, string> = {
   idle: "tap the light to wake Jonny",
@@ -20,7 +19,7 @@ export default function Home() {
   const [error, setError] = useState("");
 
   const recognitionRef = useRef<any>(null);
-  const historyRef = useRef<ChatMessage[]>([]);
+  const audioRef = useRef<HTMLAudioElement | null>(null);
   const activeRef = useRef(false);
   const busyRef = useRef(false); // true while thinking or speaking
 
@@ -84,38 +83,89 @@ export default function Home() {
     setError("");
     setOrbState("thinking");
 
-    historyRef.current.push({ role: "user", content: text });
+    // The Mac brain holds the real conversation history — send only the message.
     let reply = "";
+    let researchJobId: string | null = null;
     try {
       const res = await fetch("/api/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ messages: historyRef.current }),
+        body: JSON.stringify({ message: text }),
       });
       if (res.status === 401) {
         window.location.href = "/login";
         return;
       }
-      if (!res.ok) throw new Error(`api ${res.status}`);
-      reply = (await res.json()).text;
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        reply = body.error || "Sorry, I couldn't reach my brain.";
+      } else {
+        const data = await res.json();
+        reply = data.text;
+        researchJobId = data.researchJobId;
+      }
     } catch {
-      reply = "Sorry, I hit an error reaching my brain.";
+      reply = "Sorry, I can't reach the Mac right now.";
     }
 
-    historyRef.current.push({ role: "assistant", content: reply });
-    if (historyRef.current.length > 40) {
-      historyRef.current = historyRef.current.slice(-40);
-    }
     setLastJonny(reply);
-    speak(reply);
+    speak(reply, () => {
+      if (researchJobId) pollResearch(researchJobId);
+    });
   }
 
-  function speak(text: string) {
+  function pollResearch(jobId: string) {
+    const started = Date.now();
+    const tick = async () => {
+      if (Date.now() - started > 10 * 60 * 1000) return; // give up after 10 min
+      try {
+        const res = await fetch(`/api/research?job=${encodeURIComponent(jobId)}`);
+        const data = await res.json();
+        if (data.status === "done") {
+          setLastJonny(data.summary);
+          speak(data.summary);
+          return;
+        }
+        if (data.status === "error") return;
+      } catch {
+        /* keep polling */
+      }
+      setTimeout(tick, 5000);
+    };
+    setTimeout(tick, 5000);
+  }
+
+  // Play the Mac's Kokoro voice; fall back to the browser voice if unreachable.
+  async function speak(text: string, after?: () => void) {
     const done = () => {
       busyRef.current = false;
-      if (activeRef.current) startListening();
+      if (after) after();
+      else if (activeRef.current) startListening();
       else setOrbState("idle");
     };
+    setOrbState("speaking");
+    try {
+      const res = await fetch("/api/tts", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text }),
+      });
+      if (res.ok) {
+        const blob = await res.blob();
+        const audio = new Audio(URL.createObjectURL(blob));
+        audioRef.current = audio;
+        audio.onended = done;
+        audio.onerror = () => browserSpeak(text, done);
+        await audio.play();
+        return;
+      }
+    } catch {
+      /* fall through to browser voice */
+    }
+    browserSpeak(text, done);
+  }
+
+  function browserSpeak(text: string, done: () => void) {
     if (typeof speechSynthesis === "undefined") {
       done();
       return;
@@ -125,8 +175,15 @@ export default function Home() {
     utterance.rate = 1.05;
     utterance.onend = done;
     utterance.onerror = done;
-    setOrbState("speaking");
     speechSynthesis.speak(utterance);
+  }
+
+  function stopSpeaking() {
+    if (audioRef.current) {
+      audioRef.current.pause();
+      audioRef.current = null;
+    }
+    if (typeof speechSynthesis !== "undefined") speechSynthesis.cancel();
   }
 
   function toggleActive() {
@@ -135,7 +192,7 @@ export default function Home() {
       activeRef.current = false;
       busyRef.current = false;
       stopListening();
-      if (typeof speechSynthesis !== "undefined") speechSynthesis.cancel();
+      stopSpeaking();
       setOrbState("idle");
     } else {
       setError("");
@@ -148,7 +205,7 @@ export default function Home() {
   useEffect(() => {
     return () => {
       stopListening();
-      if (typeof speechSynthesis !== "undefined") speechSynthesis.cancel();
+      stopSpeaking();
     };
   }, []);
 
@@ -173,6 +230,9 @@ export default function Home() {
           Jonny listens continuously while awake and answers out loud.
         </p>
       )}
+      <a className="profile-link" href="/about">
+        About me
+      </a>
     </main>
   );
 }
