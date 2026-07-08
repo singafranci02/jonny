@@ -44,14 +44,33 @@ class Tool:
             return f"{type(e).__name__}: {e}", True
 
 
-def make_tools(cfg: dict, memory, knowledge) -> list[Tool]:
+def make_tools(cfg: dict, memory, knowledge, request_research=None) -> list[Tool]:
     from . import local, stores, web
 
-    return [
+    tools = [
         *local.build(),
         *web.build(cfg),
         *stores.build(memory, knowledge),
     ]
+    if request_research is not None:
+        tools.append(
+            Tool(
+                name="deep_research",
+                description=(
+                    "Start a background deep-research job producing a cited "
+                    "report. Call when asked to research or investigate a "
+                    "topic; NOT for quick lookups (use web_search). Tell the "
+                    "user it has started."
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {"topic": {"type": "string"}},
+                    "required": ["topic"],
+                },
+                func=request_research,
+            )
+        )
+    return tools
 
 
 def run_tool(tools: list[Tool], name: str, arguments: dict) -> tuple[str, bool]:

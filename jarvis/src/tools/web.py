@@ -70,11 +70,7 @@ def build(cfg: dict) -> list[Tool]:
     return [
         Tool(
             name="web_search",
-            description=(
-                "Search the web. Call this when the answer depends on current "
-                "events, prices, weather, news, or anything you don't reliably "
-                "know. Returns JSON results with title, url, snippet."
-            ),
+            description="Web search. Call for current events, prices, weather, news, or anything you don't reliably know.",
             parameters={
                 "type": "object",
                 "properties": {"query": {"type": "string"}},
@@ -84,11 +80,7 @@ def build(cfg: dict) -> list[Tool]:
         ),
         Tool(
             name="fetch_page",
-            description=(
-                "Fetch a web page and return its readable text. Call this "
-                "after web_search when a snippet isn't enough and you need "
-                "the actual page content."
-            ),
+            description="Fetch a page's readable text. Call after web_search when a snippet isn't enough.",
             parameters={
                 "type": "object",
                 "properties": {"url": {"type": "string"}},

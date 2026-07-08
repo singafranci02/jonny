@@ -41,6 +41,10 @@ ingest:
 research:
 	$(PY) -m src.research.cli $(ARGS)
 
+# diagnose listening problems (ARGS="--devices" lists microphones)
+mic-test:
+	$(PY) -m src.stt.mictest $(ARGS)
+
 AGENT_ID := com.francescotomatis.jarvis
 AGENT_PLIST := $(HOME)/Library/LaunchAgents/$(AGENT_ID).plist
 

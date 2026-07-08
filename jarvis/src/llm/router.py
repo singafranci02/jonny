@@ -5,12 +5,16 @@ from __future__ import annotations
 import re
 
 RESEARCH_TRIGGERS = [
-    r"\bresearch\b",
-    r"\bdeep dive\b",
+    r"\b(?:do\s+(?:some\s+)?)?research(?:\s+(?:on|about|into))?\b",
+    r"\bdeep dive(?:\s+(?:on|into))?\b",
     r"\binvestigate\b",
-    r"\bwrite (?:me )?a report\b",
+    r"\bwrite (?:me )?a report (?:on|about)\b",
     r"\blook into\b",
+    r"\bfind out (?:everything |all )?(?:about|on)\b",
+    r"\bgive me a (?:full |detailed )?(?:rundown|breakdown) (?:on|of|about)\b",
 ]
+
+_NON_TOPICS = {"it", "this", "that", "them", "these", "those", "him", "her"}
 
 
 def pick_tier(user_message: str, routing_cfg: dict) -> str:
@@ -28,8 +32,9 @@ def detect_research(user_message: str) -> str | None:
     for pattern in RESEARCH_TRIGGERS:
         match = re.search(pattern, text)
         if match:
-            topic = user_message[match.end():].strip(" :,-—")
-            # "research X" needs an actual X; "can you research it" does not count
-            if len(topic.split()) >= 2:
+            topic = user_message[match.end():].strip(" :,-—.?!")
+            words = topic.split()
+            # "research crypto" counts; "can you research it" does not
+            if words and topic.lower() not in _NON_TOPICS:
                 return topic
     return None
