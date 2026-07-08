@@ -129,24 +129,32 @@ terminal first and grant it there.
 
 The [Jonny](https://github.com/singafranci02/jonny) website is a thin client
 onto **this** Mac brain — same local model, tools, research, memory, profile,
-and Kokoro voice. `make serve` runs the brain as an HTTP server; a Cloudflare
-tunnel exposes it so the Vercel site (and your phone) can reach it.
+and Kokoro voice. The Mac serves its brain over HTTP; a tunnel gives it a
+stable public URL that only the Vercel site talks to (your password protects
+it, and the browser never sees the token).
+
+### Always-on setup (do it once, never again)
 
 ```sh
-# one time
-brew install cloudflared
-openssl rand -hex 24            # put the result in .env as JARVIS_TOKEN
-
-# every time you want the website live
-make serve                     # terminal 1 — the brain (needs JARVIS_TOKEN in .env)
-./scripts/tunnel.sh            # terminal 2 — prints a https://<...>.trycloudflare.com URL
+openssl rand -hex 24           # already added to .env as JARVIS_TOKEN
+make install-web               # brain auto-starts on login and stays up
 ```
 
-Then in the Vercel project settings add two env vars and redeploy:
-`MAC_BRAIN_URL` = the tunnel URL, `JARVIS_TOKEN` = the same string as in `.env`.
-(The quick-tunnel URL changes each run; for a permanent URL, set up a
-Cloudflare **Named Tunnel** with your own domain — one-time, then the URL is
-stable.) When the Mac is off, the website says so instead of answering.
+Then a **stable tunnel** so the URL never changes (invisible plumbing — only
+Vercel uses it). Easiest free option is Tailscale:
+
+```sh
+brew install --cask tailscale  # sign in once (e.g. Google)
+tailscale funnel --bg 8765     # permanent https://<mac>.<tailnet>.ts.net URL
+```
+
+In Vercel (once): set `MAC_BRAIN_URL` to that ts.net URL and `JARVIS_TOKEN` to
+the value from `.env`, then redeploy. Point **jonnybot.xyz** at the Vercel
+project (its DNS is already on Vercel) so you just visit jonnybot.xyz to talk.
+
+After that the Mac (always on) starts everything itself — no terminals, no
+Vercel edits. Quick manual alternative for testing: `make serve` +
+`./scripts/tunnel.sh` (ephemeral URL). When the Mac is off, the site says so.
 
 The About Me profile ([data/profile.md](data/profile.md)) is editable from the
 website's **About me** page or by hand; both the website and `make voice` read

@@ -4,7 +4,7 @@ VENV := .venv
 PIP := $(VENV)/bin/pip
 PY := $(VENV)/bin/python
 
-.PHONY: setup setup-voice run chat voice memory ingest research serve install-agent uninstall-agent push test-once clean
+.PHONY: setup setup-voice run chat voice memory ingest research serve install-agent uninstall-agent install-web uninstall-web push test-once clean
 
 setup:
 	$(PYTHON) -m venv $(VENV)
@@ -63,6 +63,24 @@ install-agent:
 uninstall-agent:
 	launchctl unload $(AGENT_PLIST) 2>/dev/null || true
 	rm -f $(AGENT_PLIST)
+	@echo "Removed."
+
+WEB_AGENT_ID := com.francescotomatis.jarvis-web
+WEB_AGENT_PLIST := $(HOME)/Library/LaunchAgents/$(WEB_AGENT_ID).plist
+
+# run the brain server on login & keep it alive, so the website is always
+# reachable (pair with `tailscale funnel --bg 8765`). Needs JARVIS_TOKEN in .env.
+install-web:
+	@grep -q '^JARVIS_TOKEN=.\+' .env || (echo "Set JARVIS_TOKEN in .env first (run: openssl rand -hex 24)"; exit 1)
+	mkdir -p $(HOME)/Library/LaunchAgents
+	sed "s|__ROOT__|$(CURDIR)|g" scripts/$(WEB_AGENT_ID).plist > $(WEB_AGENT_PLIST)
+	launchctl unload $(WEB_AGENT_PLIST) 2>/dev/null || true
+	launchctl load $(WEB_AGENT_PLIST)
+	@echo "Brain server runs on login now. Logs: tail -f data/jarvis-web.log"
+
+uninstall-web:
+	launchctl unload $(WEB_AGENT_PLIST) 2>/dev/null || true
+	rm -f $(WEB_AGENT_PLIST)
 	@echo "Removed."
 
 # publish committed Jarvis work into the shared jonny repo (jarvis/ subtree)
