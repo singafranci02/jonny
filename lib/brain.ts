@@ -28,6 +28,8 @@ export async function brainFetch(
     headers: {
       ...(init.headers || {}),
       Authorization: `Bearer ${cfg.token}`,
+      // skip ngrok's free-tier browser interstitial (harmless on other tunnels)
+      "ngrok-skip-browser-warning": "1",
     },
     // the Mac can take a few seconds (local model); allow generous time
     signal: AbortSignal.timeout(120_000),
