@@ -13,10 +13,13 @@ from __future__ import annotations
 
 def build_user_content(
     user_message: str,
+    profile: str | None = None,
     memories: list[str] | None = None,
     knowledge: list[tuple[str, str]] | None = None,  # (source_file, chunk)
 ) -> str:
     parts: list[str] = []
+    if profile:
+        parts.append("ABOUT THE USER (their own profile):\n" + profile)
     if memories:
         parts.append("MEMORIES:\n" + "\n".join(f"- {m}" for m in memories))
     if knowledge:

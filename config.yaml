@@ -78,6 +78,14 @@ research:
   results_per_query: 3      # search hits considered per sub-query
   pages_per_query: 2        # pages actually read per sub-query
 
+profile:
+  file: data/profile.md     # your hand-edited "About Me" (gitignored, private)
+
+server:
+  port: 8765
+  # token that the web app must send to reach this Mac. Set JARVIS_TOKEN in .env
+  # to any long random string, and set the same value in Vercel.
+
 wakeword:
   enabled: true             # require the phrase before responding (voice mode)
   phrase: hey jarvis

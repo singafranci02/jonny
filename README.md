@@ -125,6 +125,33 @@ terminal first and grant it there.
 - Kokoro fails to load → speech falls back to macOS `say`.
 - Memory extraction failures log and never break a turn.
 
+## The web dashboard (Jonny) as a remote face
+
+The [Jonny](https://github.com/singafranci02/jonny) website is a thin client
+onto **this** Mac brain — same local model, tools, research, memory, profile,
+and Kokoro voice. `make serve` runs the brain as an HTTP server; a Cloudflare
+tunnel exposes it so the Vercel site (and your phone) can reach it.
+
+```sh
+# one time
+brew install cloudflared
+openssl rand -hex 24            # put the result in .env as JARVIS_TOKEN
+
+# every time you want the website live
+make serve                     # terminal 1 — the brain (needs JARVIS_TOKEN in .env)
+./scripts/tunnel.sh            # terminal 2 — prints a https://<...>.trycloudflare.com URL
+```
+
+Then in the Vercel project settings add two env vars and redeploy:
+`MAC_BRAIN_URL` = the tunnel URL, `JARVIS_TOKEN` = the same string as in `.env`.
+(The quick-tunnel URL changes each run; for a permanent URL, set up a
+Cloudflare **Named Tunnel** with your own domain — one-time, then the URL is
+stable.) When the Mac is off, the website says so instead of answering.
+
+The About Me profile ([data/profile.md](data/profile.md)) is editable from the
+website's **About me** page or by hand; both the website and `make voice` read
+it on every turn.
+
 ## Memory
 
 Facts you mention get distilled by Claude Haiku after each turn (in the
@@ -171,8 +198,10 @@ src/tts/             TTSEngine interface + Kokoro and macOS `say` backends
 src/memory/          MemoryStore interface + Mem0 backend + CLI
 src/knowledge/       KnowledgeIndex: chunker, Ollama embeddings, Chroma, watcher
 src/wakeword/        transcript gate (wake phrase + conversation window)
-src/context.py       prompt assembly (persona + memories + knowledge + history)
-scripts/             LaunchAgent plist template
+src/server.py        FastAPI brain server (chat/research/profile/tts) for the web app
+src/profile.py       About Me profile (editable steering, injected every turn)
+src/context.py       prompt assembly (profile + memories + knowledge + history)
+scripts/             LaunchAgent plist + tunnel.sh
 src/main.py          async chat + voice loops
 knowledge/           drop notes/PDFs here (Phase 4)
 data/                vector DB + memory store (gitignored)
