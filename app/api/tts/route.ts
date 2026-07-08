@@ -19,7 +19,9 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: "tts unavailable" }, { status: res.status });
     }
     return new Response(res.body, {
-      headers: { "content-type": "audio/wav" },
+      headers: {
+        "content-type": res.headers.get("content-type") || "audio/mpeg",
+      },
     });
   } catch {
     return NextResponse.json({ error: "tts unreachable" }, { status: 502 });
