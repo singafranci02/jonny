@@ -203,7 +203,18 @@ services start themselves at login (macOS LaunchAgents in `scripts/`):
 |---|---|---|
 | `jarvis-web` | the brain as an HTTP server (`src/server.py`, port 8765) | `make install-web` |
 | `jarvis-tunnel` | ngrok — the permanent public URL to the Mac | `make install-tunnel NGROK_URL=…` |
+| `jarvis-watchdog` | restarts the brain within ~60s if it wedges (`src/ops/watchdog.py`) | `make install-watchdog` |
 | `jarvis` (optional) | always-on `make voice` mic loop | `make install-agent` |
+
+**Never silently dies.** Each LaunchAgent has `KeepAlive` (SuccessfulExit
+false) so launchd restarts a crash immediately — verified: a `kill -9` on the
+brain recovered in 16s. The watchdog is a second layer for a process that's
+alive but wedged. For the Mac itself, `sudo ./scripts/mac-liveness.sh` stops
+it sleeping and makes it power back on after an outage (plus one manual
+Energy-settings click the script explains). Check everything with
+**`make doctor`** (green/red per component) and **`make status`** (where to
+reach it). The health endpoint (`GET /health`) reports brain/ollama/models/
+uptime and feeds both.
 
 **The tunnel:** Vercel (cloud) can't reach into your Mac directly, so ngrok
 gives the Mac a fixed public address (`…ngrok-free.dev`). Vercel is

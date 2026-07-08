@@ -4,7 +4,7 @@ VENV := .venv
 PIP := $(VENV)/bin/pip
 PY := $(VENV)/bin/python
 
-.PHONY: setup setup-voice run chat voice memory ingest research serve install-agent uninstall-agent install-web uninstall-web install-tunnel uninstall-tunnel push test-once clean
+.PHONY: setup setup-voice run chat voice memory ingest research serve install-agent uninstall-agent install-web uninstall-web install-tunnel uninstall-tunnel install-watchdog uninstall-watchdog doctor status push test-once clean
 
 setup:
 	$(PYTHON) -m venv $(VENV)
@@ -101,6 +101,29 @@ uninstall-tunnel:
 	launchctl unload $(TUNNEL_AGENT_PLIST) 2>/dev/null || true
 	rm -f $(TUNNEL_AGENT_PLIST)
 	@echo "Removed."
+
+WATCHDOG_ID := com.francescotomatis.jarvis-watchdog
+WATCHDOG_PLIST := $(HOME)/Library/LaunchAgents/$(WATCHDOG_ID).plist
+
+# watchdog: restarts the brain within ~60s if it ever dies
+install-watchdog:
+	mkdir -p $(HOME)/Library/LaunchAgents
+	sed "s|__ROOT__|$(CURDIR)|g" scripts/$(WATCHDOG_ID).plist > $(WATCHDOG_PLIST)
+	launchctl unload $(WATCHDOG_PLIST) 2>/dev/null || true
+	launchctl load $(WATCHDOG_PLIST)
+	@echo "Watchdog running. It keeps the brain alive."
+
+uninstall-watchdog:
+	launchctl unload $(WATCHDOG_PLIST) 2>/dev/null || true
+	rm -f $(WATCHDOG_PLIST)
+	@echo "Removed."
+
+# is it live, and is everything healthy?
+doctor:
+	$(PY) -m src.ops.doctor
+
+status:
+	$(PY) -m src.ops.doctor status
 
 # publish committed Jarvis work into the shared jonny repo (jarvis/ subtree)
 JONNY_REPO := $(HOME)/jonny
