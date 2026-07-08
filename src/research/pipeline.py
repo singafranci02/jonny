@@ -22,9 +22,10 @@ from ..tools.web import fetch_page, web_search
 PLAN_PROMPT = """You are planning web research on this topic:
 
 {topic}
-
+{user_context}
 Output ONLY a JSON array of 3 to 5 distinct, specific web search queries
-covering complementary angles of the topic. No other text."""
+covering complementary angles of the topic — angled toward what would
+actually be useful to this user. No other text."""
 
 NOTES_PROMPT = """TOPIC: {topic}
 SOURCE URL: {url}
@@ -40,7 +41,7 @@ SYNTH_PROMPT = """Write a markdown research report on the topic below, using ONL
 the sourced notes provided.
 
 TOPIC: {topic}
-
+{user_context}
 NOTES (each block is one numbered source):
 {notes}
 
@@ -69,10 +70,14 @@ class ResearchPipeline:
         self.pages_per_query = rcfg.get("pages_per_query", 2)
         self.out_dir = ROOT / cfg["knowledge"].get("folder", "knowledge") / "research"
 
-    async def _plan(self, topic: str, progress) -> list[str]:
+    async def _plan(self, topic: str, user_context: str, progress) -> list[str]:
         progress("planning search queries...")
         resp = await self.llm.chat(
-            RESEARCH_SYSTEM, [{"role": "user", "content": PLAN_PROMPT.format(topic=topic)}],
+            RESEARCH_SYSTEM,
+            [{
+                "role": "user",
+                "content": PLAN_PROMPT.format(topic=topic, user_context=user_context),
+            }],
             tier="research",
         )
         match = re.search(r"\[.*\]", resp.text, re.DOTALL)
@@ -115,7 +120,9 @@ class ResearchPipeline:
                 sources.append({"url": url, "title": hit.get("title", url), "notes": notes.text})
         return sources
 
-    async def _synthesize(self, topic: str, sources: list[dict], progress) -> str:
+    async def _synthesize(
+        self, topic: str, user_context: str, sources: list[dict], progress
+    ) -> str:
         progress(f"synthesizing report from {len(sources)} sources...")
         notes_block = "\n\n".join(
             f"[{i + 1}] {s['title']}\nURL: {s['url']}\n{s['notes']}"
@@ -125,19 +132,29 @@ class ResearchPipeline:
             RESEARCH_SYSTEM,
             [{
                 "role": "user",
-                "content": SYNTH_PROMPT.format(topic=topic, notes=notes_block),
+                "content": SYNTH_PROMPT.format(
+                    topic=topic, user_context=user_context, notes=notes_block
+                ),
             }],
             tier="research",
         )
         return resp.text
 
-    async def run(self, topic: str, progress=lambda msg: None) -> tuple[Path, str]:
-        """Returns (report_path, speakable_summary)."""
-        queries = await self._plan(topic, progress)
+    async def run(
+        self, topic: str, progress=lambda msg: None, user_context: str = ""
+    ) -> tuple[Path, str]:
+        """Returns (report_path, speakable_summary). user_context: profile +
+        relevant memories, so the research is angled at THIS user."""
+        if user_context:
+            user_context = (
+                "\nWhat you know about the user (tailor the research to them):\n"
+                f"{user_context}\n"
+            )
+        queries = await self._plan(topic, user_context, progress)
         sources = await self._gather(topic, queries, progress)
         if not sources:
             raise RuntimeError("research found no readable sources")
-        report = await self._synthesize(topic, sources, progress)
+        report = await self._synthesize(topic, user_context, sources, progress)
 
         self.out_dir.mkdir(parents=True, exist_ok=True)
         path = self.out_dir / f"{slugify(topic)}-{date.today():%Y%m%d}.md"

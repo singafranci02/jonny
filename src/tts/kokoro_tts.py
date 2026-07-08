@@ -22,7 +22,10 @@ class KokoroTTS(TTSEngine):
         self.voice = tcfg.get("voice", "af_heart")
         self.speed = tcfg.get("speed", 1.0)
         # 'a' = American English G2P; see kokoro docs for other languages
-        self.pipeline = KPipeline(lang_code=tcfg.get("lang_code", "a"))
+        self.pipeline = KPipeline(
+            lang_code=tcfg.get("lang_code", "a"),
+            device=tcfg.get("device") or None,  # "mps" = Apple GPU, faster
+        )
         self._sd = sounddevice
         self._playing = False
 

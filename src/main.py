@@ -70,10 +70,11 @@ class Session:
             loop.run_in_executor(None, profile_for_prompt, self.cfg),
         )
         t_retrieve = time.monotonic() - t0
-        self.conversation.add_user(
-            build_user_content(
-                user_message, profile=profile, memories=memories, knowledge=knowledge
-            )
+        # history keeps only the bare message; profile/memories/knowledge are
+        # injected transiently into THIS call, so prompts don't balloon
+        self.conversation.add_user(user_message)
+        enriched = build_user_content(
+            user_message, profile=profile, memories=memories, knowledge=knowledge
         )
 
         first_token = [None]
@@ -84,8 +85,12 @@ class Session:
             if on_text is not None:
                 on_text(delta)
 
+        scratch = [
+            *self.conversation.messages[:-1],
+            {"role": "user", "content": enriched},
+        ]
         try:
-            resp = await self._agent_loop(tier, on_text=timed_on_text)
+            resp = await self._agent_loop(tier, scratch, on_text=timed_on_text)
         except Exception:
             self.conversation.messages.pop()  # keep history consistent
             raise
@@ -109,7 +114,7 @@ class Session:
         return resp
 
     async def _agent_loop(
-        self, tier: str, max_rounds: int = 5, on_text=None
+        self, tier: str, scratch: list[dict], max_rounds: int = 5, on_text=None
     ) -> LLMResponse:
         """Call the LLM with tools; execute tool calls until it answers.
 
@@ -120,7 +125,6 @@ class Session:
         from .tools import run_tool
 
         loop = asyncio.get_event_loop()
-        scratch = list(self.conversation.messages)
         totals = {"input": 0, "output": 0, "cost": 0.0, "rounds": 0}
 
         resp = await self.llm.chat(
@@ -185,10 +189,21 @@ class Session:
 
     async def research(self, topic: str, progress=lambda m: None):
         """Run the deep-research pipeline; returns (report_path, summary)."""
+        from .profile import profile_for_prompt
         from .research.pipeline import ResearchPipeline
 
+        loop = asyncio.get_event_loop()
+        profile, memories = await asyncio.gather(
+            loop.run_in_executor(None, profile_for_prompt, self.cfg),
+            loop.run_in_executor(None, self.memory.search, topic),
+        )
+        user_context = "\n".join(
+            filter(None, [profile, *(f"- {m}" for m in memories)])
+        )
         pipeline = ResearchPipeline(self.cfg, self.llm)
-        path, summary = await pipeline.run(topic, progress=progress)
+        path, summary = await pipeline.run(
+            topic, progress=progress, user_context=user_context
+        )
         self.conversation.add_user(f"(I asked you to research: {topic})")
         self.conversation.add_assistant(
             f"(research done, saved to {path.name}) {summary}"

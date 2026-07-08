@@ -4,7 +4,8 @@
 
 llm:
   # How many past user/assistant turns to keep in the prompt
-  max_history_turns: 20
+  # (smaller = faster local prefill; memory recalls older facts anyway)
+  max_history_turns: 10
 
   # Hybrid brain: each tier picks its own provider + model.
   # provider: ollama (local, free, private) | anthropic | openai_compatible
@@ -39,7 +40,7 @@ llm:
 
   ollama:
     url: http://localhost:11434
-    keep_alive: 30m         # keep the local model resident between turns
+    keep_alive: -1          # never unload: cold model load costs ~30s on 16GB
 
   # USD per 1M tokens (Sonnet 5 intro pricing through 2026-08-31,
   # then 3.00 / 15.00; cache write = 1.25x input, cache read = 0.1x)
@@ -114,6 +115,7 @@ tts:
                             # bm_lewis / American: am_onyx, am_michael...
   speed: 1.1                # >1 = brisker delivery
   lang_code: b              # 'b' = British English, 'a' = American
+  device: mps               # Apple GPU; blank = cpu
   say_voice: ""             # macOS say fallback; "" = system default
   say_rate: 190
 
