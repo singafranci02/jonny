@@ -312,6 +312,9 @@ export default function Home() {
         <a className="profile-link" href="/about">
           About me
         </a>
+        <a className="profile-link" href="/files">
+          Files
+        </a>
       </div>
     </main>
   );
