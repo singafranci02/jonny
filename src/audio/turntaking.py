@@ -68,26 +68,21 @@ def classify(text: str) -> str:
 
     terminal = stripped[-1] in ".!?"
     last = _last_word(stripped)
-    dangling = last in _TRAILING
+    strict = last in _STRICT           # can't grammatically end a sentence
+    soft = last in _TRAILING and not strict  # e.g. "um", "well", "maybe"
     prob = turndetect.completion_probability(stripped)
 
-    # a sentence literally can't end on "to/the/and…" — hold it whatever the
-    # punctuation, unless the model is near-certain otherwise
-    if last in _STRICT and (prob is None or prob < 0.9):
+    # a sentence literally can't end on "to/the/and…" — hold it, whatever the
+    # punctuation, unless the model is near-certain it's somehow done
+    if strict and (prob is None or prob < 0.9):
+        return "incomplete"
+    if stripped[-1] in (",", "-"):
         return "incomplete"
 
-    if prob is not None:
-        # whisper marks a sentence end -> finished, unless it trails on a
-        # dangling word AND the model is quite sure it's not done
-        if terminal and not (dangling and prob < 0.3):
-            return "complete"
-        # no terminal punctuation -> trust the model's judgement
-        if not terminal and prob >= 0.6:
-            return "complete"
-        return "incomplete"
-
-    # ---- heuristic fallback (model not loaded) ----
-    if dangling or stripped[-1] == "," or stripped.endswith("-"):
+    # everything else defaults to RESPONDING (bias against leaving you hanging).
+    # only a soft trailing word ("...and", "...well") consults the model, and
+    # even then only holds when it's fairly sure you're mid-thought.
+    if soft and prob is not None and prob < 0.35:
         return "incomplete"
     return "complete"
 

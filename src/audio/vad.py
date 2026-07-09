@@ -20,9 +20,9 @@ class VadSegmenter:
     def __init__(
         self,
         aggressiveness: int = 2,      # 0-3, higher = more aggressive filtering
-        start_frames: int = 3,        # ~90ms of speech to trigger
+        start_frames: int = 2,        # ~60ms of speech to trigger (catch onsets)
         end_ms: int = 600,            # silence that ends an utterance
-        pad_ms: int = 240,            # keep this much lead-in before speech
+        pad_ms: int = 360,            # keep this much lead-in so word-starts aren't clipped
         min_speech_ms: int = 250,     # ignore blips shorter than this
     ):
         import webrtcvad

@@ -88,7 +88,7 @@ research:
 turn:
   # if you pause mid-thought it waits this long for you to continue before
   # answering what it has (raise if it still jumps in; lower if it lags)
-  continuation_timeout: 2.5
+  continuation_timeout: 1.2
 
 profile:
   file: data/profile.md     # your hand-edited "About Me" (gitignored, private)
