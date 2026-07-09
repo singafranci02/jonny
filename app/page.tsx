@@ -89,11 +89,16 @@ export default function Home() {
       return false;
     }
 
-    const ctx = new AudioContext({ sampleRate: 16000 });
+    // NATIVE rate — the worklet resamples to 16k itself. Forcing 16000 here
+    // breaks on browsers/hardware that don't honor it (audio arrives sped-up
+    // and Whisper hears gibberish).
+    const ctx = new AudioContext();
     ctxRef.current = ctx;
+    console.log(`[jonny] mic pipeline: ${ctx.sampleRate}Hz -> 16k`);
     try {
       await ctx.audioWorklet.addModule("/pcm-worklet.js");
     } catch {
+      setError("Couldn't start the audio pipeline (worklet).");
       return false;
     }
 
@@ -109,18 +114,28 @@ export default function Home() {
         const event = JSON.parse(ev.data);
         switch (event.type) {
           case "ready": {
-            // hook the mic up and start streaming
-            const source = ctx.createMediaStreamSource(streamRef.current!);
-            const node = new AudioWorkletNode(ctx, "pcm-worklet");
-            node.port.onmessage = (m: MessageEvent) => {
-              if (ws.readyState === WebSocket.OPEN) ws.send(m.data as ArrayBuffer);
-            };
-            source.connect(node);
-            // worklet needs a destination to pull audio; a muted gain avoids echo
-            const sink = ctx.createGain();
-            sink.gain.value = 0;
-            node.connect(sink).connect(ctx.destination);
-            setOrbState("listening");
+            // hook the mic up and start streaming — surface ANY failure
+            // (a silently-broken mic chain looks like "it ignores me")
+            try {
+              const source = ctx.createMediaStreamSource(streamRef.current!);
+              const node = new AudioWorkletNode(ctx, "pcm-worklet");
+              node.port.onmessage = (m: MessageEvent) => {
+                if (ws.readyState === WebSocket.OPEN) ws.send(m.data as ArrayBuffer);
+              };
+              source.connect(node);
+              // worklet needs a destination to pull audio; muted gain avoids echo
+              const sink = ctx.createGain();
+              sink.gain.value = 0;
+              node.connect(sink).connect(ctx.destination);
+              setOrbState("listening");
+            } catch (e) {
+              setError(`Mic pipeline failed: ${e}`);
+              if (!settled) {
+                settled = true;
+                resolve(false);
+              }
+              break;
+            }
             if (!settled) {
               settled = true;
               resolve(true);
@@ -221,7 +236,6 @@ export default function Home() {
           echoCancellation: true,
           noiseSuppression: true,
           autoGainControl: true,
-          sampleRate: 16000, // ask the mic for 16k mono directly (cleaner than resampling)
           channelCount: 1,
         },
       });
