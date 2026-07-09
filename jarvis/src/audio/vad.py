@@ -19,15 +19,20 @@ FRAME_BYTES = SAMPLE_RATE // 1000 * FRAME_MS * 2  # 30ms of 16-bit mono = 960
 class VadSegmenter:
     def __init__(
         self,
-        aggressiveness: int = 2,      # 0-3, higher = more aggressive filtering
-        start_frames: int = 2,        # ~60ms of speech to trigger (catch onsets)
+        aggressiveness: int = 3,      # 0-3, higher = more aggressive filtering
+        start_frames: int = 4,        # ~120ms of consecutive speech to trigger
         end_ms: int = 600,            # silence that ends an utterance
         pad_ms: int = 360,            # keep this much lead-in so word-starts aren't clipped
-        min_speech_ms: int = 250,     # ignore blips shorter than this
+        min_speech_ms: int = 400,     # ignore blips shorter than this
+        energy_floor: int = 300,      # int16 RMS a frame must ALSO exceed —
+                                      # webrtcvad hears spectral shape, not
+                                      # loudness, so breaths/keyboard slip
+                                      # through without this gate
     ):
         import webrtcvad
 
         self.vad = webrtcvad.Vad(aggressiveness)
+        self.energy_floor = energy_floor
         self.start_frames = start_frames
         self.end_frames = end_ms // FRAME_MS
         self.min_speech_frames = min_speech_ms // FRAME_MS
@@ -50,7 +55,9 @@ class VadSegmenter:
         while len(self._buf) >= FRAME_BYTES:
             frame = bytes(self._buf[:FRAME_BYTES])
             del self._buf[:FRAME_BYTES]
-            is_speech = self.vad.is_speech(frame, SAMPLE_RATE)
+            is_speech = self.vad.is_speech(frame, SAMPLE_RATE) and (
+                self._rms(frame) >= self.energy_floor
+            )
 
             if not self._in_speech:
                 self._pad.append(frame)
@@ -82,6 +89,14 @@ class VadSegmenter:
             return utter
         self._reset_speech()
         return None
+
+    @staticmethod
+    def _rms(frame: bytes) -> float:
+        import array
+        import math
+
+        samples = array.array("h", frame)
+        return math.sqrt(sum(s * s for s in samples) / len(samples))
 
     def _reset_speech(self) -> None:
         self._in_speech = False

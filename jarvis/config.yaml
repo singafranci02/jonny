@@ -89,6 +89,11 @@ turn:
   # if you pause mid-thought it waits this long for you to continue before
   # answering what it has (raise if it still jumps in; lower if it lags)
   continuation_timeout: 1.2
+  # false-trigger protection: a frame must be BOTH speech-shaped (webrtcvad,
+  # 0-3) AND loud enough (int16 RMS) to count. Raise the floor if it still
+  # triggers on room noise; lower it if it misses quiet speech.
+  vad_aggressiveness: 3
+  vad_energy_floor: 300
 
 profile:
   file: data/profile.md     # your hand-edited "About Me" (gitignored, private)
