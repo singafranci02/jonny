@@ -90,6 +90,7 @@ async def _startup() -> None:
     import time as _time
 
     _state["started_at"] = _time.time()
+    _state["loop"] = asyncio.get_event_loop()
     session = Session()
     await session.warmup()
     _state["session"] = session
@@ -308,6 +309,22 @@ async def stt(request: Request) -> dict:
     return {"text": text}
 
 
+def _speakable(text: str) -> str:
+    """Never read code, JSON, or URLs aloud — replace with natural speech.
+    (A model occasionally leaks raw tool syntax/results into its reply; the
+    voice must not recite it.)"""
+    import re
+
+    text = re.sub(r"```.*?(```|$)", " ", text, flags=re.DOTALL)  # code fences
+    text = re.sub(r"https?://\S+", "the link", text)             # URLs
+    # tool-call / JSON leakage: a sentence that's mostly syntax isn't speech
+    syntax = len(re.findall(r'[{}\[\]<>_=/\\|`"#*]', text))
+    if syntax > 6 or (len(text) > 0 and syntax / max(len(text), 1) > 0.08):
+        return ""
+    text = re.sub(r"\s{2,}", " ", text).strip()
+    return text
+
+
 async def _stream_turn(message: str, events: asyncio.Queue) -> None:
     """Run one turn, putting events onto `events`: text deltas, per-sentence
     audio (base64 MP3) as the model generates, a slow-answer ack, and a final
@@ -331,6 +348,7 @@ async def _stream_turn(message: str, events: asyncio.Queue) -> None:
     seq = [0]
 
     async def emit_sentence(sentence: str) -> None:
+        sentence = _speakable(sentence)
         if not can_speak or not sentence.strip():
             return
         audio = await loop.run_in_executor(None, engine.synthesize, sentence)
@@ -460,6 +478,64 @@ _COMMON_CAPS = {
 }
 
 
+def _ensure_recorder():
+    """The websocket ear: RealtimeSTT's battle-tested engine (dual VAD +
+    turn silence + transcription), fed from the socket instead of a local
+    mic — its official browser-server pattern. Replaces the hand-rolled
+    VAD/segmenter that caused the echo/false-trigger saga."""
+    if _state.get("recorder") is None:
+        import logging
+
+        from RealtimeSTT import AudioToTextRecorder
+
+        scfg = _state["session"].cfg["stt"]
+        _state["recorder"] = AudioToTextRecorder(
+            use_microphone=False,
+            model=scfg.get("web_model") or scfg.get("model", "small.en"),
+            language=scfg.get("language", "en") or "",
+            compute_type=scfg.get("compute_type", "int8"),
+            device=scfg.get("device", "cpu"),
+            beam_size=scfg.get("beam_size", 5),
+            initial_prompt=_stt_initial_prompt(),
+            post_speech_silence_duration=scfg.get("silence_duration", 0.7),
+            min_length_of_recording=0.4,
+            silero_sensitivity=scfg.get("silero_sensitivity", 0.45),
+            webrtc_sensitivity=scfg.get("webrtc_sensitivity", 3),
+            enable_realtime_transcription=False,
+            spinner=False,
+            level=logging.ERROR,
+        )
+        _state["recorder_running"] = True
+
+        def pump() -> None:
+            loop = _state["loop"]
+            while _state.get("recorder_running"):
+                try:
+                    text = _state["recorder"].text()
+                except Exception:
+                    break
+                if text and text.strip():
+                    q = _state.get("ws_text_queue")
+                    if q is not None:
+                        loop.call_soon_threadsafe(q.put_nowait, text.strip())
+
+        import threading
+
+        threading.Thread(target=pump, daemon=True).start()
+    return _state["recorder"]
+
+
+@app.on_event("shutdown")
+async def _shutdown() -> None:
+    _state["recorder_running"] = False
+    rec = _state.get("recorder")
+    if rec is not None:
+        try:
+            rec.shutdown()
+        except Exception:
+            pass
+
+
 def _ensure_whisper():
     if _state.get("whisper") is None:
         from faster_whisper import WhisperModel
@@ -563,12 +639,10 @@ async def ws(websocket: WebSocket) -> None:
 
     Smart turn-taking: if what you said looks unfinished (trailing "and…",
     "let me finish", a mid-thought pause), it stays quiet and waits for the
-    rest instead of jumping in. Low-confidence audio → it asks you to repeat
-    rather than guessing. Auth: first message is a short-lived HMAC ticket."""
-    import random
-
+    rest instead of jumping in. Listening is RealtimeSTT's engine (dual VAD +
+    transcription), fed from this socket — its official server pattern.
+    Auth: first message is a short-lived HMAC ticket."""
     from .audio.turntaking import classify
-    from .audio.vad import VadSegmenter
 
     await websocket.accept()
     try:
@@ -591,15 +665,14 @@ async def ws(websocket: WebSocket) -> None:
             pass
     _state["active_ws"] = websocket
 
+    # the ear: RealtimeSTT engine (first connection loads the model)
+    loop = asyncio.get_event_loop()
+    recorder = await loop.run_in_executor(None, _ensure_recorder)
+    text_q: asyncio.Queue = asyncio.Queue()
+    _state["ws_text_queue"] = text_q
+
     await websocket.send_json({"type": "ready"})
     cfg = _state["session"].cfg.get("turn", {})
-    base_floor = cfg.get("vad_energy_floor", 300)
-    barge_floor = cfg.get("barge_energy_floor", 1400)
-    seg = VadSegmenter(
-        aggressiveness=cfg.get("vad_aggressiveness", 3),
-        energy_floor=base_floor,
-    )
-    loop = asyncio.get_event_loop()
     cont_timeout = cfg.get("continuation_timeout", 2.5)
 
     import collections
@@ -611,7 +684,6 @@ async def ws(websocket: WebSocket) -> None:
     abort = {"on": False}
     pending = {"text": ""}
     flush = {"task": None}
-    last_reprompt = {"at": 0.0}
     recent_replies: collections.deque = collections.deque(maxlen=12)
     respond_serializer = asyncio.Lock()  # one reply at a time per socket
 
@@ -662,14 +734,22 @@ async def ws(websocket: WebSocket) -> None:
 
         flush["task"] = asyncio.ensure_future(_later())
 
-    async def handle_utterance(pcm: bytes) -> None:
-        import time as _time
+    def _log_heard(text: str) -> None:
+        try:
+            from .config import ROOT
 
+            with open(ROOT / "data" / "stt.log", "a") as f:
+                f.write(f"{_time.strftime('%Y-%m-%d %H:%M:%S')}   ws   {text!r}\n")
+        except Exception:
+            pass
+
+    async def handle_text(text: str) -> None:
         cancel_flush()
-        text, low_conf = await loop.run_in_executor(None, _transcribe_pcm, pcm)
-        # nothing intelligible, or one of whisper's classic noise inventions
-        # ("Thank you." from silence) → silently ignore, never nag
-        if not text.strip() or _looks_like_noise(text, low_conf):
+        text = text.strip()
+        _log_heard(text)
+        # whisper's classic noise inventions ("Thank you." from silence)
+        # → silently ignore, never nag
+        if not text or _looks_like_noise(text, True):
             if pending["text"]:
                 schedule_flush()
             return
@@ -684,18 +764,6 @@ async def ws(websocket: WebSocket) -> None:
             abort["on"] = True
             speaking["until"] = 0.0
             await websocket.send_json({"type": "interrupt"})
-        # clearly misheard, with nothing buffered → ask, don't guess —
-        # but at most once every 8s (false triggers must not become nagging)
-        if low_conf and not pending["text"]:
-            if (
-                _state.get("reprompts")
-                and _time.monotonic() - last_reprompt["at"] > 8
-            ):
-                last_reprompt["at"] = _time.monotonic()
-                clip = random.choice(_state["reprompts"])
-                await websocket.send_json({"type": "audio", "seq": 0, **clip})
-                await websocket.send_json({"type": "done", "text": clip["text"]})
-            return
 
         merged = f"{pending['text']} {text}".strip()
         kind = classify(merged if pending["text"] else text)
@@ -718,33 +786,36 @@ async def ws(websocket: WebSocket) -> None:
 
     tasks: set = set()
 
-    def spawn(pcm: bytes) -> None:
-        t = asyncio.ensure_future(handle_utterance(pcm))
+    def spawn(text: str) -> None:
+        t = asyncio.ensure_future(handle_text(text))
         tasks.add(t)
         t.add_done_callback(tasks.discard)
 
+    async def text_consumer() -> None:
+        # utterance texts arrive from the recorder's pump thread; each is
+        # handled concurrently (so a barge-in is recognized during a reply)
+        while True:
+            spawn(await text_q.get())
+
+    consumer = asyncio.ensure_future(text_consumer())
     try:
         while True:
             msg = await websocket.receive()
             if msg.get("type") == "websocket.disconnect":
                 break
             if (data := msg.get("bytes")) is not None:
-                # while its reply is playing, only LOUD direct speech counts —
-                # its own voice from the speakers must not trigger barge-in
-                seg.energy_floor = barge_floor if _playback_active() else base_floor
-                for utter in seg.add(data):
-                    spawn(utter)
-                # (barge-in is transcript-confirmed in handle_utterance — an
-                # instant energy-based interrupt gets fooled by its own echo)
-            elif (txt := msg.get("text")) is not None:
-                if txt == "flush" and (utter := seg.flush()) is not None:
-                    spawn(utter)
+                recorder.feed_audio(data)
+            # (text control messages like the old "flush" are no-ops now:
+            # the recorder's own VAD closes utterances)
     except Exception:
         pass
     finally:
         cancel_flush()
+        consumer.cancel()
         for t in tasks:
             t.cancel()
+        if _state.get("ws_text_queue") is text_q:
+            _state["ws_text_queue"] = None
         if _state.get("active_ws") is websocket:
             _state["active_ws"] = None
 
