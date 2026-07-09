@@ -497,17 +497,28 @@ def _ensure_recorder():
             device=scfg.get("device", "cpu"),
             beam_size=scfg.get("beam_size", 5),
             initial_prompt=_stt_initial_prompt(),
-            post_speech_silence_duration=scfg.get("silence_duration", 0.7),
+            post_speech_silence_duration=scfg.get("silence_duration", 0.5),
+            early_transcription_on_silence=scfg.get(
+                "early_transcription_on_silence", 0.25
+            ),
             min_length_of_recording=0.4,
             silero_sensitivity=scfg.get("silero_sensitivity", 0.45),
             webrtc_sensitivity=scfg.get("webrtc_sensitivity", 3),
+            # the recorder's VAD already segmented the speech; whisper's own
+            # internal VAD pass would just re-do it slower
+            faster_whisper_vad_filter=False,
             enable_realtime_transcription=False,
             spinner=False,
             level=logging.ERROR,
+            on_recording_stop=lambda: _state.__setitem__(
+                "rec_stopped_at", __import__("time").monotonic()
+            ),
         )
         _state["recorder_running"] = True
 
         def pump() -> None:
+            import time as _t
+
             loop = _state["loop"]
             while _state.get("recorder_running"):
                 try:
@@ -515,6 +526,9 @@ def _ensure_recorder():
                 except Exception:
                     break
                 if text and text.strip():
+                    stop_at = _state.pop("rec_stopped_at", None)
+                    if stop_at is not None:
+                        _state["last_stt_ms"] = int((_t.monotonic() - stop_at) * 1000)
                     q = _state.get("ws_text_queue")
                     if q is not None:
                         loop.call_soon_threadsafe(q.put_nowait, text.strip())
@@ -738,8 +752,12 @@ async def ws(websocket: WebSocket) -> None:
         try:
             from .config import ROOT
 
+            ms = _state.get("last_stt_ms")
             with open(ROOT / "data" / "stt.log", "a") as f:
-                f.write(f"{_time.strftime('%Y-%m-%d %H:%M:%S')}   ws   {text!r}\n")
+                f.write(
+                    f"{_time.strftime('%Y-%m-%d %H:%M:%S')}   ws "
+                    f"(stt {ms}ms)   {text!r}\n"
+                )
         except Exception:
             pass
 

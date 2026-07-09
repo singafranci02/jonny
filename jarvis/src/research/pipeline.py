@@ -46,8 +46,10 @@ NOTES (each block is one numbered source):
 {notes}
 
 Requirements:
-- Start with "# <title>" then a "## Summary" section of exactly 2-3 plain,
-  speakable sentences (no citations there).
+- Start with "# <title>" then a "## Summary" section: 3-5 plain, speakable
+  sentences that deliver the key findings THEMSELVES — concrete facts,
+  numbers, recommendations. Never meta ("this report covers...", "sources
+  say..."), never citations, never mention of researching or documents.
 - Then well-organized sections covering the findings, with inline citation
   markers like [1], [2] that refer to the sources.
 - End with "## Sources" listing each number with its URL.
