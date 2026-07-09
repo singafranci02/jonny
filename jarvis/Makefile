@@ -133,6 +133,10 @@ doctor:
 status:
 	$(PY) -m src.ops.doctor status
 
+# what did it actually hear? (black-box recorder)
+heard:
+	@tail -15 data/stt.log 2>/dev/null || echo "no utterances logged yet"
+
 # publish committed Jarvis work into the shared jonny repo (jarvis/ subtree)
 JONNY_REPO := $(HOME)/jonny
 push:
