@@ -506,6 +506,22 @@ def _debug_save(pcm: bytes, text: str, low: bool) -> None:
         pass
 
 
+# phrases whisper famously invents from pure noise/silence — if a short
+# utterance is exactly one of these, it's almost certainly not you talking
+_NOISE_HALLUCINATIONS = {
+    "thank you", "thanks", "thank you very much", "thanks for watching",
+    "thank you for watching", "bye", "you", ".", "uh", "um", "oh", "so",
+    "okay", "yeah", "hmm", "huh", "the",
+}
+
+
+def _looks_like_noise(text: str, low_conf: bool) -> bool:
+    import re
+
+    norm = re.sub(r"[^a-z ]", "", text.lower()).strip()
+    return norm in _NOISE_HALLUCINATIONS and (low_conf or len(norm.split()) <= 2)
+
+
 def _transcribe_pcm(pcm: bytes) -> tuple[str, bool]:
     """Returns (text, low_confidence). Low confidence = probably misheard →
     the caller asks you to repeat instead of answering garbage."""
@@ -566,15 +582,19 @@ async def ws(websocket: WebSocket) -> None:
         return
 
     await websocket.send_json({"type": "ready"})
-    seg = VadSegmenter()
-    loop = asyncio.get_event_loop()
     cfg = _state["session"].cfg.get("turn", {})
+    seg = VadSegmenter(
+        aggressiveness=cfg.get("vad_aggressiveness", 3),
+        energy_floor=cfg.get("vad_energy_floor", 300),
+    )
+    loop = asyncio.get_event_loop()
     cont_timeout = cfg.get("continuation_timeout", 2.5)
 
     speaking = {"on": False}
     abort = {"on": False}
     pending = {"text": ""}
     flush = {"task": None}
+    last_reprompt = {"at": 0.0}
     utter_q: asyncio.Queue = asyncio.Queue()
 
     async def respond(text: str) -> None:
@@ -612,17 +632,27 @@ async def ws(websocket: WebSocket) -> None:
         flush["task"] = asyncio.ensure_future(_later())
 
     async def handle_utterance(pcm: bytes) -> None:
+        import time as _time
+
         cancel_flush()
         text, low_conf = await loop.run_in_executor(None, _transcribe_pcm, pcm)
-        if not text.strip():
+        # nothing intelligible, or one of whisper's classic noise inventions
+        # ("Thank you." from silence) → silently ignore, never nag
+        if not text.strip() or _looks_like_noise(text, low_conf):
             if pending["text"]:
                 schedule_flush()
             return
-        # clearly misheard, with nothing buffered → ask, don't guess
-        if low_conf and not pending["text"] and _state.get("reprompts"):
-            clip = random.choice(_state["reprompts"])
-            await websocket.send_json({"type": "audio", "seq": 0, **clip})
-            await websocket.send_json({"type": "done", "text": clip["text"]})
+        # clearly misheard, with nothing buffered → ask, don't guess —
+        # but at most once every 8s (false triggers must not become nagging)
+        if low_conf and not pending["text"]:
+            if (
+                _state.get("reprompts")
+                and _time.monotonic() - last_reprompt["at"] > 8
+            ):
+                last_reprompt["at"] = _time.monotonic()
+                clip = random.choice(_state["reprompts"])
+                await websocket.send_json({"type": "audio", "seq": 0, **clip})
+                await websocket.send_json({"type": "done", "text": clip["text"]})
             return
 
         merged = f"{pending['text']} {text}".strip()
