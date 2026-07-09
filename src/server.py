@@ -315,6 +315,7 @@ def _speakable(text: str) -> str:
     voice must not recite it.)"""
     import re
 
+    text = re.sub(r"<think>.*?(</think>|$)", " ", text, flags=re.DOTALL)  # local-model CoT
     text = re.sub(r"```.*?(```|$)", " ", text, flags=re.DOTALL)  # code fences
     text = re.sub(r"https?://\S+", "the link", text)             # URLs
     # tool-call / JSON leakage: a sentence that's mostly syntax isn't speech
