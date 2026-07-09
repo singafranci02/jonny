@@ -99,6 +99,13 @@ turn:
   # is hard to trigger; use headphones for the best experience.
   barge_energy_floor: 1400
 
+workspace:
+  # the ONE folder Jarvis may write files in (created on first use; a
+  # Finder-visible symlink on the Desktop points here — real writes stay in
+  # the home dir so macOS TCC doesn't silently block the background service)
+  path: ~/JarvisWorkspace
+  trash_subdir: "_trash"    # old versions land here before any overwrite/edit
+
 profile:
   file: data/profile.md     # your hand-edited "About Me" (gitignored, private)
 

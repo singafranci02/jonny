@@ -137,6 +137,11 @@ status:
 heard:
 	@tail -15 data/stt.log 2>/dev/null || echo "no utterances logged yet"
 
+# the one folder Jarvis may write in: path + contents + recent writes
+workspace:
+	@echo "workspace: $$HOME/JarvisWorkspace"; ls -la $$HOME/JarvisWorkspace 2>/dev/null | grep -v "^total" || echo "  (empty)"
+	@echo "--- recent writes ---"; tail -10 data/workspace_audit.log 2>/dev/null || echo "  (none yet)"
+
 # publish committed Jarvis work into the shared jonny repo (jarvis/ subtree)
 JONNY_REPO := $(HOME)/jonny
 push:

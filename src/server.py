@@ -839,6 +839,30 @@ async def ws(websocket: WebSocket) -> None:
             _state["active_ws"] = None
 
 
+@app.get("/workspace", dependencies=[Depends(require_token)])
+async def workspace_list() -> dict:
+    """Read-only view of the workspace for the website."""
+    import json as _json
+
+    from .tools import workspace as W
+
+    cfg = _state["session"].cfg
+    listing = W.list_files(cfg)
+    files = [] if listing == "the workspace is empty" else _json.loads(listing)
+    return {"files": files}
+
+
+@app.get("/workspace/file", dependencies=[Depends(require_token)])
+async def workspace_file(name: str) -> dict:
+    from .tools import workspace as W
+
+    cfg = _state["session"].cfg
+    try:
+        return {"name": name, "content": W.read_file(cfg, name)}
+    except W.WorkspaceError as e:
+        raise HTTPException(400, str(e))
+
+
 @app.post("/tts", dependencies=[Depends(require_token)])
 async def tts(body: TTSIn) -> Response:
     from .tts import make_tts_engine
