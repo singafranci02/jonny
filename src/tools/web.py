@@ -7,13 +7,22 @@ import json
 from . import Tool
 
 
+def _ddg_search(query: str, max_results: int) -> list:
+    from ddgs import DDGS
+
+    return list(DDGS(timeout=5).text(query, max_results=max_results))
+
+
 def web_search(query: str, max_results: int = 5) -> str:
     # primary: DuckDuckGo — and auto-fetch the top pages so one call
     # returns actual content, not just snippets (isair/jarvis pattern)
     try:
-        from ddgs import DDGS
+        # HARD 8s cap: when rate-limited, ddgs retries internally for
+        # minutes — a search must never stall the conversation
+        from concurrent.futures import ThreadPoolExecutor
 
-        results = list(DDGS().text(query, max_results=max_results))
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            results = pool.submit(_ddg_search, query, max_results).result(timeout=8)
         if results:
             hits = [
                 {"title": r.get("title"), "url": r.get("href"), "snippet": r.get("body")}
