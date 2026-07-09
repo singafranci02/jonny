@@ -144,8 +144,13 @@ class Session:
         totals = {"input": 0, "output": 0, "cost": 0.0, "rounds": 0}
 
         tools = self.tools if use_tools else None
+        # with tools in play, NOTHING streams to the voice until the loop is
+        # done: any round can turn out to be pre-tool narration ("let me
+        # check..."), and narration must never be spoken. The final answer is
+        # delivered whole at the end; tool-less turns keep live streaming.
+        live_on_text = None if tools else on_text
         resp = await self.llm.chat(
-            self.system_prompt, scratch, tier=tier, tools=tools, on_text=on_text
+            self.system_prompt, scratch, tier=tier, tools=tools, on_text=live_on_text
         )
         while resp.tool_calls and totals["rounds"] < max_rounds:
             totals["rounds"] += 1
@@ -172,9 +177,11 @@ class Session:
                 results.append((call, output, is_error))
             scratch.extend(self.llm.tool_messages(resp, results))
             resp = await self.llm.chat(
-                self.system_prompt, scratch, tier=tier, tools=tools, on_text=on_text
+                self.system_prompt, scratch, tier=tier, tools=tools, on_text=live_on_text
             )
 
+        if tools and on_text is not None and resp.text:
+            on_text(resp.text)  # buffered final answer, narration already gone
         resp.input_tokens += totals["input"]
         resp.output_tokens += totals["output"]
         resp.cost_usd = (resp.cost_usd or 0.0) + totals["cost"]
