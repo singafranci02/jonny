@@ -19,13 +19,26 @@ def web_search(query: str, max_results: int = 5) -> str:
                 {"title": r.get("title"), "url": r.get("href"), "snippet": r.get("body")}
                 for r in results
             ]
-            for hit in hits[:2]:  # read the top two pages
+            # read the top two pages IN PARALLEL with a hard 6s budget —
+            # a slow site must never stall the whole conversation
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                futures = {
+                    pool.submit(fetch_page, hit["url"], 2500): hit
+                    for hit in hits[:2]
+                    if hit.get("url")
+                }
                 try:
-                    text = fetch_page(hit["url"], max_chars=2500)
-                    if not text.startswith(("could not fetch", "no readable")):
-                        hit["page_content"] = text
-                except Exception:
-                    pass
+                    for fut in as_completed(futures, timeout=6):
+                        try:
+                            text = fut.result()
+                            if not text.startswith(("could not fetch", "no readable")):
+                                futures[fut]["page_content"] = text
+                        except Exception:
+                            pass
+                except TimeoutError:
+                    pass  # stragglers are abandoned; snippets still go back
             return json.dumps(hits, ensure_ascii=False)
     except Exception:
         pass

@@ -581,21 +581,43 @@ async def ws(websocket: WebSocket) -> None:
         await websocket.close(code=1008)
         return
 
+    # single-user: a new connection (page refresh, second tab) replaces the
+    # old one — zombie sockets must not keep consuming mic audio
+    old_ws = _state.get("active_ws")
+    if old_ws is not None:
+        try:
+            await old_ws.close(code=1000)
+        except Exception:
+            pass
+    _state["active_ws"] = websocket
+
     await websocket.send_json({"type": "ready"})
     cfg = _state["session"].cfg.get("turn", {})
+    base_floor = cfg.get("vad_energy_floor", 300)
+    barge_floor = cfg.get("barge_energy_floor", 1400)
     seg = VadSegmenter(
         aggressiveness=cfg.get("vad_aggressiveness", 3),
-        energy_floor=cfg.get("vad_energy_floor", 300),
+        energy_floor=base_floor,
     )
     loop = asyncio.get_event_loop()
     cont_timeout = cfg.get("continuation_timeout", 2.5)
 
-    speaking = {"on": False}
+    import collections
+    import time as _time
+
+    from .audio.echo import is_echo
+
+    speaking = {"on": False, "until": 0.0}
     abort = {"on": False}
     pending = {"text": ""}
     flush = {"task": None}
     last_reprompt = {"at": 0.0}
-    utter_q: asyncio.Queue = asyncio.Queue()
+    recent_replies: collections.deque = collections.deque(maxlen=12)
+    respond_serializer = asyncio.Lock()  # one reply at a time per socket
+
+    def _playback_active() -> bool:
+        # while sending audio + a grace tail while the client finishes playing
+        return speaking["on"] or _time.monotonic() < speaking["until"]
 
     async def respond(text: str) -> None:
         abort["on"] = False
@@ -603,14 +625,23 @@ async def ws(websocket: WebSocket) -> None:
         events: asyncio.Queue = asyncio.Queue()
         asyncio.ensure_future(_stream_turn(text, events))
         speaking["on"] = True
-        while True:
-            event = await events.get()
-            if event is None:
-                break
-            if abort["on"]:  # you talked over it — stop forwarding the reply
-                continue
-            await websocket.send_json(event)
-        speaking["on"] = False
+        try:
+            while True:
+                event = await events.get()
+                if event is None:
+                    break
+                if event.get("type") == "audio":
+                    recent_replies.append(event.get("text", ""))
+                    # estimate how long the client will be playing this clip
+                    est = len(base64.b64decode(event["mp3"])) / 8000  # 64kbps
+                    speaking["until"] = max(
+                        speaking["until"], _time.monotonic() + est + 0.5
+                    )
+                if abort["on"] and event.get("type") in ("audio", "delta"):
+                    continue  # you talked over it — drop the rest of the voice
+                await websocket.send_json(event)
+        finally:
+            speaking["on"] = False
 
     def cancel_flush() -> None:
         if flush["task"]:
@@ -642,6 +673,17 @@ async def ws(websocket: WebSocket) -> None:
             if pending["text"]:
                 schedule_flush()
             return
+        # its own voice leaking back through the mic: if the transcript
+        # matches something it just said, drop it (echo, not you)
+        if is_echo(text, recent_replies):
+            return
+        # confirmed barge-in: real speech (not echo/noise) while it's talking
+        # → NOW cut the playback. Energy alone can't tell loud echo from you,
+        # so the interrupt waits for this confirmation.
+        if _playback_active():
+            abort["on"] = True
+            speaking["until"] = 0.0
+            await websocket.send_json({"type": "interrupt"})
         # clearly misheard, with nothing buffered → ask, don't guess —
         # but at most once every 8s (false triggers must not become nagging)
         if low_conf and not pending["text"]:
@@ -669,35 +711,42 @@ async def ws(websocket: WebSocket) -> None:
             schedule_flush()
             return
         pending["text"] = ""
-        await respond(merged)
+        # transcription/filters run CONCURRENTLY per utterance (so a barge-in
+        # can be recognized while a reply plays); only responding serializes
+        async with respond_serializer:
+            await respond(merged)
 
-    async def consumer() -> None:
-        while True:
-            pcm = await utter_q.get()
-            await handle_utterance(pcm)
+    tasks: set = set()
 
-    consumer_task = asyncio.ensure_future(consumer())
+    def spawn(pcm: bytes) -> None:
+        t = asyncio.ensure_future(handle_utterance(pcm))
+        tasks.add(t)
+        t.add_done_callback(tasks.discard)
+
     try:
         while True:
             msg = await websocket.receive()
             if msg.get("type") == "websocket.disconnect":
                 break
             if (data := msg.get("bytes")) is not None:
-                was_speaking = seg.speaking
+                # while its reply is playing, only LOUD direct speech counts —
+                # its own voice from the speakers must not trigger barge-in
+                seg.energy_floor = barge_floor if _playback_active() else base_floor
                 for utter in seg.add(data):
-                    utter_q.put_nowait(utter)
-                # barge-in: you started talking while it's speaking → cut it off
-                if seg.speaking and not was_speaking and speaking["on"]:
-                    abort["on"] = True
-                    await websocket.send_json({"type": "interrupt"})
+                    spawn(utter)
+                # (barge-in is transcript-confirmed in handle_utterance — an
+                # instant energy-based interrupt gets fooled by its own echo)
             elif (txt := msg.get("text")) is not None:
                 if txt == "flush" and (utter := seg.flush()) is not None:
-                    utter_q.put_nowait(utter)
+                    spawn(utter)
     except Exception:
         pass
     finally:
         cancel_flush()
-        consumer_task.cancel()
+        for t in tasks:
+            t.cancel()
+        if _state.get("active_ws") is websocket:
+            _state["active_ws"] = None
 
 
 @app.post("/tts", dependencies=[Depends(require_token)])

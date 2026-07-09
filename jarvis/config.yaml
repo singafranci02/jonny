@@ -94,6 +94,10 @@ turn:
   # triggers on room noise; lower it if it misses quiet speech.
   vad_aggressiveness: 3
   vad_energy_floor: 300
+  # while its reply is playing, only speech LOUDER than this counts (so its
+  # own voice from your speakers can't interrupt itself). Lower if barge-in
+  # is hard to trigger; use headphones for the best experience.
+  barge_energy_floor: 1400
 
 profile:
   file: data/profile.md     # your hand-edited "About Me" (gitignored, private)
