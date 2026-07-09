@@ -298,6 +298,7 @@ async def stt(request: Request) -> dict:
             language=(scfg.get("language") or None),
             beam_size=scfg.get("beam_size", 5),
             initial_prompt=_stt_initial_prompt(),
+            condition_on_previous_text=False,
             vad_filter=True,
         )
         return " ".join(s.text.strip() for s in segments).strip()
@@ -484,6 +485,9 @@ def _transcribe_pcm(pcm: bytes) -> tuple[str, bool]:
         language=(scfg.get("language") or None),
         beam_size=scfg.get("beam_size", 5),
         initial_prompt=_stt_initial_prompt(),
+        # each utterance is independent — don't let the previous one bias
+        # (leaves it prone to hallucinating on short real-time clips)
+        condition_on_previous_text=False,
         vad_filter=False,  # our VAD already segmented the utterance
     )
     segs = list(segments)
