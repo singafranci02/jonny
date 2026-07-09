@@ -473,6 +473,39 @@ def _ensure_whisper():
     return _state["whisper"]
 
 
+def _debug_save(pcm: bytes, text: str, low: bool) -> None:
+    """Black-box recorder: keep the last utterances + what Whisper heard, so
+    'it doesn't understand me' is diagnosable from real audio, not guesses.
+    Private — stays on the Mac in data/debug_utterances/. stt.debug_save."""
+    try:
+        import time as _time
+        import wave
+        from pathlib import Path
+
+        from .config import ROOT
+
+        d = ROOT / "data" / "debug_utterances"
+        d.mkdir(parents=True, exist_ok=True)
+        stamp = _time.strftime("%H%M%S")
+        path = d / f"utt-{stamp}.wav"
+        with wave.open(str(path), "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(16000)
+            w.writeframes(pcm)
+        with open(ROOT / "data" / "stt.log", "a") as f:
+            dur = len(pcm) / 2 / 16000
+            f.write(
+                f"{_time.strftime('%Y-%m-%d %H:%M:%S')}  {dur:4.1f}s  "
+                f"{'LOW ' if low else 'ok  '}  {text!r}  ({path.name})\n"
+            )
+        wavs = sorted(d.glob("utt-*.wav"))
+        for old in wavs[:-20]:  # keep the last 20
+            old.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
 def _transcribe_pcm(pcm: bytes) -> tuple[str, bool]:
     """Returns (text, low_confidence). Low confidence = probably misheard →
     the caller asks you to repeat instead of answering garbage."""
@@ -493,12 +526,16 @@ def _transcribe_pcm(pcm: bytes) -> tuple[str, bool]:
     segs = list(segments)
     text = " ".join(s.text.strip() for s in segs).strip()
     if not segs or not text:
+        if scfg.get("debug_save", True):
+            _debug_save(pcm, "(empty)", True)
         return "", True
     avg_logprob = sum(s.avg_logprob for s in segs) / len(segs)
     no_speech = max(s.no_speech_prob for s in segs)
     lp_floor = scfg.get("min_avg_logprob", -1.0)
     ns_ceil = scfg.get("max_no_speech", 0.6)
     low = avg_logprob < lp_floor or no_speech > ns_ceil
+    if scfg.get("debug_save", True):
+        _debug_save(pcm, text, low)
     return text, low
 
 

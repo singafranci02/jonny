@@ -124,6 +124,9 @@ stt:
   vocabulary: "Mareluna, Giulia, Ligurian, Jarvis, Jonny"
   min_avg_logprob: -1.0     # below this = probably misheard → ask to repeat
   max_no_speech: 0.6        # above this = probably wasn't real speech
+  # black-box recorder: keeps the last 20 utterances + what Whisper heard in
+  # data/debug_utterances + data/stt.log (private, Mac-only) for diagnosis
+  debug_save: true
   silence_duration: 0.7     # seconds of silence that end an utterance (raise if it cuts you off)
   initial_prompt: "Hey Jarvis."   # biases Whisper toward hearing the wake phrase
   input_device_index: null  # null = system default mic; `make mic-test` lists devices
