@@ -155,9 +155,20 @@ class Session:
             results = []
             for call in resp.tool_calls:
                 console.print(f"[dim]tool: {call.name}({call.arguments})[/dim]")
-                output, is_error = await loop.run_in_executor(
-                    None, run_tool, self.tools, call.name, call.arguments
-                )
+                try:
+                    # no tool may stall a conversation: hard 20s ceiling
+                    output, is_error = await asyncio.wait_for(
+                        loop.run_in_executor(
+                            None, run_tool, self.tools, call.name, call.arguments
+                        ),
+                        timeout=20,
+                    )
+                except asyncio.TimeoutError:
+                    output, is_error = (
+                        "tool timed out — answer from what you know and say "
+                        "you couldn't check live data",
+                        True,
+                    )
                 results.append((call, output, is_error))
             scratch.extend(self.llm.tool_messages(resp, results))
             resp = await self.llm.chat(
