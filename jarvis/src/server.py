@@ -505,9 +505,9 @@ def _ensure_recorder():
             min_length_of_recording=0.4,
             silero_sensitivity=scfg.get("silero_sensitivity", 0.45),
             webrtc_sensitivity=scfg.get("webrtc_sensitivity", 3),
-            # the recorder's VAD already segmented the speech; whisper's own
-            # internal VAD pass would just re-do it slower
-            faster_whisper_vad_filter=False,
+            # NOTE: faster_whisper_vad_filter must stay True — RealtimeSTT's
+            # transcription path REQUIRES it ("No clip timestamps found"
+            # errors killed all transcription when set False, 2026-07-09)
             enable_realtime_transcription=False,
             spinner=False,
             level=logging.ERROR,
@@ -525,7 +525,14 @@ def _ensure_recorder():
                 try:
                     text = _state["recorder"].text()
                 except Exception:
-                    break
+                    # one bad utterance must NEVER kill the ear for good
+                    # (a single transcription error once deafened it until
+                    # restart) — log, breathe, keep listening
+                    import traceback
+
+                    traceback.print_exc()
+                    _t.sleep(0.5)
+                    continue
                 if text and text.strip():
                     stop_at = _state.pop("rec_stopped_at", None)
                     if stop_at is not None:
