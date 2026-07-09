@@ -235,9 +235,7 @@ class Session:
             topic, progress=progress, user_context=user_context
         )
         self.conversation.add_user(f"(I asked you to research: {topic})")
-        self.conversation.add_assistant(
-            f"(research done, saved to {path.name}) {summary}"
-        )
+        self.conversation.add_assistant(summary)
         return path, summary
 
     async def flush(self) -> None:

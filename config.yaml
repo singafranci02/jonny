@@ -136,7 +136,12 @@ stt:
   # black-box recorder: keeps the last 20 utterances + what Whisper heard in
   # data/debug_utterances + data/stt.log (private, Mac-only) for diagnosis
   debug_save: true
-  silence_duration: 0.7     # seconds of silence that end an utterance (raise if it cuts you off)
+  silence_duration: 0.5     # seconds of silence that end an utterance. Safe to
+                            # keep short: if it cuts you off mid-thought, the
+                            # turn-taking layer holds and waits for the rest.
+  # start transcribing DURING the silence window (engine fast path): by the
+  # time the turn is confirmed over, the text is already ready (~saves 0.5-1s)
+  early_transcription_on_silence: 0.25
   initial_prompt: "Hey Jarvis."   # biases Whisper toward hearing the wake phrase
   input_device_index: null  # null = system default mic; `make mic-test` lists devices
 
