@@ -45,12 +45,13 @@ class Tool:
 
 
 def make_tools(cfg: dict, memory, knowledge, request_research=None) -> list[Tool]:
-    from . import local, stores, web
+    from . import local, stores, web, workspace
 
     tools = [
         *local.build(),
         *web.build(cfg),
         *stores.build(memory, knowledge),
+        *workspace.build(cfg),
     ]
     if request_research is not None:
         tools.append(

@@ -23,6 +23,9 @@ TOOL_HINTS = (
     "price", "stock", "search", "look up", "google", "remember", "remind",
     "calculate", "convert", "my notes", "notes say", "knowledge",
     "research", "investigate",
+    # workspace file requests must never take the tool-less fast path
+    "file", "save", "write", "note", "doc", "workspace", "folder",
+    "edit", "rename", "read me",
 )
 
 
