@@ -217,7 +217,13 @@ export default function Home() {
     setError("");
     try {
       streamRef.current = await navigator.mediaDevices.getUserMedia({
-        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+          sampleRate: 16000, // ask the mic for 16k mono directly (cleaner than resampling)
+          channelCount: 1,
+        },
       });
     } catch {
       setError("Microphone permission denied.");
