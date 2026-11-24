@@ -69,9 +69,16 @@ export default async function SetupPage({
             </p>
             {!s.folder.writable && (
               <p className="muted small">
-                iCloud Drive is privacy-protected. On the Mac: run <code>make life ARGS=python-path</code>, then System
-                Settings → Privacy &amp; Security → Full Disk Access → + → add that file → restart Jarvis (
-                <code>make install-web</code>). If the folder doesn&apos;t exist, run <code>make life ARGS=folders</code>.
+                {s.folder.error && <>macOS said: {s.folder.error}. </>}
+                iCloud Drive is privacy-protected. On the Mac: System Settings → Privacy &amp; Security → Full Disk
+                Access → + → press Cmd-Shift-G, paste <code>{s.full_disk_access_target}</code> → Open. Then restart Jarvis
+                (<code>make install-web</code>).
+                {!s.folder.exists && (
+                  <>
+                    {" "}
+                    If the folder really doesn&apos;t exist yet, run <code>make life ARGS=folders</code>.
+                  </>
+                )}
               </p>
             )}
             <p className={s.telegram.configured && s.telegram.chat_id_set && s.telegram.telegram === "polling" ? "status-ok" : "status-todo"}>

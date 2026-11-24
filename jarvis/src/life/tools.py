@@ -8,10 +8,11 @@ in automatically, and records from other areas can't be touched.
 from __future__ import annotations
 
 import json
+from datetime import timedelta
 
 from ..tools import Tool
 from .areas import Area
-from .clock import RECURRENCES, Clock, utc_now
+from .clock import RECURRENCES, Clock, from_iso, utc_now
 from .store import ITEM_KINDS, LifeStore
 
 _DT = 'Local date-time in the user\'s timezone, "YYYY-MM-DDTHH:mm"'
@@ -47,6 +48,16 @@ def build_life_tools(store: LifeStore, clock: Clock, areas: list[Area], fixed: A
             return props, required
         return {"area": {"type": "string", "enum": ids, "description": "life area"}, **props}, ["area", *required]
 
+    def sender_warning() -> str:
+        """Reminders are only sent by Jarvis's server (the Mac mini). If no
+        sender has swept this machine's database lately, say so instead of
+        silently storing a reminder nothing will deliver."""
+        last = store.get_setting("scheduler_last_sweep")
+        if last and utc_now() - from_iso(last) < timedelta(minutes=10):
+            return ""
+        return (" Warning: the reminder sender isn't running against this machine's database (it runs in "
+                "Jarvis's server on the Mac mini), so this may not be delivered. Tell the user.")
+
     # ---------------- functions ----------------
 
     def overview(area: str | None = None) -> str:
@@ -66,7 +77,7 @@ def build_life_tools(store: LifeStore, clock: Clock, areas: list[Area], fixed: A
             raise ValueError(f"{clock.when(due)} is in the past; check the current time with life_overview")
         r = store.add_reminder(a, text, due, recurrence)
         rep = "" if r["recurrence"] == "none" else f", repeats {r['recurrence']}"
-        return f"Reminder #{r['id']} set for {clock.when(r['due_at'])}{rep} ({labels[a]})."
+        return f"Reminder #{r['id']} set for {clock.when(r['due_at'])}{rep} ({labels[a]}).{sender_warning()}"
 
     def update_reminder(id: int, text: str | None = None, due_at: str | None = None,
                         recurrence: str | None = None, status: str | None = None,

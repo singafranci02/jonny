@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from datetime import timedelta
 
 from ..context import Conversation
-from .areas import ensure_folders, folder_status, workspace_root
+from .areas import ensure_folders, folder_status, full_disk_access_target, workspace_root
 from .clock import from_iso, parse_days, to_iso, utc_now
 from .telegram import TelegramClient, TelegramError, reminder_keyboard
 
@@ -145,14 +145,15 @@ class LifeService:
             )
             reply = resp.text
             await asyncio.to_thread(self.store.log_message, "out", "chat", reply)
-        if self.session.pending_research:
-            topic, self.session.pending_research = self.session.pending_research, None
-            asyncio.ensure_future(self._research(topic))
+        # a deep_research request made in THIS turn (never another channel's)
+        if resp.extra.get("research_topic"):
+            asyncio.ensure_future(self._research(resp.extra["research_topic"]))
         return reply
 
     async def _research(self, topic: str) -> None:
         try:
-            path, summary = await self.session.research(topic)
+            # the summary joins the text conversation, not the voice one
+            path, summary = await self.session.research(topic, conversation=self.text_convo)
             await self.notify(f"Research done: {topic}\n\n{summary}\n\nSaved as {path.name}", "checkin")
         except Exception as e:
             log.exception("research failed")
@@ -179,13 +180,19 @@ class LifeService:
             except asyncio.CancelledError:
                 raise
             except TelegramError as e:
-                if e.code == 409:  # a webhook is set somewhere: polling needs it gone
+                if e.code == 409 and "webhook" in str(e).lower():
+                    # a webhook is set: polling needs it gone
                     try:
                         await self.tg.delete_webhook()
                         continue
                     except Exception:
                         pass
-                self.status["telegram"] = f"error: {e}"
+                if e.code == 409:
+                    # another process polls this bot (e.g. a second Mac running
+                    # `make serve`): back off rather than fight over updates
+                    self.status["telegram"] = "conflict: another Jarvis is polling this bot"
+                else:
+                    self.status["telegram"] = f"error: {e}"
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 60)
             except Exception as e:  # network down etc.
@@ -223,7 +230,7 @@ class LifeService:
             await self.tg.send(chat_id, HELP)
             return
         if text.startswith("/today"):
-            await asyncio.to_thread(self.store.log_message, "in", "user", text)
+            await asyncio.to_thread(self.store.log_message, "in", "command", text)
             summary = await asyncio.to_thread(self.store.today_text, lambda a: self.labels.get(a, a))
             await self.tg.send(chat_id, summary)
             return
@@ -236,7 +243,13 @@ class LifeService:
             reply = f"Sorry, something went wrong on my side ({type(e).__name__}). Try again in a moment."
         finally:
             typing.cancel()
-        await self.tg.send(chat_id, reply)
+        try:
+            await self.tg.send(chat_id, reply)  # retries transient failures itself
+        except Exception as e:
+            log.error("reply not delivered: %s", e)
+            await asyncio.to_thread(
+                self.store.log_message, "out", "system", f"(This reply couldn't be delivered to Telegram: {e})"
+            )
 
     async def _keep_typing(self) -> None:
         while True:
@@ -270,7 +283,7 @@ class LifeService:
         original = message.get("text") or f"⏰ {reminder['text']}"
         await self.tg.edit_text(chat_id, message["message_id"], f"{original}\n\n{status}")
         await asyncio.to_thread(
-            self.store.log_message, "in", "user", f"{status}: {reminder['text']}", reminder["area"]
+            self.store.log_message, "in", "button", f"{status}: {reminder['text']}", reminder["area"]
         )
 
     # ---------------- scheduler ----------------
@@ -354,6 +367,8 @@ class LifeService:
         text = (resp.text or "").strip()
         if text and text.upper() != "NOTHING":
             await self.notify(text, "checkin")
+        if resp.extra.get("research_topic"):
+            asyncio.ensure_future(self._research(resp.extra["research_topic"]))
         return text
 
     def checkin_by_key(self, key: str) -> CheckIn | None:
@@ -364,8 +379,13 @@ class LifeService:
         today = now.date().isoformat()
         if now.hour < 3 or await asyncio.to_thread(self.store.get_setting, "backup_last") == today:
             return
-        await asyncio.to_thread(self.backup)
+        # one attempt per day: a blocked iCloud folder shouldn't retry (and
+        # log) every 20 seconds
         await asyncio.to_thread(self.store.set_setting, "backup_last", today)
+        try:
+            await asyncio.to_thread(self.backup)
+        except Exception as e:
+            log.warning("nightly backup failed: %s", e)
 
     def backup(self) -> str:
         folder = workspace_root(self.cfg) / "_backups"
@@ -390,6 +410,7 @@ class LifeService:
             "scheduler_last_sweep": self.clock.when(sweep) if sweep else None,
             "scheduler_ok": bool(sweep) and utc_now() - from_iso(sweep) < timedelta(minutes=2),
             "folder": folder_status(self.cfg),
+            "full_disk_access_target": full_disk_access_target(),
             "timezone": self.clock.tz_name,
             "coordinator_model": self.cfg["llm"]["tiers"][self.coordinator_tier]["model"],
             "area_model": self.cfg["llm"]["tiers"].get(self.life.agents.tier_name, {}).get("model"),

@@ -43,6 +43,7 @@ export type Status = {
   scheduler_last_sweep: string | null;
   scheduler_ok: boolean;
   folder: { root: string; exists: boolean; writable: boolean; error?: string; areas: Record<string, boolean> };
+  full_disk_access_target: string;
   timezone: string;
   coordinator_model: string;
   area_model: string | null;
@@ -75,14 +76,30 @@ async function call<T>(path: string, init: RequestInit = {}, timeoutMs?: number)
     return { ok: false, error: "Jarvis's Mac isn't reachable right now (off, asleep, or the tunnel is down)." };
   }
   if (res.status === 401) return { ok: false, error: "The Mac rejected the token: JARVIS_TOKEN must match the Mac's .env." };
+  const tunnelError = res.headers.get("ngrok-error-code");
   const body = await res.json().catch(() => null);
   if (!res.ok) {
-    const detail = body && typeof body.detail === "string" ? body.detail : body?.error;
-    if (res.status === 404 && !detail) {
+    // The tunnel answered, not Jarvis: ngrok's "endpoint offline" page (a 404)
+    // or a gateway error while Jarvis is down. Both are HTML, not JSON.
+    if (tunnelError || body === null) {
+      return {
+        ok: false,
+        error: `Jarvis's Mac isn't reachable right now (${tunnelError ? `tunnel error ${tunnelError}` : `HTTP ${res.status}`}). It may be off, asleep, or restarting.`,
+      };
+    }
+    // FastAPI's default 404: this Jarvis has no /life routes yet
+    if (res.status === 404 && body.detail === "Not Found") {
       return { ok: false, error: "The Mac is running an older Jarvis without Life HQ: pull the latest code there and restart it." };
     }
+    const detail =
+      typeof body.detail === "string"
+        ? body.detail
+        : Array.isArray(body.detail) // validation errors: a list of {msg, loc}
+          ? body.detail.map((d: { msg?: string }) => d?.msg).filter(Boolean).join("; ")
+          : body.error;
     return { ok: false, error: detail || `The Mac answered ${res.status}.` };
   }
+  if (body === null) return { ok: false, error: "The Mac sent an answer the website couldn't read." };
   return { ok: true, data: body as T };
 }
 

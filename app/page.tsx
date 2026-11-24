@@ -8,7 +8,6 @@ import { lifeGet, type Area, type Dashboard as Data } from "@/lib/life";
 // reminders, tasks and logs; this page is a window onto it.
 
 export const dynamic = "force-dynamic";
-export const maxDuration = 300; // "Ask Jarvis" can involve area agents
 
 const RECURRENCES = ["none", "daily", "weekdays", "weekly", "monthly"];
 
@@ -20,7 +19,8 @@ const SOURCE_LABEL: Record<string, string> = {
   system: "system",
 };
 
-export default async function Dashboard() {
+export default async function Dashboard({ searchParams }: { searchParams: Promise<{ err?: string }> }) {
+  const { err } = await searchParams;
   const res = await lifeGet<Data>("/life/dashboard");
 
   if (!res.ok) {
@@ -54,6 +54,7 @@ export default async function Dashboard() {
     <div className="shell">
       <Nav active="home" />
 
+      {err && <p className="flash err">That change didn&apos;t go through: {err}</p>}
       {problems.length > 0 && (
         <p className="banner">
           Heads up: {problems.join(" · ")}. <Link href="/setup">Open Setup →</Link>
@@ -151,6 +152,7 @@ export default async function Dashboard() {
           const items = d.items.filter((i) => i.area === area.id);
           const goals = items.filter((i) => i.kind === "goal");
           const tasks = items.filter((i) => i.kind === "task");
+          const notes = items.filter((i) => i.kind === "note");
           const logs = d.logs.filter((l) => l.area === area.id).slice(0, 3);
           return (
             <section key={area.id} className={`card area area-${area.id}`}>
@@ -184,6 +186,20 @@ export default async function Dashboard() {
                 ))}
                 {tasks.length > 5 && <li className="muted small">+{tasks.length - 5} more</li>}
               </ul>
+              {notes.length > 0 && (
+                <ul className="list compact">
+                  {notes.slice(0, 3).map((n) => (
+                    <li key={n.id} className="row">
+                      <span className="what">📝 {n.title}</span>
+                      <form action={itemAction} className="row-actions">
+                        <input type="hidden" name="id" value={n.id} />
+                        <button name="op" value="archive" title="Archive note" className="ghost">✕</button>
+                      </form>
+                    </li>
+                  ))}
+                  {notes.length > 3 && <li className="muted small">+{notes.length - 3} more notes</li>}
+                </ul>
+              )}
               {logs.length > 0 && (
                 <ul className="logs">
                   {logs.map((l) => (

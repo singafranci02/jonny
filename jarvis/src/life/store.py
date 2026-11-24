@@ -125,11 +125,19 @@ class LifeStore:
 
     # ---------------- reminders ----------------
 
+    def _upcoming(self, due: datetime, recurrence: str, anchor: int | None) -> datetime:
+        """A repeating reminder whose time has already passed starts at its next
+        occurrence ("every day at 8:40", set at 10:40, first fires tomorrow)."""
+        if recurrence != "none" and due <= utc_now():
+            return self.clock.next_occurrence(due, recurrence, utc_now(), anchor) or due
+        return due
+
     def add_reminder(self, area: str, text: str, due: datetime, recurrence: str = "none") -> dict:
         if recurrence not in RECURRENCES:
             raise ValueError(f"recurrence must be one of {', '.join(RECURRENCES)}")
         now = to_iso(utc_now())
         anchor = self.clock.local(due).day if recurrence == "monthly" else None
+        due = self._upcoming(due, recurrence, anchor)
         with self._db() as c:
             cur = c.execute(
                 "insert into reminders (area, text, due_at, recurrence, anchor_day, created_at, updated_at) "
@@ -169,15 +177,20 @@ class LifeStore:
                 new["recurrence"] = recurrence
             if due is not None:
                 new["due_at"] = to_iso(due)
-                # rescheduling something already sent re-arms it
-                if status is None and cur["status"] == "sent":
-                    new["status"] = "pending"
+            # rescheduling something already sent, or making it repeat, re-arms it
+            schedule_changed = due is not None or (recurrence is not None and recurrence != cur["recurrence"])
+            if status is None and cur["status"] == "sent" and schedule_changed:
+                new["status"] = "pending"
             if status is not None:
                 new["status"] = status
             if due is not None or recurrence is not None:
                 new["anchor_day"] = (
                     self.clock.local(new["due_at"]).day if new["recurrence"] == "monthly" else None
                 )
+                if new["status"] == "pending":
+                    new["due_at"] = to_iso(
+                        self._upcoming(from_iso(new["due_at"]), new["recurrence"], new["anchor_day"])
+                    )
             c.execute(
                 "update reminders set text = ?, area = ?, recurrence = ?, due_at = ?, status = ?, "
                 "anchor_day = ?, updated_at = ? where id = ?",
@@ -266,6 +279,20 @@ class LifeStore:
         if r["recurrence"] == "none":
             return self.update_reminder(rid, due=until, status="pending")
         return self.add_reminder(r["area"], r["text"], until)
+
+    def skip_occurrence(self, rid: int) -> dict | None:
+        """For a pending repeating reminder: move it to the occurrence after its
+        current one (dashboard ✓ / +1h on a series that hasn't fired yet)."""
+        r = self.get_reminder(rid)
+        if r is None or r["recurrence"] == "none" or r["status"] != "pending":
+            return None
+        nxt = self.clock.next_occurrence(r["due_at"], r["recurrence"], from_iso(r["due_at"]), r.get("anchor_day"))
+        with self._db() as c:
+            c.execute(
+                "update reminders set due_at = ?, updated_at = ? where id = ?",
+                (to_iso(nxt), to_iso(utc_now()), rid),
+            )
+        return self.get_reminder(rid)
 
     def complete(self, rid: int) -> dict | None:
         """Done: one-off reminders close; for repeating ones this only
@@ -409,7 +436,10 @@ class LifeStore:
         with the next message ("7h, ran 30 min" makes sense after the check-in)."""
         since = to_iso(utc_now() - timedelta(hours=24))
         with self._db() as c:
-            last_in = c.execute("select max(id) as id from messages where direction = 'in'").fetchone()["id"] or 0
+            # only real replies count (button presses and /today don't answer a check-in)
+            last_in = c.execute(
+                "select max(id) as id from messages where direction = 'in' and source = 'user'"
+            ).fetchone()["id"] or 0
             rows = c.execute(
                 "select * from messages where direction = 'out' and source in ('checkin', 'reminder') "
                 "and id > ? and created_at > ? order by id asc limit 6",

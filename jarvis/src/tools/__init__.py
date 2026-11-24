@@ -14,6 +14,7 @@ class Tool:
     parameters: dict  # JSON schema, {"type": "object", ...}
     func: Callable[..., str]
     timeout: float = 20.0  # seconds the agent loop waits; delegate needs minutes
+    timeout_message: str | None = None  # what the model is told if that wait runs out
 
     def anthropic_schema(self) -> dict:
         return {

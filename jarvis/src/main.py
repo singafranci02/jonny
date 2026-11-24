@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextvars
 import sys
 
 from rich.console import Console
@@ -25,6 +26,10 @@ from .memory import make_memory_store
 
 console = Console()
 
+# Per-turn state (e.g. a research request made by a tool during the turn).
+# Tools run via asyncio.to_thread, which carries this context into the thread.
+_turn_state: contextvars.ContextVar[dict | None] = contextvars.ContextVar("jarvis_turn_state", default=None)
+
 
 class Session:
     def __init__(self) -> None:
@@ -35,11 +40,17 @@ class Session:
         self.knowledge = make_knowledge_index(self.cfg)
         from .tools import make_tools
 
-        # the model can request research itself; the active loop picks it up
+        # the model can request research itself; the active loop picks it up.
+        # Within a turn the request is recorded on that turn's own state, so
+        # concurrent turns (voice vs Telegram) never pick up each other's.
         self.pending_research: str | None = None
 
         def _request_research(topic: str) -> str:
-            self.pending_research = topic
+            state = _turn_state.get()
+            if state is not None:
+                state["research"] = topic
+            else:
+                self.pending_research = topic
             return "research started in the background; the user will be told when it's ready"
 
         self.tools = make_tools(
@@ -118,6 +129,8 @@ class Session:
         if fast:
             history = history[-6:]  # slim context: recent turns only
         scratch = [*history, {"role": "user", "content": enriched}]
+        state = {"research": None}
+        token = _turn_state.set(state)
         try:
             resp = await self._agent_loop(
                 tier, scratch, on_text=timed_on_text, use_tools=not fast
@@ -125,6 +138,14 @@ class Session:
         except Exception:
             convo.messages.pop()  # keep history consistent
             raise
+        finally:
+            _turn_state.reset(token)
+        # a research request made during this turn belongs to this turn's
+        # caller: voice callers read session.pending_research (as before),
+        # the life organiser reads resp.extra["research_topic"]
+        resp.extra["research_topic"] = state["research"]
+        if state["research"] and conversation is None:
+            self.pending_research = state["research"]
         if fast:
             resp.extra["path"] = "fast"
         resp.extra["timings"] = {
@@ -187,15 +208,16 @@ class Session:
                 # (20s for lookups; delegate to an area agent gets minutes)
                 limit = getattr(tool, "timeout", 20) if tool else 20
                 try:
+                    # to_thread (not run_in_executor) carries the turn's
+                    # context into the thread (see _turn_state)
                     output, is_error = await asyncio.wait_for(
-                        loop.run_in_executor(
-                            None, run_tool, self.tools, call.name, call.arguments
-                        ),
+                        asyncio.to_thread(run_tool, self.tools, call.name, call.arguments),
                         timeout=limit,
                     )
                 except asyncio.TimeoutError:
                     output, is_error = (
-                        "tool timed out — answer from what you know and say "
+                        (tool.timeout_message if tool and tool.timeout_message else None)
+                        or "tool timed out — answer from what you know and say "
                         "you couldn't check live data",
                         True,
                     )
@@ -253,8 +275,9 @@ class Session:
             _warm_llm(), loop.run_in_executor(None, _warm_stores)
         )
 
-    async def research(self, topic: str, progress=lambda m: None):
-        """Run the deep-research pipeline; returns (report_path, summary)."""
+    async def research(self, topic: str, progress=lambda m: None, conversation: Conversation | None = None):
+        """Run the deep-research pipeline; returns (report_path, summary).
+        The summary is added to `conversation` (default: the voice one)."""
         from .profile import profile_for_prompt
         from .research.pipeline import ResearchPipeline
 
@@ -270,8 +293,9 @@ class Session:
         path, summary = await pipeline.run(
             topic, progress=progress, user_context=user_context
         )
-        self.conversation.add_user(f"(I asked you to research: {topic})")
-        self.conversation.add_assistant(summary)
+        convo = conversation if conversation is not None else self.conversation
+        convo.add_user(f"(I asked you to research: {topic})")
+        convo.add_assistant(summary)
         return path, summary
 
     async def flush(self) -> None:

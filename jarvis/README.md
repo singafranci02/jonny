@@ -102,7 +102,7 @@ review) arrive on Telegram. Everything is configured in `config.yaml` →
 ```sh
 make life ARGS=folders         # create iCloud Drive/Jarvis and the area folders
 make life                      # status: folder, permissions, Telegram, models
-make life ARGS=python-path     # the file to give Full Disk Access (iCloud)
+make life ARGS=python-path     # the Python.app to give Full Disk Access (iCloud)
 make life ARGS=test-telegram   # send yourself a test message
 make life ARGS=today           # today's reminders and due items
 make test                      # unit tests, no network

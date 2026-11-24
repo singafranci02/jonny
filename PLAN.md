@@ -102,7 +102,7 @@ Things to say to Jarvis:
 | `jarvis/src/life/api.py`, `telegram.py`, `cli.py` | Website API (`/life/*`), Telegram client, `make life` |
 | `jarvis/src/main.py`, `server.py`, `llm/anthropic_client.py` | Small hooks: separate text-channel history, parallel tool calls, model options |
 | `jarvis/prompts/system.md` | Jarvis's persona, now including the folder and when to delegate |
-| `jarvis/tests/test_life.py` | 20 tests, no network (`make test`) |
+| `jarvis/tests/test_life.py` | 29 tests, no network (`make test`) |
 | `app/page.tsx`, `app/setup/`, `lib/life.ts` | The website dashboard and Setup page, reading from the Mac |
 | `app/talk/`, `app/about/`, `app/files/`, `lib/brain.ts` | The voice face and its pages (unchanged apart from the nav bar and a timeout option) |
 
@@ -139,7 +139,7 @@ These are rough estimates; check them against `jarvis/data/life_agents.log`, whi
 - The website dashboard, Setup page, and "Ask Jarvis".
 
 **Verified:**
-- 20 unit tests (no network): time and daylight-saving recurrence, the database, area locks on tools, folder setup, the area agent loop including folder confinement, Telegram handling, the scheduler, the website API, and the turn-loop hooks.
+- 29 unit tests (no network): time and daylight-saving recurrence, the database, area locks on tools, folder setup, the area agent loop including folder confinement, Telegram handling, the scheduler, the website API, and the turn-loop hooks.
 - The real Anthropic SDK sends the right requests: checked against a local stand-in API.
 - The website builds, and renders real data from the real `/life` API.
 
@@ -155,7 +155,7 @@ These are rough estimates; check them against `jarvis/data/life_agents.log`, whi
    cd ~/jonny && git fetch origin && git checkout life-hq
    git subtree split --prefix=jarvis -b jarvis-life-hq     # Jarvis-only history, incl. the new work
    cd <your Jarvis folder> && git pull ~/jonny jarvis-life-hq
-   make setup && make test                                 # deps + the 20 tests
+   make setup && make test                                 # deps + the 29 tests
    ```
 
 4. **Telegram on the Mac:**
@@ -163,10 +163,12 @@ These are rough estimates; check them against `jarvis/data/life_agents.log`, whi
    2. Send `/start` to your bot: it replies with your chat id.
    3. Add `TELEGRAM_CHAT_ID=…` and restart again.
 5. **iCloud access for the background service:**
-   1. Run `make life ARGS=python-path`.
-   2. In System Settings → Privacy & Security → Full Disk Access, add that file, then restart.
+   1. Run `make life ARGS=python-path`. It prints a `…/Python.app`, which is what macOS checks; the website's Setup page shows the same path.
+   2. In System Settings → Privacy & Security → Full Disk Access, click +, press Cmd-Shift-G, paste that path, and Open. Then restart.
    3. In Finder → iCloud Drive → Jarvis, right-click → **Keep Downloaded**.
    4. Run `make life`: everything should be green.
+
+   After a Python minor upgrade (say 3.12 to 3.13), add the new `Python.app` again.
 6. **Website:** merge `life-hq` into `main`. Vercel deploys, and no new settings are needed.
 
 **Done when all of these pass:**
@@ -202,7 +204,8 @@ These are rough estimates; check them against `jarvis/data/life_agents.log`, whi
 | Risk | Mitigation |
 |---|---|
 | The Mac mini is off, asleep, or stuck at the FileVault login after a power cut: nothing is sent | Your existing liveness script (no sleep, power back on) and watchdog. Telegram holds messages for 24h; check-ins catch up within 2h; the website shows "offline". Phase 2 adds an outside alert |
-| macOS blocks the background service from iCloud Drive | Full Disk Access for its python (`make life ARGS=python-path`). `make life` and the Setup page detect the problem from inside the server |
+| macOS blocks the background service from iCloud Drive | Full Disk Access for its `Python.app` (`make life ARGS=python-path`). `make life` and the Setup page detect the problem from inside the server. Jarvis still starts without it; only file tools report the problem |
+| Two machines run Jarvis's server with the same Telegram token | Only one can poll the bot. The other backs off and Setup says "conflict". Run the server with the token only on the Mac mini; reminders set from another machine carry a warning |
 | iCloud keeps files cloud-only ("Optimize Mac Storage") | "Keep Downloaded" on the Jarvis folder on the Mac mini |
 | The same file edited on both Macs at once | iCloud keeps both ("file 2.md"); the agents write mostly on the Mac mini, so this should be rare |
 | Spend | A spend limit in the Anthropic Console; per-run bounds on the area agents; costs logged per run |
