@@ -123,8 +123,9 @@ workspace:
   # the same folder on every Mac signed in to your Apple ID. It holds one
   # subfolder per life area (see life.areas) plus Inbox/.
   # iCloud Drive is privacy-protected: the background service (make
-  # install-web) needs Full Disk Access for its python, or writes are
-  # silently refused. `make life` checks; the website's Setup page shows it.
+  # install-web) needs Full Disk Access for its Python.app (`make life
+  # ARGS=python-path` prints it), or access is refused. Jarvis still starts
+  # without it; `make life` and the website's Setup page show the problem.
   # Also: Finder > iCloud Drive > Jarvis > right-click > Keep Downloaded,
   # so files are always on the Mac mini's disk, not cloud-only.
   path: ~/Library/Mobile Documents/com~apple~CloudDocs/Jarvis

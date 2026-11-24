@@ -151,18 +151,35 @@ class AreaAgents:
         ]
         rounds, cost, text = 0, 0.0, ""
         resp = None
+        partial = "(I ran out of time or steps; this is partial.)"
         while True:
-            resp = self.client().messages.create(messages=messages, **kwargs)
+            # every step is held to the time left, so run() always returns
+            # before Jarvis stops waiting (delegate's timeout is larger)
+            remaining = deadline - time.monotonic()
+            if remaining < 10:
+                text = (text + "\n" if text else "") + partial
+                break
+            retries = 2 if remaining > 120 else 0
+            try:
+                resp = (
+                    self.client()
+                    .with_options(timeout=remaining / (retries + 1), max_retries=retries)
+                    .messages.create(messages=messages, **kwargs)
+                )
+            except Exception as e:  # API error or timeout: report what we have
+                text = (text + "\n" if text else "") + f"(stopped early: the model call failed with {type(e).__name__})"
+                resp = None
+                break
             cost += self._cost(model_cfg["model"], resp.usage)
             text = "".join(getattr(b, "text", "") for b in resp.content if b.type == "text").strip()
             calls = [b for b in resp.content if b.type == "tool_use"]
             if resp.stop_reason != "tool_use" or not calls:
                 break
-            if rounds >= self.max_rounds or time.monotonic() > deadline:
-                text = (text + "\n" if text else "") + "(I ran out of time or steps; this is partial.)"
+            if rounds >= self.max_rounds or deadline - time.monotonic() < 15:
+                text = (text + "\n" if text else "") + partial
                 break
             rounds += 1
-            results = self._run_tools(tools, calls)
+            results = self._run_tools(tools, calls, deadline)
             messages.append({"role": "assistant", "content": resp.content})
             messages.append({"role": "user", "content": results})
 
@@ -174,13 +191,16 @@ class AreaAgents:
         self._log(area, task, report, rounds, cost, time.monotonic() - started)
         return report
 
-    def _run_tools(self, tools: list[Tool], calls) -> list[dict]:
+    def _run_tools(self, tools: list[Tool], calls, deadline: float) -> list[dict]:
         """Execute one round's tool calls concurrently; ALL results go back in
-        a single user message, in call order."""
+        a single user message, in call order. Waits share one clock: each
+        tool gets at most 90s from the start of the round, and never past the
+        run's deadline."""
 
         def one(call) -> tuple[str, bool]:
             return run_tool(tools, call.name, dict(call.input or {}))
 
+        round_end = min(time.monotonic() + 90, deadline - 10)
         # not a `with` block: its exit would wait on a hung tool forever
         pool = concurrent.futures.ThreadPoolExecutor(max_workers=4)
         try:
@@ -188,7 +208,7 @@ class AreaAgents:
             outputs = []
             for f in futures:
                 try:
-                    outputs.append(f.result(timeout=90))
+                    outputs.append(f.result(timeout=max(1.0, round_end - time.monotonic())))
                 except concurrent.futures.TimeoutError:
                     outputs.append(("tool timed out; carry on without it", True))
         finally:
@@ -227,5 +247,11 @@ class AreaAgents:
                 "required": ["area", "task"],
             },
             func=lambda area, task: self.run(area, task),
-            timeout=self.timeout_s + 30,
+            # run() returns by its own deadline; this outer wait is the backstop
+            timeout=self.timeout_s + 60,
+            timeout_message=(
+                "The area agent is taking longer than usual and is still working in the background: "
+                "its changes may still appear. Don't ask it again yet; tell the user it is still on it, "
+                "and check life_overview before retrying so nothing gets duplicated."
+            ),
         )

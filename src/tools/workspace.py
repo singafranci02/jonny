@@ -11,24 +11,49 @@ from __future__ import annotations
 
 import json
 import shutil
+import threading
 import time
+from datetime import datetime
 from pathlib import Path
 
 from . import Tool
 
 _MAX_READ = 6000
 _MAX_WRITE = 100_000
+# folders that hold machinery, not documents: never listed
+_HIDDEN_DIRS = {"_trash", "_backups"}
+
+# tool calls in one round run in parallel: serialise read-modify-write per file
+_file_locks: dict[str, threading.Lock] = {}
+_file_locks_guard = threading.Lock()
+
+
+def _lock_for(path: Path) -> threading.Lock:
+    with _file_locks_guard:
+        return _file_locks.setdefault(str(path), threading.Lock())
 
 
 class WorkspaceError(Exception):
     pass
 
 
-def _root(cfg: dict) -> Path:
+def _root_path(cfg: dict) -> Path:
+    """The configured folder, without touching the filesystem (safe at
+    startup even when iCloud/TCC would refuse access)."""
     ws = cfg.get("workspace", {}) or {}
-    root = Path(ws.get("path", "~/JarvisWorkspace")).expanduser()
-    root.mkdir(parents=True, exist_ok=True)
-    return root.resolve()
+    return Path(ws.get("path", "~/JarvisWorkspace")).expanduser()
+
+
+def _root(cfg: dict) -> Path:
+    root = _root_path(cfg)
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+        return root.resolve()
+    except OSError as e:
+        raise WorkspaceError(
+            f"can't reach the workspace folder {root} ({e.strerror or e}). If it is in iCloud "
+            "Drive, the background service needs Full Disk Access (make life ARGS=python-path)."
+        )
 
 
 def _trash(cfg: dict) -> Path:
@@ -75,7 +100,7 @@ def _audit(cfg: dict, action: str, path: Path, extra: str = "") -> None:
 def _version_to_trash(cfg: dict, path: Path) -> None:
     """Before any destructive write, keep the old content."""
     if path.exists() and path.is_file():
-        stamp = time.strftime("%Y%m%d-%H%M%S")
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")  # unique even within a second
         shutil.copy2(path, _trash(cfg) / f"{path.name}.{stamp}")
 
 
@@ -83,33 +108,35 @@ def create_file(cfg: dict, name: str, content: str) -> str:
     path = _resolve(cfg, name)
     if len(content or "") > _MAX_WRITE:
         raise WorkspaceError("content too large")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    existed = path.exists()
-    _version_to_trash(cfg, path)
-    path.write_text(content or "")
+    with _lock_for(path):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        existed = path.exists()
+        _version_to_trash(cfg, path)
+        path.write_text(content or "")
     _audit(cfg, "overwrite" if existed else "create", path, f"{len(content or '')}ch")
     return f"{'overwrote' if existed else 'created'} {path.name} ({len(content or '')} characters)"
 
 
 def edit_file(cfg: dict, name: str, find: str, replace: str) -> str:
     path = _resolve(cfg, name)
-    if not path.exists():
-        raise WorkspaceError(f"{path.name} doesn't exist — create it first")
-    text = path.read_text()
-    if find:
-        if find not in text:
-            raise WorkspaceError(
-                f"couldn't find that text in {path.name}; read it first to "
-                "see its current contents"
-            )
-        new = text.replace(find, replace, 1)
-    else:
-        # empty find = append
-        new = text + ("" if text.endswith("\n") or not text else "\n") + replace
-    if len(new) > _MAX_WRITE:
-        raise WorkspaceError("resulting file too large")
-    _version_to_trash(cfg, path)
-    path.write_text(new)
+    with _lock_for(path):
+        if not path.exists():
+            raise WorkspaceError(f"{path.name} doesn't exist — create it first")
+        text = path.read_text()
+        if find:
+            if find not in text:
+                raise WorkspaceError(
+                    f"couldn't find that text in {path.name}; read it first to "
+                    "see its current contents"
+                )
+            new = text.replace(find, replace, 1)
+        else:
+            # empty find = append
+            new = text + ("" if text.endswith("\n") or not text else "\n") + replace
+        if len(new) > _MAX_WRITE:
+            raise WorkspaceError("resulting file too large")
+        _version_to_trash(cfg, path)
+        path.write_text(new)
     _audit(cfg, "edit", path, f"{len(text)}->{len(new)}ch")
     return f"edited {path.name}"
 
@@ -118,8 +145,19 @@ def read_file(cfg: dict, name: str) -> str:
     path = _resolve(cfg, name)
     if not path.exists():
         raise WorkspaceError(f"{path.name} doesn't exist")
-    text = path.read_text(errors="replace")
+    data = path.read_bytes()
+    if b"\x00" in data[:8192]:
+        raise WorkspaceError(f"{path.name} is a binary file; open it in Finder instead")
+    text = data.decode(errors="replace")
     return text[:_MAX_READ] + ("\n...(truncated)" if len(text) > _MAX_READ else "")
+
+
+def _listed(rel_parts: tuple[str, ...], trash: str) -> bool:
+    """Documents only: no trash/backups folders, no dotfiles (.DS_Store, and
+    iCloud's '.name.icloud' placeholders for files not downloaded yet)."""
+    return not any(
+        part.startswith(".") or part in _HIDDEN_DIRS or part == trash for part in rel_parts
+    )
 
 
 def list_files(cfg: dict) -> str:
@@ -127,7 +165,7 @@ def list_files(cfg: dict) -> str:
     trash = (cfg.get("workspace", {}) or {}).get("trash_subdir", "_trash")
     entries = sorted(
         p for p in root.rglob("*")
-        if p.is_file() and trash not in p.relative_to(root).parts
+        if p.is_file() and _listed(p.relative_to(root).parts, trash)
     )
     if not entries:
         return "the workspace is empty"
@@ -142,17 +180,29 @@ def list_files(cfg: dict) -> str:
 def move_file(cfg: dict, name: str, new_name: str) -> str:
     src = _resolve(cfg, name)
     dst = _resolve(cfg, new_name)  # destination confined too
-    if not src.exists():
-        raise WorkspaceError(f"{src.name} doesn't exist")
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    _version_to_trash(cfg, dst)  # never silently clobber a file by moving onto it
-    shutil.move(str(src), str(dst))
+    first, second = sorted([src, dst], key=str)  # fixed order: no deadlock
+    with _lock_for(first), (_lock_for(second) if second != first else _NoLock()):
+        if not src.exists():
+            raise WorkspaceError(f"{src.name} doesn't exist")
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        _version_to_trash(cfg, dst)  # never silently clobber a file by moving onto it
+        shutil.move(str(src), str(dst))
     _audit(cfg, "move", src, f"-> {dst}")
     return f"moved {src.name} to {dst.relative_to(_root(cfg))}"
 
 
+class _NoLock:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
 def build(cfg: dict) -> list[Tool]:
-    root = _root(cfg)
+    # no filesystem access here: Jarvis must start even if the folder (iCloud)
+    # isn't reachable yet; each tool call reports the problem instead
+    root = _root_path(cfg)
     loc = f"your workspace folder ({root})"
     return [
         Tool(

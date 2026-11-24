@@ -15,13 +15,12 @@ import argparse
 import asyncio
 import os
 import shutil
-import sys
 from pathlib import Path
 
 from rich.console import Console
 
 from ..config import load_config
-from .areas import ensure_folders, folder_status, inbox_name, workspace_root
+from .areas import ensure_folders, folder_status, full_disk_access_target, inbox_name, workspace_root
 
 console = Console()
 
@@ -56,9 +55,9 @@ def main() -> None:
         return
 
     if args.cmd == "python-path":
-        # launchd runs the venv's python, which resolves to this binary; it is
-        # what needs Full Disk Access to reach iCloud Drive in the background
-        console.print(os.path.realpath(sys.executable))
+        # what needs Full Disk Access for the background service to reach
+        # iCloud Drive (for framework pythons that's Python.app, not bin/python)
+        console.print(full_disk_access_target())
         return
 
     if args.cmd == "folders":
@@ -75,7 +74,12 @@ def main() -> None:
         ok = st["exists"] and st["writable"]
         console.print(f"[{'green' if ok else 'red'}]folder[/] {st['root']}  exists={st['exists']} writable={st['writable']}")
         if st.get("error"):
-            console.print(f"  [red]{st['error']}[/red]  (grant Full Disk Access to the python that runs Jarvis)")
+            console.print(f"  [red]{st['error']}[/red]")
+        if not ok:
+            console.print(
+                "  The background service needs Full Disk Access to reach iCloud Drive: System Settings > "
+                f"Privacy & Security > Full Disk Access > + > {full_disk_access_target()}  (Cmd-Shift-G pastes a path)"
+            )
         for area, present in st["areas"].items():
             console.print(f"  {'✓' if present else '✗'} {area}")
         for var in ("TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID", "ANTHROPIC_API_KEY"):

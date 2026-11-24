@@ -10,7 +10,7 @@ from typing import Callable
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
-from .clock import utc_now
+from .clock import from_iso, utc_now
 
 
 class ReminderIn(BaseModel):
@@ -78,17 +78,32 @@ def make_router(get_service: Callable, require_token: Callable) -> APIRouter:
 
     @router.post("/reminders/{rid}/{op}")
     async def reminder_op(rid: int, op: str) -> dict:
+        """The dashboard's buttons act on the row's own (upcoming) occurrence,
+        unlike Telegram's, which act on a reminder that just fired."""
         s = svc()
-        if op == "done":
-            r = await asyncio.to_thread(s.store.complete, rid)
-        elif op == "cancel":
-            r = await asyncio.to_thread(lambda: s.store.update_reminder(rid, status="cancelled"))
-        elif op == "snooze":
-            r = await asyncio.to_thread(s.store.snooze, rid, utc_now() + timedelta(hours=1))
-        else:
+        if op not in ("done", "cancel", "snooze"):
             raise HTTPException(400, f"unknown action {op!r}")
+        r = await asyncio.to_thread(s.store.get_reminder, rid)
         if r is None:
             raise HTTPException(404, "no such reminder")
+        repeating_upcoming = r["recurrence"] != "none" and r["status"] == "pending"
+        if op == "cancel":
+            await asyncio.to_thread(lambda: s.store.update_reminder(rid, status="cancelled"))
+        elif op == "done":
+            # done early: a one-off closes; a series skips this occurrence
+            if repeating_upcoming:
+                await asyncio.to_thread(s.store.skip_occurrence, rid)
+            else:
+                await asyncio.to_thread(s.store.complete, rid)
+        else:
+            due = from_iso(r["due_at"])
+            later = max(due, utc_now()) + timedelta(hours=1)  # never earlier than planned
+            if repeating_upcoming:
+                # push just this occurrence: a one-off an hour later, series skips it
+                await asyncio.to_thread(s.store.add_reminder, r["area"], r["text"], later)
+                await asyncio.to_thread(s.store.skip_occurrence, rid)
+            else:
+                await asyncio.to_thread(s.store.snooze, rid, later)
         return {"ok": True}
 
     @router.post("/items")
@@ -139,7 +154,10 @@ def make_router(get_service: Callable, require_token: Callable) -> APIRouter:
         s = svc()
         if not s.can_message():
             raise HTTPException(400, "Telegram isn't configured on the Mac yet (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in .env)")
-        await s.notify("👋 Jarvis here. Telegram is connected. Send /help to see what I can do.", "system")
+        try:
+            await s.notify("👋 Jarvis here. Telegram is connected. Send /help to see what I can do.", "system")
+        except Exception as e:  # e.g. "chat not found": wrong chat id, or Start never pressed
+            raise HTTPException(400, f"Telegram refused the message: {e}")
         return {"ok": True}
 
     @router.post("/checkins/{key}/run")

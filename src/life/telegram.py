@@ -7,15 +7,19 @@ service is involved, and if the Mac is off Telegram simply holds messages
 
 from __future__ import annotations
 
+import asyncio
+
 import httpx
 
 MAX_LEN = 4000  # Telegram's hard limit is 4096 characters per message
+RETRY_DELAYS = (2, 5, 15)  # seconds between send attempts on transient failures
 
 
 class TelegramError(Exception):
-    def __init__(self, description: str, code: int | None = None):
+    def __init__(self, description: str, code: int | None = None, retry_after: int | None = None):
         super().__init__(description)
         self.code = code
+        self.retry_after = retry_after
 
 
 def chunks(text: str, size: int = MAX_LEN) -> list[str]:
@@ -56,8 +60,29 @@ class TelegramClient:
         except ValueError:
             raise TelegramError(f"{method}: HTTP {resp.status_code}", resp.status_code)
         if not data.get("ok"):
-            raise TelegramError(f"{method}: {data.get('description', 'failed')}", data.get("error_code"))
+            raise TelegramError(
+                f"{method}: {data.get('description', 'failed')}",
+                data.get("error_code"),
+                (data.get("parameters") or {}).get("retry_after"),
+            )
         return data.get("result")
+
+    async def _send_message(self, **params):
+        """sendMessage with retries for transient failures: network errors,
+        Telegram 5xx, and 429 rate limits (waiting as long as Telegram asks)."""
+        for attempt in range(len(RETRY_DELAYS) + 1):
+            last_try = attempt == len(RETRY_DELAYS)
+            try:
+                return await self.call("sendMessage", **params)
+            except TelegramError as e:
+                transient = e.code == 429 or (e.code or 0) >= 500
+                if not transient or last_try:
+                    raise
+                await asyncio.sleep(e.retry_after or RETRY_DELAYS[attempt])
+            except httpx.TransportError:
+                if last_try:
+                    raise
+                await asyncio.sleep(RETRY_DELAYS[attempt])
 
     async def send(self, chat_id: int, text: str, keyboard: dict | None = None) -> int | None:
         """Plain text (no parse_mode, so agent text can't break formatting).
@@ -65,8 +90,7 @@ class TelegramClient:
         parts = chunks(text)
         last = None
         for i, part in enumerate(parts):
-            msg = await self.call(
-                "sendMessage",
+            msg = await self._send_message(
                 chat_id=chat_id,
                 text=part,
                 link_preview_options={"is_disabled": True},

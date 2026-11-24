@@ -244,8 +244,10 @@ you (Telegram / voice / website) ──► Jarvis ── delegate (parallel) ─
   page read and edit this data through the same token and tunnel.
 - **Ops:** `make life` (status), `make life ARGS=folders|today|test-telegram|backup|python-path`,
   and `make test`. iCloud Drive is privacy-protected: the background service
-  needs Full Disk Access for its python (`make life ARGS=python-path` prints
-  which file).
+  needs Full Disk Access for its `Python.app` (`make life ARGS=python-path`
+  prints it). Without it Jarvis still starts, and only the file tools report
+  the problem. Run the server with the Telegram token on one machine only,
+  because a second poller backs off with a "conflict" status.
 
 ---
 

@@ -870,7 +870,10 @@ async def workspace_list() -> dict:
     from .tools import workspace as W
 
     cfg = _state["session"].cfg
-    listing = W.list_files(cfg)
+    try:
+        listing = W.list_files(cfg)
+    except W.WorkspaceError as e:  # e.g. iCloud Drive blocked by macOS privacy
+        raise HTTPException(503, str(e))
     files = [] if listing == "the workspace is empty" else _json.loads(listing)
     return {"files": files}
 

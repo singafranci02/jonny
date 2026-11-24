@@ -138,19 +138,38 @@ def read_context(cfg: dict, area: Area, limit: int = 12000) -> str:
     return text[:limit] + ("\n...(truncated)" if len(text) > limit else "")
 
 
+def full_disk_access_target() -> str:
+    """What to add under Full Disk Access so this python can reach iCloud
+    Drive. Framework builds (Homebrew, python.org) start through a
+    bin/python3.x launcher that hands over to Resources/Python.app, and macOS
+    checks the identity of the program actually running, so the app bundle
+    is what needs the grant. Re-add it after a Python minor upgrade."""
+    import sys
+    import sysconfig
+
+    if sysconfig.get_config_var("PYTHONFRAMEWORK"):
+        app = Path(sys.base_prefix) / "Resources" / "Python.app"
+        if app.exists():
+            return os.path.realpath(app)
+    return os.path.realpath(sys.executable)
+
+
 def folder_status(cfg: dict) -> dict:
     """For /life/status and `make life ARGS=status`: is the folder reachable
     and writable from this process (iCloud permissions can block launchd)?"""
     root = workspace_root(cfg)
-    status = {"root": str(root), "exists": root.exists(), "writable": False, "areas": {}}
-    if root.exists():
-        probe = root / ".jarvis-write-test"
-        try:
+    status = {"root": str(root), "exists": False, "writable": False, "areas": {}}
+    try:
+        # on Python <= 3.11, exists()/is_dir() raise PermissionError when macOS
+        # privacy (TCC) blocks the folder, instead of returning False
+        status["exists"] = root.exists()
+        if status["exists"]:
+            probe = root / ".jarvis-write-test"
             probe.write_text("ok")
             probe.unlink()
             status["writable"] = True
-        except OSError as e:
-            status["error"] = str(e)
-        for a in load_areas(cfg):
-            status["areas"][a.id] = (root / a.folder).is_dir()
+            for a in load_areas(cfg):
+                status["areas"][a.id] = (root / a.folder).is_dir()
+    except OSError as e:
+        status["error"] = str(e)
     return status

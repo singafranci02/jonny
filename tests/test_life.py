@@ -130,10 +130,17 @@ def test_iso_roundtrip():
 # ---------------------------------------------------------------- store
 
 
+def backdate(store, rid, when):
+    """Simulate time passing: a reminder created earlier is now due at `when`."""
+    with store._db() as c:
+        c.execute("update reminders set due_at = ? where id = ?", (to_iso(when), rid))
+
+
 def test_reminders_lifecycle(store, clock):
     past = utc_now() - timedelta(minutes=1)
     one = store.add_reminder("health", "vitamin D", past)
-    daily = store.add_reminder("fitness", "stretch", past, "daily")
+    daily = store.add_reminder("fitness", "stretch", utc_now() + timedelta(minutes=5), "daily")
+    backdate(store, daily["id"], past)  # it came due a minute ago
     later = store.add_reminder("work", "report", utc_now() + timedelta(hours=3))
     assert [r["id"] for r in store.upcoming_reminders()] == [one["id"], daily["id"], later["id"]]
     assert len(store.upcoming_reminders(area="work")) == 1
@@ -310,11 +317,19 @@ class FakeAnthropic:
     def __init__(self, responses):
         self.responses = list(responses)
         self.requests = []
+        self.options = []
         self.messages = self
+
+    def with_options(self, **kw):
+        self.options.append(kw)
+        return self
 
     def create(self, **kwargs):
         self.requests.append(kwargs)
-        return self.responses.pop(0)
+        nxt = self.responses.pop(0)
+        if isinstance(nxt, Exception):
+            raise nxt
+        return nxt
 
 
 def _resp(stop, *blocks):
@@ -377,7 +392,20 @@ def test_area_agent_limits_and_refusal(cfg, store, clock):
     assert "declined" in agents.run("health", "x")
     assert "unknown area" in agents.run("nope", "x")
     tool = agents.delegate_tool()
-    assert tool.timeout == 90 and tool.parameters["properties"]["area"]["enum"] == ["work", "fitness", "health"]
+    assert tool.timeout == 120 and tool.parameters["properties"]["area"]["enum"] == ["work", "fitness", "health"]
+    assert "still working" in tool.timeout_message
+
+
+def test_area_agent_deadline_and_api_errors(cfg, store, clock):
+    fake = FakeAnthropic([_resp("end_turn", _block("text", text="ok"))])
+    agents = _agents(cfg, store, clock, fake)
+    assert agents.run("work", "x") == "ok"
+    # every model call is held to the time left (and the whole run to timeout_s)
+    assert 0 < fake.options[0]["timeout"] <= 60
+    agents.timeout_s = 5  # less than the 10s floor: stop before calling the model
+    assert "partial" in agents.run("work", "x") and len(fake.requests) == 1
+    agents = _agents(cfg, store, clock, FakeAnthropic([RuntimeError("overloaded")]))
+    assert "stopped early" in agents.run("work", "x")
 
 
 # ---------------------------------------------------------------- telegram helpers
@@ -429,12 +457,18 @@ class FakeSession:
         self.life = LifeContext(clock=clock, store=store, areas=areas,
                                 agents=SimpleNamespace(tier_name="area"))
         self.reply = reply
+        self.research_topic = None
         self.calls = []
+        self.researched = []
         self.pending_research = None
 
     async def turn(self, text, on_text=None, *, conversation=None, tier=None, note=None, learn=True):
         self.calls.append(dict(text=text, conversation=conversation, tier=tier, note=note, learn=learn))
-        return SimpleNamespace(text=self.reply)
+        return SimpleNamespace(text=self.reply, extra={"research_topic": self.research_topic})
+
+    async def research(self, topic, progress=None, conversation=None):
+        self.researched.append((topic, conversation))
+        return Path(f"/tmp/{topic}.md"), f"summary of {topic}"
 
 
 def _service(cfg, store, clock, monkeypatch, reply="Noted.", chat_id="42"):
@@ -449,7 +483,8 @@ def _service(cfg, store, clock, monkeypatch, reply="Noted.", chat_id="42"):
 
 def test_service_reminders_and_buttons(cfg, store, clock, monkeypatch):
     svc = _service(cfg, store, clock, monkeypatch)
-    r = store.add_reminder("fitness", "stretch", utc_now() - timedelta(minutes=1), "daily")
+    r = store.add_reminder("fitness", "stretch", utc_now() + timedelta(minutes=5), "daily")
+    backdate(store, r["id"], utc_now() - timedelta(minutes=1))  # it came due a minute ago
     assert asyncio.run(svc.send_due_reminders()) == 1
     chat, text, kb = svc.tg.sent[0]
     assert chat == 42 and text.startswith("⏰ stretch") and "repeats daily" in text
@@ -660,3 +695,205 @@ def test_session_turn_hooks(monkeypatch):
 
     asyncio.run(s.turn("hi there friend"))
     assert len(s.conversation.messages) == 2
+
+
+# ---------------------------------------------------------------- review fixes
+
+
+def test_reminder_rearm_and_roll_forward(store, clock):
+    # a fired one-off made repeating comes back at its next occurrence
+    r = store.add_reminder("health", "pills", utc_now() - timedelta(minutes=1))
+    [c] = store.claim_due()
+    store.mark_sent(c)
+    u = store.update_reminder(r["id"], recurrence="daily")
+    assert u["status"] == "pending" and from_iso(u["due_at"]) > utc_now()
+    # a repeating reminder whose first time is past starts at the next one, not now
+    past = utc_now() - timedelta(hours=2)
+    d = store.add_reminder("fitness", "stretch", past, "daily")
+    assert from_iso(d["due_at"]) > utc_now() and store.claim_due() == []
+    assert round((from_iso(d["due_at"]) - past).total_seconds() / 3600) == 24
+    # skip_occurrence moves a series one step; one-offs aren't affected
+    s = store.skip_occurrence(d["id"])
+    assert round((from_iso(s["due_at"]) - from_iso(d["due_at"])).total_seconds() / 3600) == 24
+    one = store.add_reminder("work", "x", utc_now() + timedelta(hours=1))
+    assert store.skip_occurrence(one["id"]) is None
+
+
+def test_unseen_outbound_ignores_buttons_and_commands(store):
+    store.log_message("in", "user", "hi")
+    store.log_message("out", "checkin", "How was today?")
+    store.log_message("in", "button", "✅ Done: pills")
+    store.log_message("in", "command", "/today")
+    assert [m["text"] for m in store.unseen_outbound()] == ["How was today?"]
+
+
+def test_workspace_unreachable_and_hygiene(tmp_path):
+    import threading
+
+    from src.tools import workspace as W
+
+    blocker = tmp_path / "not-a-folder"
+    blocker.write_text("x")
+    bad = {"workspace": {"path": str(blocker / "Jarvis")}}
+    tools = {t.name: t for t in W.build(bad)}  # must not touch the filesystem
+    out, err = tools["ws_list"].run({})
+    assert err and "can't reach the workspace" in out
+
+    cfg = {"workspace": {"path": str(tmp_path / "ws"), "trash_subdir": "_trash"}}
+    W.create_file(cfg, "Fitness/plan.md", "# plan\n")
+    (tmp_path / "ws" / "_backups").mkdir()
+    (tmp_path / "ws" / "_backups" / "life-2026-01-01.db").write_bytes(b"SQLite\x00\x00")
+    (tmp_path / "ws" / ".DS_Store").write_bytes(b"\x00")
+    (tmp_path / "ws" / "Work").mkdir()
+    (tmp_path / "ws" / "Work" / ".notes.md.icloud").write_text("placeholder")
+    (tmp_path / "ws" / "blob.bin").write_bytes(b"\x00\x01")
+    names = [f["name"] for f in json.loads(W.list_files(cfg))]
+    assert names == ["Fitness/plan.md", "blob.bin"]
+    with pytest.raises(W.WorkspaceError):
+        W.read_file(cfg, "blob.bin")
+
+    # parallel edits to one file are serialised: none is lost
+    threads = [
+        threading.Thread(target=W.edit_file, args=(cfg, "Fitness/plan.md", "", f"line {i}"))
+        for i in range(20)
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    text = W.read_file(cfg, "Fitness/plan.md")
+    assert all(f"line {i}" in text for i in range(20))
+
+
+def test_full_disk_access_target():
+    import sysconfig
+
+    from src.life.areas import full_disk_access_target
+
+    target = full_disk_access_target()
+    if sysconfig.get_config_var("PYTHONFRAMEWORK"):
+        assert target.endswith("Resources/Python.app")
+    assert Path(target).exists()
+
+
+def test_poll_conflict_and_research_routing(cfg, store, clock, monkeypatch):
+    from src.life.telegram import TelegramError
+
+    svc = _service(cfg, store, clock, monkeypatch)
+    deleted = []
+
+    async def get_me():
+        return {"username": "b"}
+
+    async def delete_webhook():
+        deleted.append(1)
+
+    async def updates(offset, timeout=50):
+        raise TelegramError("getUpdates: Conflict: terminated by other getUpdates request", 409)
+
+    svc.tg.get_me, svc.tg.delete_webhook, svc.tg.get_updates = get_me, delete_webhook, updates
+
+    async def run_briefly():
+        task = asyncio.ensure_future(svc._poll_loop())
+        await asyncio.sleep(0.2)
+        task.cancel()
+
+    asyncio.run(run_briefly())
+    assert svc.status["telegram"].startswith("conflict") and deleted == []
+
+    # research asked for in a Telegram turn reports back on Telegram, into the text history
+    svc.session.research_topic = "e-ink tablets"
+
+    async def chat_then_wait():
+        await svc.chat("research e-ink tablets")
+        await asyncio.sleep(0.05)
+
+    asyncio.run(chat_then_wait())
+    assert svc.session.researched == [("e-ink tablets", svc.text_convo)]
+    assert "Research done" in svc.tg.sent[-1][1]
+
+
+def test_telegram_send_retries(monkeypatch):
+    import src.life.telegram as T
+
+    monkeypatch.setattr(T, "RETRY_DELAYS", (0, 0, 0))
+    tg = T.TelegramClient("x")
+    attempts = []
+
+    async def flaky(method, **params):
+        attempts.append(method)
+        if len(attempts) < 3:
+            raise T.TelegramError("Too Many Requests", 429, retry_after=0)
+        return {"message_id": 7}
+
+    tg.call = flaky
+    assert asyncio.run(tg.send(1, "hi")) == 7 and len(attempts) == 3
+
+    async def bad(method, **params):
+        attempts.append(method)
+        raise T.TelegramError("Bad Request: chat not found", 400)
+
+    tg.call = bad
+    attempts.clear()
+    with pytest.raises(T.TelegramError):
+        asyncio.run(tg.send(1, "hi"))
+    assert len(attempts) == 1  # not retried
+
+
+def test_dashboard_buttons_semantics(cfg, store, clock, monkeypatch):
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from src.life.api import make_router
+
+    svc = _service(cfg, store, clock, monkeypatch)
+    app = FastAPI()
+    app.include_router(make_router(lambda: svc, lambda: None))
+    c = TestClient(app)
+    sunday = utc_now() + timedelta(days=3)
+    one = store.add_reminder("work", "call mum", sunday)
+    assert c.post(f"/life/reminders/{one['id']}/snooze").status_code == 200
+    # +1h means an hour after its own time, never earlier than planned
+    assert from_iso(store.get_reminder(one["id"])["due_at"]) == (sunday + timedelta(hours=1)).replace(microsecond=0)
+    daily = store.add_reminder("health", "pills", utc_now() + timedelta(hours=2), "daily")
+    c.post(f"/life/reminders/{daily['id']}/snooze")
+    moved = store.get_reminder(daily["id"])
+    assert round((from_iso(moved["due_at"]) - from_iso(daily["due_at"])).total_seconds() / 3600) == 24
+    assert any(r["text"] == "pills" and r["recurrence"] == "none" for r in store.upcoming_reminders())
+    before = store.get_reminder(daily["id"])["due_at"]
+    c.post(f"/life/reminders/{daily['id']}/done")
+    assert store.get_reminder(daily["id"])["due_at"] > before  # done early skips this occurrence
+
+    async def refuse(*a, **k):
+        raise RuntimeError("Bad Request: chat not found")
+
+    svc.tg.send = refuse
+    r = c.post("/life/test-telegram")
+    assert r.status_code == 400 and "chat not found" in r.json()["detail"]
+
+
+def test_session_research_stays_with_its_turn(monkeypatch):
+    import src.profile
+
+    from src.llm.base import LLMResponse, ToolCall
+    from src.main import _turn_state
+
+    monkeypatch.setattr(src.profile, "profile_for_prompt", lambda cfg: "")
+
+    def ask_research():
+        state = _turn_state.get()
+        state["research"] = "solar panels"
+        return "started"
+
+    tools = [Tool("deep_research", "r", {"type": "object", "properties": {}}, ask_research)]
+
+    def script():
+        return [LLMResponse(text="", model="m", tier="t", tool_calls=[ToolCall("1", "deep_research", {})]),
+                LLMResponse(text="On it.", model="m", tier="t")]
+
+    s = _bare_session(tools, ScriptedLLM(script()))
+    resp = asyncio.run(s.turn("research solar panels", conversation=Conversation(4), tier="coordinator"))
+    assert resp.extra["research_topic"] == "solar panels" and s.pending_research is None
+    s.llm = ScriptedLLM(script())
+    resp = asyncio.run(s.turn("research solar panels please now"))
+    assert s.pending_research == "solar panels"  # voice callers keep reading this
