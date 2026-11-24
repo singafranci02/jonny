@@ -60,6 +60,12 @@ def require_token(authorization: str = Header(default="")) -> None:
         raise HTTPException(401, "unauthorized")
 
 
+# Life HQ: reminders/tasks/logs, area agents, Telegram (see src/life/)
+from .life.api import make_router as _make_life_router  # noqa: E402
+
+app.include_router(_make_life_router(lambda: _state.get("life"), require_token))
+
+
 def _valid_ticket(ticket: str) -> bool:
     """A ticket is 'base64url(payload).hex(hmac_sha256(payload, TOKEN))', with
     payload = {"exp": <unix seconds>}. The web app mints it (holding the
@@ -94,6 +100,13 @@ async def _startup() -> None:
     session = Session()
     await session.warmup()
     _state["session"] = session
+    if session.life is not None:
+        # Telegram polling + reminder/check-in scheduler (this process only)
+        from .life.service import LifeService
+
+        life = LifeService(session)
+        _state["life"] = life
+        await life.start()
     _state["tts"] = None  # lazily built on first /tts call
     asyncio.ensure_future(_prepare_acks())
     # load the turn-completion model in the background (heuristic until ready)
@@ -549,6 +562,9 @@ def _ensure_recorder():
 
 @app.on_event("shutdown")
 async def _shutdown() -> None:
+    life = _state.get("life")
+    if life is not None:
+        await life.stop()
     _state["recorder_running"] = False
     rec = _state.get("recorder")
     if rec is not None:

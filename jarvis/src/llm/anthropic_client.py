@@ -17,6 +17,39 @@ from .base import LLMClient, LLMResponse, ToolCall
 from .cost import compute_cost
 
 
+def request_options(model_cfg: dict) -> dict:
+    """Thinking/effort/fallback options for one tier, shared by the main loop
+    and the area subagents.
+
+    - thinking: adaptive -> adaptive thinking (+ effort if set).
+    - thinking off: Sonnet 5 takes {"type": "disabled"}; Opus 5.5 and
+      Sonnet 5.5 reject that with a 400 (Sonnet 5.5's off switch is
+      "between_tools"; Opus 5.5 always thinks, so lower effort instead).
+    - fallbacks: "default" opts into server-side refusal fallbacks (beta).
+    """
+    model = model_cfg["model"]
+    opts: dict = {}
+    thinking = str(model_cfg.get("thinking", "off"))
+    if thinking == "adaptive":
+        opts["thinking"] = {"type": "adaptive"}
+        if model_cfg.get("effort"):
+            opts["output_config"] = {"effort": model_cfg["effort"]}
+    elif model.startswith("claude-sonnet-5-5"):
+        opts["thinking"] = {"type": "between_tools"}
+        opts["output_config"] = {"effort": model_cfg.get("effort", "low")}
+    elif model.startswith("claude-opus-5-5"):
+        opts["output_config"] = {"effort": model_cfg.get("effort", "low")}
+    elif "sonnet-5" in model:
+        # Sonnet 5 runs adaptive thinking when the field is omitted;
+        # voice turns want the explicit fast path. Older models (Haiku
+        # 4.5...) default to no thinking when the field is absent.
+        opts["thinking"] = {"type": "disabled"}
+    if model_cfg.get("fallbacks"):
+        opts["extra_headers"] = {"anthropic-beta": "server-side-fallback-2026-07-01"}
+        opts["extra_body"] = {"fallbacks": model_cfg["fallbacks"]}
+    return opts
+
+
 class AnthropicLLM(LLMClient):
     def __init__(self, cfg: dict):
         self.pricing = cfg["llm"].get("pricing", {})
@@ -43,16 +76,7 @@ class AnthropicLLM(LLMClient):
             ],
             "messages": messages,
         }
-        thinking = str(model_cfg.get("thinking", "off"))
-        if thinking == "adaptive":
-            kwargs["thinking"] = {"type": "adaptive"}
-            if model_cfg.get("effort"):
-                kwargs["output_config"] = {"effort": model_cfg["effort"]}
-        elif "sonnet-5" in model_cfg["model"]:
-            # Sonnet 5 runs adaptive thinking when the field is omitted;
-            # voice turns want the explicit fast path. Older models (Haiku
-            # 4.5...) default to no thinking when the field is absent.
-            kwargs["thinking"] = {"type": "disabled"}
+        kwargs.update(request_options(model_cfg))
         if tools:
             kwargs["tools"] = [t.anthropic_schema() for t in tools]
 

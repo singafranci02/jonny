@@ -17,6 +17,7 @@ export function brainConfig(): { url: string; token: string } | null {
 export async function brainFetch(
   path: string,
   init: RequestInit = {},
+  timeoutMs = 120_000,
 ): Promise<Response> {
   const cfg = brainConfig();
   if (!cfg) {
@@ -33,7 +34,8 @@ export async function brainFetch(
       // skip ngrok's free-tier browser interstitial (harmless on other tunnels)
       "ngrok-skip-browser-warning": "1",
     },
-    // the Mac can take a few seconds (local model); allow generous time
-    signal: AbortSignal.timeout(120_000),
+    // the Mac can take a few seconds (local model); allow generous time.
+    // Life HQ requests that delegate to area agents pass a longer one.
+    signal: AbortSignal.timeout(timeoutMs),
   });
 }

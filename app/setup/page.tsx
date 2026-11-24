@@ -1,26 +1,27 @@
 import { Nav } from "../components/Nav";
-import {
-  connectTelegramAction,
-  initDbAction,
-  runCheckInAction,
-  syncAgentsAction,
-  testTelegramAction,
-} from "./actions";
-import { getAgentIds, scheduleStatuses, type AgentIds, type ScheduleStatus } from "@/lib/agents";
-import { appUrl, envStatus, mcpUrl, timezone } from "@/lib/config";
-import { db, getSetting } from "@/lib/db";
-import { getMe, getWebhookInfo } from "@/lib/telegram";
-import { fmtWhen } from "@/lib/time";
+import { runCheckInAction, testTelegramAction } from "./actions";
+import { brainConfig, brainFetch } from "@/lib/brain";
+import { envStatus } from "@/lib/config";
+import { lifeGet, type Status } from "@/lib/life";
 
 export const dynamic = "force-dynamic";
-export const maxDuration = 120; // syncing agents makes ~20 API calls
 
-async function attempt<T>(fn: () => Promise<T>): Promise<{ value?: T; error?: string }> {
+type Health = { status: string; uptime_s: number; ollama_up: boolean };
+
+async function health(): Promise<Health | null> {
+  if (!brainConfig()) return null;
   try {
-    return { value: await fn() };
-  } catch (err) {
-    return { error: err instanceof Error ? err.message : String(err) };
+    const res = await brainFetch("/health", { cache: "no-store" }, 8_000);
+    return res.ok ? ((await res.json()) as Health) : null;
+  } catch {
+    return null;
   }
+}
+
+function uptime(s: number): string {
+  if (s < 3600) return `${Math.round(s / 60)} min`;
+  if (s < 86400) return `${Math.round(s / 3600)} h`;
+  return `${Math.round(s / 86400)} days`;
 }
 
 export default async function SetupPage({
@@ -30,22 +31,8 @@ export default async function SetupPage({
 }) {
   const { ok, err } = await searchParams;
   const env = envStatus();
-  const base = appUrl();
-
-  const dbCheck = await attempt(async () => {
-    await db()`select 1 from settings limit 1`;
-    return true;
-  });
-  const dbReady = dbCheck.value === true;
-  const [bot, hook, idsResult, lastTick] = await Promise.all([
-    attempt(getMe),
-    attempt(getWebhookInfo),
-    dbReady ? attempt(getAgentIds) : Promise.resolve({ value: null as AgentIds | null }),
-    dbReady ? getSetting<{ at: string; sent: number; replies: number }>("last_tick").catch(() => null) : null,
-  ]);
-  const ids = idsResult.value ?? null;
-  const schedules: ScheduleStatus[] = ids?.coordinatorId ? await scheduleStatuses(ids).catch(() => []) : [];
-  const expectedHook = base ? `${base}/api/telegram` : "";
+  const [brain, life] = await Promise.all([health(), lifeGet<Status>("/life/status")]);
+  const s = life.ok ? life.data : null;
 
   return (
     <div className="shell">
@@ -54,91 +41,90 @@ export default async function SetupPage({
       {err && <p className="flash err">{err}</p>}
 
       <section className="card step">
-        <h3>1 · Environment variables</h3>
-        <p className="muted small">Set these in Vercel → Project → Settings → Environment Variables, then redeploy.</p>
+        <h3>1 · This website (Vercel)</h3>
+        <p className="muted small">
+          The website only needs three settings; everything else lives on the Mac. Set them in Vercel → Project →
+          Settings → Environment Variables, then redeploy.
+        </p>
         <ul className="checklist">
           {env.map((v) => (
-            <li key={v.name} className={v.set ? "done" : v.required ? "todo" : "optional"}>
+            <li key={v.name} className={v.set ? "done" : "todo"}>
               <code>{v.name}</code> <span className="muted">{v.help}</span>
             </li>
           ))}
         </ul>
-        <p className="muted small">
-          Public URL: <code>{base || "not detected"}</code> · Timezone: <code>{timezone()}</code>
-        </p>
       </section>
 
       <section className="card step">
-        <h3>2 · Database</h3>
-        <p className={dbReady ? "status-ok" : "status-todo"}>
-          {dbReady ? "Tables exist." : `Not ready: ${dbCheck.error}`}
+        <h3>2 · Jarvis on the Mac mini</h3>
+        <p className={brain ? "status-ok" : "status-todo"}>
+          {brain ? `Brain is up (${uptime(brain.uptime_s)})${brain.ollama_up ? "" : " · Ollama is down"}` : "Brain not reachable"}
         </p>
-        <form action={initDbAction}>
-          <button type="submit">{dbReady ? "Update tables" : "Create tables"}</button>
-        </form>
-      </section>
-
-      <section className="card step">
-        <h3>3 · Telegram</h3>
-        {bot.value ? (
-          <p className="status-ok">
-            Bot: <a href={`https://t.me/${bot.value.username}`}>@{bot.value.username}</a>
-          </p>
-        ) : (
-          <p className="status-todo">Bot not reachable: {bot.error}</p>
+        {!s && <p className="status-todo">Life HQ: {life.ok ? "" : life.error}</p>}
+        {s && (
+          <>
+            <p className={s.folder.writable ? "status-ok" : "status-todo"}>
+              Folder: <code>{s.folder.root}</code>{" "}
+              {s.folder.writable ? "is writable" : s.folder.exists ? "exists but Jarvis can't write to it" : "doesn't exist yet"}
+            </p>
+            {!s.folder.writable && (
+              <p className="muted small">
+                iCloud Drive is privacy-protected. On the Mac: run <code>make life ARGS=python-path</code>, then System
+                Settings → Privacy &amp; Security → Full Disk Access → + → add that file → restart Jarvis (
+                <code>make install-web</code>). If the folder doesn&apos;t exist, run <code>make life ARGS=folders</code>.
+              </p>
+            )}
+            <p className={s.telegram.configured && s.telegram.chat_id_set && s.telegram.telegram === "polling" ? "status-ok" : "status-todo"}>
+              Telegram:{" "}
+              {!s.telegram.configured
+                ? "not set up"
+                : !s.telegram.chat_id_set
+                  ? `bot @${s.telegram.bot ?? "?"} works, chat id missing`
+                  : `@${s.telegram.bot ?? "?"} · ${s.telegram.telegram}${s.telegram.last_poll ? ` · last checked ${s.telegram.last_poll}` : ""}`}
+            </p>
+            {(!s.telegram.configured || !s.telegram.chat_id_set) && (
+              <p className="muted small">
+                On the Mac, add <code>TELEGRAM_BOT_TOKEN=…</code> (from @BotFather) to Jarvis&apos;s <code>.env</code> and
+                restart. Then send <code>/start</code> to your bot: it replies with your chat id. Add{" "}
+                <code>TELEGRAM_CHAT_ID=…</code> and restart again.
+              </p>
+            )}
+            <p className={s.scheduler_ok ? "status-ok" : "status-todo"}>
+              Reminder sender: {s.scheduler_last_sweep ? `last ran ${s.scheduler_last_sweep}` : "hasn't run"}
+            </p>
+            <p className="muted small">
+              Timezone <code>{s.timezone}</code> · Jarvis on <code>{s.coordinator_model}</code> · area agents on{" "}
+              <code>{s.area_model ?? "?"}</code>
+            </p>
+            <div className="button-row">
+              <form action={testTelegramAction}>
+                <button type="submit" className="secondary">Send test Telegram message</button>
+              </form>
+            </div>
+          </>
         )}
-        <p className={hook.value?.url && hook.value.url === expectedHook ? "status-ok" : "status-todo"}>
-          Webhook: <code>{hook.value?.url || "not set"}</code>
-          {hook.value?.last_error_message && <span className="muted"> · last error: {hook.value.last_error_message}</span>}
-        </p>
-        <p className="muted small">
-          Don&apos;t know your chat id? Set everything except <code>TELEGRAM_CHAT_ID</code>, connect the webhook, send{" "}
-          <code>/start</code> to the bot, and it replies with your id.
-        </p>
-        <div className="button-row">
-          <form action={connectTelegramAction}>
-            <button type="submit">Connect webhook</button>
-          </form>
-          <form action={testTelegramAction}>
-            <button type="submit" className="secondary">Send test message</button>
-          </form>
-        </div>
       </section>
 
-      <section className="card step">
-        <h3>4 · Agents and schedules</h3>
-        <p className="muted small">
-          Creates or updates the hosted agents (Jonny plus one per area), the vault holding the token for{" "}
-          <code>{mcpUrl() || "/api/mcp"}</code>, and one scheduled check-in per entry in <code>lib/areas.ts</code>. Run
-          it again after changing <code>lib/areas.ts</code> or <code>MCP_TOKEN</code>.
-        </p>
-        <p className={ids?.coordinatorId ? "status-ok" : "status-todo"}>
-          {ids?.coordinatorId
-            ? `Synced ${ids.syncedAt ? fmtWhen(ids.syncedAt) : ""} · ${Object.keys(ids.areaAgents).length} area agents · ${Object.keys(ids.deployments).length} schedules`
-            : "Not synced yet."}
-        </p>
-        <form action={syncAgentsAction}>
-          <button type="submit" disabled={!dbReady}>Sync agents &amp; schedules</button>
-        </form>
-        {schedules.length > 0 && (
+      {s && (
+        <section className="card step">
+          <h3>3 · Check-ins</h3>
+          <p className="muted small">Scheduled messages from Jarvis. Times and wording live in the Mac&apos;s config.yaml.</p>
           <table className="schedules">
             <thead>
               <tr>
                 <th>Check-in</th>
-                <th>Status</th>
-                <th>Next run</th>
+                <th>Next</th>
                 <th />
               </tr>
             </thead>
             <tbody>
-              {schedules.map((s) => (
-                <tr key={s.key}>
-                  <td>{s.name}</td>
-                  <td>{s.status}</td>
-                  <td>{s.nextRun ? fmtWhen(s.nextRun) : "—"}</td>
+              {s.checkins.map((c) => (
+                <tr key={c.key}>
+                  <td>{c.label}</td>
+                  <td>{c.next}</td>
                   <td>
                     <form action={runCheckInAction}>
-                      <input type="hidden" name="key" value={s.key} />
+                      <input type="hidden" name="key" value={c.key} />
                       <button type="submit" className="ghost">Run now</button>
                     </form>
                   </td>
@@ -146,28 +132,8 @@ export default async function SetupPage({
               ))}
             </tbody>
           </table>
-        )}
-      </section>
-
-      <section className="card step">
-        <h3>5 · Reminder scheduler</h3>
-        <p className={lastTick ? "status-ok" : "status-todo"}>
-          {lastTick ? `Last tick ${fmtWhen(lastTick.at)} (sent ${lastTick.sent}, relayed ${lastTick.replies})` : "Has not run yet."}
-        </p>
-        <p className="muted small">
-          Something must call <code>{base || "https://…"}/api/cron/tick</code> every few minutes with header{" "}
-          <code>Authorization: Bearer $CRON_SECRET</code>. The repo ships a GitHub Actions workflow for it: add repository
-          secrets <code>APP_URL</code> and <code>CRON_SECRET</code> (GitHub → Settings → Secrets and variables → Actions).
-        </p>
-      </section>
-
-      <section className="card step">
-        <h3>Later · Jarvis</h3>
-        <p className="muted small">
-          Jarvis (or any MCP client) can use the same tools as the agents: MCP server <code>{mcpUrl() || "/api/mcp"}</code>{" "}
-          with header <code>Authorization: Bearer $MCP_TOKEN</code>.
-        </p>
-      </section>
+        </section>
+      )}
     </div>
   );
 }

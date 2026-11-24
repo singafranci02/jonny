@@ -1,102 +1,71 @@
 import Link from "next/link";
 import { Nav } from "./components/Nav";
-import {
-  addItemAction,
-  addLogAction,
-  addReminderAction,
-  askJonnyAction,
-  itemAction,
-  reminderAction,
-} from "./actions";
-import { AREAS, COORDINATOR, areaLabel } from "@/lib/areas";
-import { getAgentIds } from "@/lib/agents";
-import { getSetting, isMissingTable } from "@/lib/db";
-import {
-  awaitingReminders,
-  getLogs,
-  openItems,
-  recentMessages,
-  upcomingReminders,
-  type Item,
-  type LogEntry,
-  type Message,
-  type Reminder,
-} from "@/lib/store";
-import { fmtWhen, nowLocal, RECURRENCES, toInputValue } from "@/lib/time";
+import { AskJarvis } from "./components/AskJarvis";
+import { addItemAction, addLogAction, addReminderAction, itemAction, reminderAction } from "./actions";
+import { lifeGet, type Area, type Dashboard as Data } from "@/lib/life";
+
+// Life HQ: everything shown here lives on the Mac with Jarvis, who owns the
+// reminders, tasks and logs; this page is a window onto it.
 
 export const dynamic = "force-dynamic";
-export const maxDuration = 300; // askJonnyAction runs an agent turn after responding
+export const maxDuration = 300; // "Ask Jarvis" can involve area agents
 
-type Data = {
-  upcoming: Reminder[];
-  awaiting: Reminder[];
-  items: Item[];
-  logs: LogEntry[];
-  messages: Message[];
-  agentsSynced: boolean;
-  lastTick: { at: string } | null;
+const RECURRENCES = ["none", "daily", "weekdays", "weekly", "monthly"];
+
+const SOURCE_LABEL: Record<string, string> = {
+  user: "you",
+  chat: "Jarvis",
+  checkin: "Jarvis · check-in",
+  reminder: "reminder",
+  system: "system",
 };
 
-async function load(): Promise<Data | { error: string }> {
-  try {
-    const [upcoming, awaiting, items, logs, messages, ids, lastTick] = await Promise.all([
-      upcomingReminders({ days: 7, limit: 30 }),
-      awaitingReminders(8),
-      openItems({ limit: 200 }),
-      getLogs({ days: 14, limit: 60 }),
-      recentMessages(25),
-      getAgentIds(),
-      getSetting<{ at: string }>("last_tick"),
-    ]);
-    return { upcoming, awaiting, items, logs, messages, agentsSynced: Boolean(ids?.coordinatorId), lastTick };
-  } catch (err) {
-    if (isMissingTable(err)) return { error: "The database tables don't exist yet." };
-    return { error: err instanceof Error ? err.message : String(err) };
-  }
-}
-
 export default async function Dashboard() {
-  const data = await load();
-  const now = nowLocal();
+  const res = await lifeGet<Data>("/life/dashboard");
 
-  if ("error" in data) {
+  if (!res.ok) {
     return (
       <div className="shell">
         <Nav active="home" />
         <section className="card setup-needed">
-          <h2>Almost there</h2>
-          <p>{data.error}</p>
-          <p>
-            Finish the steps on <Link href="/setup">Setup</Link> to connect the database, Telegram and the agents.
+          <h2>Jarvis is offline</h2>
+          <p>{res.error}</p>
+          <p className="muted small">
+            Reminders resume as soon as the Mac is back. <Link href="/setup">Setup</Link> shows what is connected.
           </p>
         </section>
       </div>
     );
   }
 
-  const defaultDue = toInputValue(now.plus({ hours: 1 }).startOf("hour").toJSDate());
+  const d = res.data;
+  const label = (id: string | null) => {
+    const a = d.areas.find((x) => x.id === id);
+    return a ? `${a.emoji} ${a.name}` : (id ?? "");
+  };
+  const problems = [
+    !d.status.telegram.configured && "Telegram isn't set up on the Mac yet",
+    d.status.telegram.configured && !d.status.telegram.chat_id_set && "Telegram needs your chat id",
+    !d.status.folder.writable && "Jarvis can't write to the iCloud folder",
+    !d.status.scheduler_ok && "the reminder sender isn't running",
+  ].filter(Boolean) as string[];
 
   return (
     <div className="shell">
       <Nav active="home" />
 
-      {(!data.agentsSynced || !data.lastTick) && (
+      {problems.length > 0 && (
         <p className="banner">
-          {!data.agentsSynced ? "Agents aren't synced yet. " : ""}
-          {!data.lastTick ? "The reminder scheduler hasn't run yet. " : ""}
-          <Link href="/setup">Open Setup →</Link>
+          Heads up: {problems.join(" · ")}. <Link href="/setup">Open Setup →</Link>
         </p>
       )}
 
       <div className="hero">
         <div>
-          <p className="eyebrow">{now.toFormat("cccc d LLLL")}</p>
-          <h2 className="greeting">{greeting(now.hour)}</h2>
+          <p className="eyebrow">{d.date_label}</p>
+          <h2 className="greeting">{greeting(d.hour)}</h2>
         </div>
-        <form action={askJonnyAction} className="ask">
-          <input name="text" placeholder="Ask Jonny… (the reply arrives on Telegram)" autoComplete="off" />
-          <button type="submit">Send</button>
-        </form>
+        <AskJarvis />
       </div>
 
       <div className="grid-main">
@@ -105,14 +74,14 @@ export default async function Dashboard() {
             <h3>Next up</h3>
             <span className="muted">next 7 days</span>
           </div>
-          {data.upcoming.length === 0 && <p className="empty">Nothing scheduled. Add a reminder below or tell Jonny.</p>}
+          {d.upcoming.length === 0 && <p className="empty">Nothing scheduled. Add a reminder below, or tell Jarvis.</p>}
           <ul className="list">
-            {data.upcoming.map((r) => (
+            {d.upcoming.map((r) => (
               <li key={r.id} className="row">
-                <span className="when">{fmtWhen(r.due_at)}</span>
+                <span className="when">{r.when}</span>
                 <span className="what">
                   {r.text}
-                  <span className="tag">{areaLabel(r.area)}</span>
+                  <span className="tag">{label(r.area)}</span>
                   {r.recurrence !== "none" && <span className="tag repeat">↻ {r.recurrence}</span>}
                 </span>
                 <form action={reminderAction} className="row-actions">
@@ -124,13 +93,13 @@ export default async function Dashboard() {
               </li>
             ))}
           </ul>
-          {data.awaiting.length > 0 && (
+          {d.awaiting.length > 0 && (
             <>
               <p className="subhead">Sent, waiting for ✓</p>
               <ul className="list">
-                {data.awaiting.map((r) => (
+                {d.awaiting.map((r) => (
                   <li key={r.id} className="row dim">
-                    <span className="when">{fmtWhen(r.last_sent_at ?? r.due_at)}</span>
+                    <span className="when">{r.when}</span>
                     <span className="what">{r.text}</span>
                     <form action={reminderAction} className="row-actions">
                       <input type="hidden" name="id" value={r.id} />
@@ -143,9 +112,9 @@ export default async function Dashboard() {
           )}
           <form action={addReminderAction} className="inline-form">
             <input name="text" placeholder="Remind me to…" required />
-            <AreaSelect />
-            <input name="due" type="datetime-local" defaultValue={defaultDue} required />
-            <select name="recurrence" defaultValue="none">
+            <AreaSelect areas={d.areas} />
+            <input name="due" type="datetime-local" defaultValue={d.default_due} required />
+            <select name="recurrence" defaultValue="none" aria-label="repeat">
               {RECURRENCES.map((r) => (
                 <option key={r} value={r}>
                   {r === "none" ? "once" : r}
@@ -159,15 +128,15 @@ export default async function Dashboard() {
         <section className="card">
           <div className="card-head">
             <h3>Activity</h3>
-            <span className="muted">Telegram, reminders, agents</span>
+            <span className="muted">Telegram, reminders, check-ins</span>
           </div>
-          {data.messages.length === 0 && <p className="empty">No messages yet.</p>}
+          {d.messages.length === 0 && <p className="empty">No messages yet.</p>}
           <ul className="feed">
-            {data.messages.map((m) => (
+            {d.messages.map((m) => (
               <li key={m.id} className={`feed-item ${m.direction}`}>
                 <span className="feed-meta">
                   {SOURCE_LABEL[m.direction === "in" ? "user" : m.source] ?? m.source}
-                  {m.area ? ` · ${areaLabel(m.area)}` : ""} · {fmtWhen(m.created_at)}
+                  {m.area ? ` · ${label(m.area)}` : ""} · {m.when}
                 </span>
                 <span className="feed-text">{m.text}</span>
               </li>
@@ -178,11 +147,11 @@ export default async function Dashboard() {
 
       <h3 className="section-title">Areas</h3>
       <div className="areas">
-        {AREAS.map((area) => {
-          const items = data.items.filter((i) => i.area === area.id);
+        {d.areas.map((area) => {
+          const items = d.items.filter((i) => i.area === area.id);
           const goals = items.filter((i) => i.kind === "goal");
           const tasks = items.filter((i) => i.kind === "task");
-          const logs = data.logs.filter((l) => l.area === area.id).slice(0, 3);
+          const logs = d.logs.filter((l) => l.area === area.id).slice(0, 3);
           return (
             <section key={area.id} className={`card area area-${area.id}`}>
               <div className="card-head">
@@ -224,7 +193,7 @@ export default async function Dashboard() {
                         {l.value != null ? ` ${l.value}${l.unit ? ` ${l.unit}` : ""}` : ""}
                         {l.note ? ` · ${l.note}` : ""}
                       </span>
-                      <span className="muted">{fmtWhen(l.logged_at)}</span>
+                      <span className="muted">{l.when}</span>
                     </li>
                   ))}
                 </ul>
@@ -237,13 +206,10 @@ export default async function Dashboard() {
                   <option value="goal">goal</option>
                   <option value="note">note</option>
                 </select>
+                <button type="submit" className="secondary">Add</button>
               </form>
               <p className="checkins">
-                {area.checkIns.length ? (
-                  area.checkIns.map((c) => <span key={c.key}>{c.label}</span>)
-                ) : (
-                  <span>Reports to {COORDINATOR.name} · plans its week on Sundays</span>
-                )}
+                <span>📁 iCloud › Jarvis › {area.folder}</span>
               </p>
             </section>
           );
@@ -251,19 +217,21 @@ export default async function Dashboard() {
         <section className="card area area-jonny">
           <div className="card-head">
             <h3>
-              <span className="emoji">✨</span> {COORDINATOR.name}
+              <span className="emoji">✨</span> Jarvis
             </h3>
-            <span className="muted">chief of staff</span>
+            <span className="muted">main agent</span>
           </div>
-          <p className="muted small">Talks to you on Telegram and coordinates the area agents.</p>
+          <p className="muted small">Talks to you on Telegram, by voice and here, and brings in the area agents.</p>
           <p className="checkins">
-            {COORDINATOR.checkIns.map((c) => (
-              <span key={c.key}>{c.label}</span>
+            {d.status.checkins.map((c) => (
+              <span key={c.key} title={`next: ${c.next}`}>
+                {c.label}
+              </span>
             ))}
           </p>
           <p className="subhead">Quick log</p>
           <form action={addLogAction} className="log-form">
-            <AreaSelect defaultValue="fitness" />
+            <AreaSelect areas={d.areas} defaultValue="fitness" />
             <input name="metric" placeholder="metric (workout, sleep_hours…)" required />
             <input name="value" placeholder="value" inputMode="decimal" />
             <input name="note" placeholder="note" />
@@ -275,10 +243,11 @@ export default async function Dashboard() {
   );
 }
 
-function AreaSelect({ defaultValue }: { defaultValue?: string }) {
+function AreaSelect({ areas, defaultValue }: { areas: Area[]; defaultValue?: string }) {
+  const fallback = areas[areas.length - 1]?.id;
   return (
-    <select name="area" defaultValue={defaultValue ?? "life"} aria-label="area">
-      {AREAS.map((a) => (
+    <select name="area" defaultValue={defaultValue ?? fallback} aria-label="area">
+      {areas.map((a) => (
         <option key={a.id} value={a.id}>
           {a.emoji} {a.name}
         </option>
@@ -286,14 +255,6 @@ function AreaSelect({ defaultValue }: { defaultValue?: string }) {
     </select>
   );
 }
-
-const SOURCE_LABEL: Record<string, string> = {
-  user: "you",
-  chat: "Jonny",
-  checkin: "Jonny · check-in",
-  reminder: "reminder",
-  system: "system",
-};
 
 function greeting(hour: number): string {
   if (hour < 5) return "Late night";

@@ -45,6 +45,12 @@ class Session:
         self.tools = make_tools(
             self.cfg, self.memory, self.knowledge, request_research=_request_research
         )
+        # life organiser: reminders/tasks/logs tools + `delegate` to area agents
+        self.life = None
+        if self.cfg.get("life"):
+            from .life import attach
+
+            self.life = attach(self)
         self.conversation = Conversation(self.cfg["llm"].get("max_history_turns", 20))
         self.total_cost = 0.0
         self._writebacks: set[asyncio.Task] = set()
@@ -56,12 +62,26 @@ class Session:
             self.knowledge.ingest()  # catch up on files added while offline
             self._watcher = start_watcher(self.knowledge, folder)
 
-    async def turn(self, user_message: str, on_text=None) -> LLMResponse:
+    async def turn(
+        self,
+        user_message: str,
+        on_text=None,
+        *,
+        conversation: Conversation | None = None,
+        tier: str | None = None,
+        note: str | None = None,
+        learn: bool = True,
+    ) -> LLMResponse:
+        """One turn. Defaults serve the voice faces; the life organiser passes
+        its own `conversation` (Telegram/dashboard history, separate from
+        voice), a fixed `tier`, a context `note` placed before the message,
+        and learn=False for scheduled runs (no memory extraction)."""
         import time
 
         loop = asyncio.get_event_loop()
         t0 = time.monotonic()
-        tier = pick_tier(user_message, self.cfg.get("routing", {}))
+        convo = conversation if conversation is not None else self.conversation
+        tier = tier or pick_tier(user_message, self.cfg.get("routing", {}))
         from .profile import profile_for_prompt
 
         smalltalk = is_smalltalk(user_message)
@@ -78,10 +98,12 @@ class Session:
         t_retrieve = time.monotonic() - t0
         # history keeps only the bare message; profile/memories/knowledge are
         # injected transiently into THIS call, so prompts don't balloon
-        self.conversation.add_user(user_message)
+        convo.add_user(user_message)
         enriched = build_user_content(
             user_message, profile=profile, memories=memories, knowledge=knowledge
         )
+        if note:
+            enriched = f"{note}\n\n{enriched}"
 
         first_token = [None]
 
@@ -92,7 +114,7 @@ class Session:
                 on_text(delta)
 
         fast = is_simple(user_message, tier)
-        history = self.conversation.messages[:-1]
+        history = convo.messages[:-1]
         if fast:
             history = history[-6:]  # slim context: recent turns only
         scratch = [*history, {"role": "user", "content": enriched}]
@@ -101,7 +123,7 @@ class Session:
                 tier, scratch, on_text=timed_on_text, use_tools=not fast
             )
         except Exception:
-            self.conversation.messages.pop()  # keep history consistent
+            convo.messages.pop()  # keep history consistent
             raise
         if fast:
             resp.extra["path"] = "fast"
@@ -112,16 +134,17 @@ class Session:
         }
         if resp.extra.get("degraded"):
             console.print("[yellow]cloud API failed — answered with local model[/yellow]")
-        self.conversation.add_assistant(resp.text)
+        convo.add_assistant(resp.text)
         if resp.cost_usd is not None:
             self.total_cost += resp.cost_usd
-        # fact extraction happens in the background: never adds turn latency
-        task = loop.run_in_executor(
-            None, self.memory.add_turn, user_message, resp.text
-        )
-        t = asyncio.ensure_future(task)
-        self._writebacks.add(t)
-        t.add_done_callback(self._writebacks.discard)
+        if learn:
+            # fact extraction happens in the background: never adds turn latency
+            task = loop.run_in_executor(
+                None, self.memory.add_turn, user_message, resp.text
+            )
+            t = asyncio.ensure_future(task)
+            self._writebacks.add(t)
+            t.add_done_callback(self._writebacks.discard)
         return resp
 
     async def _agent_loop(
@@ -157,16 +180,18 @@ class Session:
             totals["input"] += resp.input_tokens
             totals["output"] += resp.output_tokens
             totals["cost"] += resp.cost_usd or 0.0
-            results = []
-            for call in resp.tool_calls:
+            async def run_one(call):
                 console.print(f"[dim]tool: {call.name}({call.arguments})[/dim]")
+                tool = next((t for t in self.tools if t.name == call.name), None)
+                # no tool may stall a conversation: a hard ceiling per tool
+                # (20s for lookups; delegate to an area agent gets minutes)
+                limit = getattr(tool, "timeout", 20) if tool else 20
                 try:
-                    # no tool may stall a conversation: hard 20s ceiling
                     output, is_error = await asyncio.wait_for(
                         loop.run_in_executor(
                             None, run_tool, self.tools, call.name, call.arguments
                         ),
-                        timeout=20,
+                        timeout=limit,
                     )
                 except asyncio.TimeoutError:
                     output, is_error = (
@@ -174,7 +199,11 @@ class Session:
                         "you couldn't check live data",
                         True,
                     )
-                results.append((call, output, is_error))
+                return (call, output, is_error)
+
+            # one round's calls run concurrently (e.g. delegating to several
+            # area agents at once); results go back together, in call order
+            results = list(await asyncio.gather(*(run_one(c) for c in resp.tool_calls)))
             scratch.extend(self.llm.tool_messages(resp, results))
             resp = await self.llm.chat(
                 self.system_prompt, scratch, tier=tier, tools=tools, on_text=live_on_text
