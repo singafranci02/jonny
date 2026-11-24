@@ -1,321 +1,303 @@
-"use client";
+import Link from "next/link";
+import { Nav } from "./components/Nav";
+import {
+  addItemAction,
+  addLogAction,
+  addReminderAction,
+  askJonnyAction,
+  itemAction,
+  reminderAction,
+} from "./actions";
+import { AREAS, COORDINATOR, areaLabel } from "@/lib/areas";
+import { getAgentIds } from "@/lib/agents";
+import { getSetting, isMissingTable } from "@/lib/db";
+import {
+  awaitingReminders,
+  getLogs,
+  openItems,
+  recentMessages,
+  upcomingReminders,
+  type Item,
+  type LogEntry,
+  type Message,
+  type Reminder,
+} from "@/lib/store";
+import { fmtWhen, nowLocal, RECURRENCES, toInputValue } from "@/lib/time";
 
-import { useEffect, useRef, useState } from "react";
+export const dynamic = "force-dynamic";
+export const maxDuration = 300; // askJonnyAction runs an agent turn after responding
 
-type OrbState = "idle" | "listening" | "thinking" | "speaking";
-
-const STATUS: Record<OrbState, string> = {
-  idle: "tap the light to wake Jonny",
-  listening: "listening…",
-  thinking: "thinking…",
-  speaking: "",
+type Data = {
+  upcoming: Reminder[];
+  awaiting: Reminder[];
+  items: Item[];
+  logs: LogEntry[];
+  messages: Message[];
+  agentsSynced: boolean;
+  lastTick: { at: string } | null;
 };
 
-// Real-time voice: the mic streams 16kHz PCM straight to the Mac over a
-// WebSocket as you talk. The Mac detects when you stop, transcribes the
-// audio that's already there, and streams the spoken reply back on the same
-// socket — so there's no "upload then wait". Falls back to record-then-post
-// if the socket can't open.
+async function load(): Promise<Data | { error: string }> {
+  try {
+    const [upcoming, awaiting, items, logs, messages, ids, lastTick] = await Promise.all([
+      upcomingReminders({ days: 7, limit: 30 }),
+      awaitingReminders(8),
+      openItems({ limit: 200 }),
+      getLogs({ days: 14, limit: 60 }),
+      recentMessages(25),
+      getAgentIds(),
+      getSetting<{ at: string }>("last_tick"),
+    ]);
+    return { upcoming, awaiting, items, logs, messages, agentsSynced: Boolean(ids?.coordinatorId), lastTick };
+  } catch (err) {
+    if (isMissingTable(err)) return { error: "The database tables don't exist yet." };
+    return { error: err instanceof Error ? err.message : String(err) };
+  }
+}
 
-export default function Home() {
-  const [orbState, setOrbState] = useState<OrbState>("idle");
-  const [active, setActive] = useState(false);
-  const [lastYou, setLastYou] = useState("");
-  const [lastJonny, setLastJonny] = useState("");
-  const [error, setError] = useState("");
-  const [showTranscript, setShowTranscript] = useState(false);
-  const [working, setWorking] = useState(false);
+export default async function Dashboard() {
+  const data = await load();
+  const now = nowLocal();
 
-  const activeRef = useRef(false);
-  const wsRef = useRef<WebSocket | null>(null);
-  const ctxRef = useRef<AudioContext | null>(null);
-  const streamRef = useRef<MediaStream | null>(null);
-  const workingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-
-  // ---------- audio playback queue ----------
-  const audioQueueRef = useRef<string[]>([]);
-  const currentAudioRef = useRef<HTMLAudioElement | null>(null);
-
-  function enqueueAudio(mp3b64: string) {
-    const bytes = Uint8Array.from(atob(mp3b64), (c) => c.charCodeAt(0));
-    const url = URL.createObjectURL(new Blob([bytes], { type: "audio/mpeg" }));
-    audioQueueRef.current.push(url);
-    if (!currentAudioRef.current) playNext();
+  if ("error" in data) {
+    return (
+      <div className="shell">
+        <Nav active="home" />
+        <section className="card setup-needed">
+          <h2>Almost there</h2>
+          <p>{data.error}</p>
+          <p>
+            Finish the steps on <Link href="/setup">Setup</Link> to connect the database, Telegram and the agents.
+          </p>
+        </section>
+      </div>
+    );
   }
 
-  function playNext() {
-    const url = audioQueueRef.current.shift();
-    if (!url) {
-      currentAudioRef.current = null;
-      if (activeRef.current) setOrbState("listening");
-      return;
-    }
-    setOrbState("speaking");
-    const audio = new Audio(url);
-    currentAudioRef.current = audio;
-    audio.onended = audio.onerror = () => {
-      URL.revokeObjectURL(url);
-      playNext();
-    };
-    audio.play().catch(() => playNext());
-  }
-
-  function stopAllAudio() {
-    audioQueueRef.current.forEach((u) => URL.revokeObjectURL(u));
-    audioQueueRef.current = [];
-    currentAudioRef.current?.pause();
-    currentAudioRef.current = null;
-  }
-
-  function clearWorking() {
-    if (workingTimerRef.current) clearTimeout(workingTimerRef.current);
-    workingTimerRef.current = null;
-    setWorking(false);
-  }
-
-  // ---------- websocket voice ----------
-
-  async function startWebsocketVoice(): Promise<boolean> {
-    let ticket: string, wsUrl: string;
-    try {
-      const res = await fetch("/api/ws-ticket");
-      if (res.status === 401) {
-        window.location.href = "/login";
-        return true;
-      }
-      if (!res.ok) return false;
-      ({ ticket, wsUrl } = await res.json());
-    } catch {
-      return false;
-    }
-
-    // NATIVE rate — the worklet resamples to 16k itself. Forcing 16000 here
-    // breaks on browsers/hardware that don't honor it (audio arrives sped-up
-    // and Whisper hears gibberish).
-    const ctx = new AudioContext();
-    ctxRef.current = ctx;
-    console.log(`[jonny] mic pipeline: ${ctx.sampleRate}Hz -> 16k`);
-    try {
-      await ctx.audioWorklet.addModule("/pcm-worklet.js");
-    } catch {
-      setError("Couldn't start the audio pipeline (worklet).");
-      return false;
-    }
-
-    return new Promise<boolean>((resolve) => {
-      let settled = false;
-      const ws = new WebSocket(wsUrl);
-      wsRef.current = ws;
-      ws.binaryType = "arraybuffer";
-
-      ws.onopen = () => ws.send(ticket);
-
-      ws.onmessage = (ev) => {
-        const event = JSON.parse(ev.data);
-        switch (event.type) {
-          case "ready": {
-            // hook the mic up and start streaming — surface ANY failure
-            // (a silently-broken mic chain looks like "it ignores me")
-            try {
-              const source = ctx.createMediaStreamSource(streamRef.current!);
-              const node = new AudioWorkletNode(ctx, "pcm-worklet");
-              node.port.onmessage = (m: MessageEvent) => {
-                if (ws.readyState === WebSocket.OPEN) ws.send(m.data as ArrayBuffer);
-              };
-              source.connect(node);
-              // worklet needs a destination to pull audio; muted gain avoids echo
-              const sink = ctx.createGain();
-              sink.gain.value = 0;
-              node.connect(sink).connect(ctx.destination);
-              setOrbState("listening");
-            } catch (e) {
-              setError(`Mic pipeline failed: ${e}`);
-              if (!settled) {
-                settled = true;
-                resolve(false);
-              }
-              break;
-            }
-            if (!settled) {
-              settled = true;
-              resolve(true);
-            }
-            break;
-          }
-          case "partial": // still talking / paused mid-thought — keep listening
-            if (event.text) setLastYou(event.text);
-            setOrbState("listening");
-            break;
-          case "transcript":
-            setLastYou(event.text);
-            setLastJonny("");
-            setError("");
-            setOrbState("thinking");
-            workingTimerRef.current = setTimeout(() => setWorking(true), 2500);
-            break;
-          case "interrupt": // you spoke over the reply — cut playback
-            stopAllAudio();
-            setOrbState("listening");
-            break;
-          case "delta":
-            setLastJonny((t) => t + event.text);
-            break;
-          case "audio":
-            clearWorking();
-            enqueueAudio(event.mp3);
-            break;
-          case "done":
-            clearWorking();
-            setLastJonny(event.text);
-            if (event.research_job_id) pollResearch(event.research_job_id);
-            break;
-          case "error":
-            setError("Something went wrong on the Mac.");
-            break;
-        }
-      };
-
-      ws.onerror = () => {
-        if (!settled) {
-          settled = true;
-          resolve(false);
-        }
-      };
-      ws.onclose = () => {
-        if (!settled) {
-          settled = true;
-          resolve(false);
-        } else if (activeRef.current) {
-          setError("Connection dropped. Tap the light to reconnect.");
-          stopEverything();
-        }
-      };
-    });
-  }
-
-  function pollResearch(jobId: string) {
-    const started = Date.now();
-    const tick = async () => {
-      if (Date.now() - started > 10 * 60 * 1000) return;
-      try {
-        const res = await fetch(`/api/research?job=${encodeURIComponent(jobId)}`);
-        const data = await res.json();
-        if (data.status === "done") {
-          setLastJonny(data.summary);
-          const tts = await fetch("/api/tts", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ text: data.summary }),
-          });
-          if (tts.ok) {
-            const bytes = new Uint8Array(await tts.arrayBuffer());
-            const url = URL.createObjectURL(new Blob([bytes], { type: "audio/mpeg" }));
-            audioQueueRef.current.push(url);
-            if (!currentAudioRef.current) playNext();
-          }
-          return;
-        }
-        if (data.status === "error") return;
-      } catch {}
-      setTimeout(tick, 5000);
-    };
-    setTimeout(tick, 5000);
-  }
-
-  // ---------- lifecycle ----------
-
-  async function toggleActive() {
-    if (active) {
-      stopEverything();
-      return;
-    }
-    setError("");
-    try {
-      streamRef.current = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: true,
-          channelCount: 1,
-        },
-      });
-    } catch {
-      setError("Microphone permission denied.");
-      return;
-    }
-    setActive(true);
-    activeRef.current = true;
-    setOrbState("thinking");
-    const ok = await startWebsocketVoice();
-    if (!ok) {
-      setError("Couldn't open the live connection — is the Mac on?");
-      stopEverything();
-    }
-  }
-
-  function stopEverything() {
-    setActive(false);
-    activeRef.current = false;
-    clearWorking();
-    stopAllAudio();
-    try {
-      wsRef.current?.close();
-    } catch {}
-    wsRef.current = null;
-    ctxRef.current?.close().catch(() => {});
-    ctxRef.current = null;
-    streamRef.current?.getTracks().forEach((t) => t.stop());
-    streamRef.current = null;
-    setOrbState("idle");
-  }
-
-  useEffect(() => {
-    return () => stopEverything();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  const defaultDue = toInputValue(now.plus({ hours: 1 }).startOf("hour").toJSDate());
 
   return (
-    <main className="stage">
-      <div
-        className={`orb orb-${orbState}`}
-        onClick={toggleActive}
-        role="button"
-        aria-label={active ? "Put Jonny to sleep" : "Wake Jonny"}
-        title={active ? "Click to stop" : "Click to talk"}
-      />
-      <h1>Jonny</h1>
-      <p className="status">
-        {working ? "working on it…" : active ? STATUS[orbState] : STATUS.idle}
-      </p>
-      {showTranscript && (
-        <div className="transcript">
-          {lastYou && <p className="you">you: {lastYou}</p>}
-          {lastJonny && <p className="jonny">{lastJonny}</p>}
-        </div>
-      )}
-      {error && <p className="error">{error}</p>}
-      {!active && (
-        <p className="hint">
-          Talk to Jonny naturally — it listens live and answers with the
-          Mac&rsquo;s voice. Just start speaking; say &ldquo;stop&rdquo; to cut
-          it off.
+    <div className="shell">
+      <Nav active="home" />
+
+      {(!data.agentsSynced || !data.lastTick) && (
+        <p className="banner">
+          {!data.agentsSynced ? "Agents aren't synced yet. " : ""}
+          {!data.lastTick ? "The reminder scheduler hasn't run yet. " : ""}
+          <Link href="/setup">Open Setup →</Link>
         </p>
       )}
-      <div className="corner-links">
-        <button
-          className="ghost-btn"
-          onClick={() => setShowTranscript((s) => !s)}
-          title="Show or hide the conversation text"
-        >
-          {showTranscript ? "hide text" : "show text"}
-        </button>
-        <a className="profile-link" href="/about">
-          About me
-        </a>
-        <a className="profile-link" href="/files">
-          Files
-        </a>
+
+      <div className="hero">
+        <div>
+          <p className="eyebrow">{now.toFormat("cccc d LLLL")}</p>
+          <h2 className="greeting">{greeting(now.hour)}</h2>
+        </div>
+        <form action={askJonnyAction} className="ask">
+          <input name="text" placeholder="Ask Jonny… (the reply arrives on Telegram)" autoComplete="off" />
+          <button type="submit">Send</button>
+        </form>
       </div>
-    </main>
+
+      <div className="grid-main">
+        <section className="card">
+          <div className="card-head">
+            <h3>Next up</h3>
+            <span className="muted">next 7 days</span>
+          </div>
+          {data.upcoming.length === 0 && <p className="empty">Nothing scheduled. Add a reminder below or tell Jonny.</p>}
+          <ul className="list">
+            {data.upcoming.map((r) => (
+              <li key={r.id} className="row">
+                <span className="when">{fmtWhen(r.due_at)}</span>
+                <span className="what">
+                  {r.text}
+                  <span className="tag">{areaLabel(r.area)}</span>
+                  {r.recurrence !== "none" && <span className="tag repeat">↻ {r.recurrence}</span>}
+                </span>
+                <form action={reminderAction} className="row-actions">
+                  <input type="hidden" name="id" value={r.id} />
+                  <button name="op" value="done" title="Done" className="ghost">✓</button>
+                  <button name="op" value="snooze" title="Snooze 1h" className="ghost">+1h</button>
+                  <button name="op" value="cancel" title="Cancel" className="ghost">✕</button>
+                </form>
+              </li>
+            ))}
+          </ul>
+          {data.awaiting.length > 0 && (
+            <>
+              <p className="subhead">Sent, waiting for ✓</p>
+              <ul className="list">
+                {data.awaiting.map((r) => (
+                  <li key={r.id} className="row dim">
+                    <span className="when">{fmtWhen(r.last_sent_at ?? r.due_at)}</span>
+                    <span className="what">{r.text}</span>
+                    <form action={reminderAction} className="row-actions">
+                      <input type="hidden" name="id" value={r.id} />
+                      <button name="op" value="done" className="ghost">✓</button>
+                    </form>
+                  </li>
+                ))}
+              </ul>
+            </>
+          )}
+          <form action={addReminderAction} className="inline-form">
+            <input name="text" placeholder="Remind me to…" required />
+            <AreaSelect />
+            <input name="due" type="datetime-local" defaultValue={defaultDue} required />
+            <select name="recurrence" defaultValue="none">
+              {RECURRENCES.map((r) => (
+                <option key={r} value={r}>
+                  {r === "none" ? "once" : r}
+                </option>
+              ))}
+            </select>
+            <button type="submit">Add</button>
+          </form>
+        </section>
+
+        <section className="card">
+          <div className="card-head">
+            <h3>Activity</h3>
+            <span className="muted">Telegram, reminders, agents</span>
+          </div>
+          {data.messages.length === 0 && <p className="empty">No messages yet.</p>}
+          <ul className="feed">
+            {data.messages.map((m) => (
+              <li key={m.id} className={`feed-item ${m.direction}`}>
+                <span className="feed-meta">
+                  {SOURCE_LABEL[m.direction === "in" ? "user" : m.source] ?? m.source}
+                  {m.area ? ` · ${areaLabel(m.area)}` : ""} · {fmtWhen(m.created_at)}
+                </span>
+                <span className="feed-text">{m.text}</span>
+              </li>
+            ))}
+          </ul>
+        </section>
+      </div>
+
+      <h3 className="section-title">Areas</h3>
+      <div className="areas">
+        {AREAS.map((area) => {
+          const items = data.items.filter((i) => i.area === area.id);
+          const goals = items.filter((i) => i.kind === "goal");
+          const tasks = items.filter((i) => i.kind === "task");
+          const logs = data.logs.filter((l) => l.area === area.id).slice(0, 3);
+          return (
+            <section key={area.id} className={`card area area-${area.id}`}>
+              <div className="card-head">
+                <h3>
+                  <span className="emoji">{area.emoji}</span> {area.name}
+                </h3>
+                <span className="muted">{tasks.length} open</span>
+              </div>
+              <p className="muted small">{area.blurb}</p>
+              {goals.length > 0 && (
+                <div className="goals">
+                  {goals.slice(0, 3).map((g) => (
+                    <span key={g.id} className="goal">🎯 {g.title}</span>
+                  ))}
+                </div>
+              )}
+              <ul className="list compact">
+                {tasks.slice(0, 5).map((t) => (
+                  <li key={t.id} className="row">
+                    <form action={itemAction}>
+                      <input type="hidden" name="id" value={t.id} />
+                      <button name="op" value="done" className="check" title="Mark done" />
+                    </form>
+                    <span className="what">
+                      {t.priority === 1 && <span className="prio">!</span>}
+                      {t.title}
+                      {t.due_date && <span className="tag">{t.due_date}</span>}
+                    </span>
+                  </li>
+                ))}
+                {tasks.length > 5 && <li className="muted small">+{tasks.length - 5} more</li>}
+              </ul>
+              {logs.length > 0 && (
+                <ul className="logs">
+                  {logs.map((l) => (
+                    <li key={l.id}>
+                      <span>
+                        {l.metric}
+                        {l.value != null ? ` ${l.value}${l.unit ? ` ${l.unit}` : ""}` : ""}
+                        {l.note ? ` · ${l.note}` : ""}
+                      </span>
+                      <span className="muted">{fmtWhen(l.logged_at)}</span>
+                    </li>
+                  ))}
+                </ul>
+              )}
+              <form action={addItemAction} className="mini-form">
+                <input type="hidden" name="area" value={area.id} />
+                <input name="title" placeholder="Add task…" />
+                <select name="kind" defaultValue="task" aria-label="kind">
+                  <option value="task">task</option>
+                  <option value="goal">goal</option>
+                  <option value="note">note</option>
+                </select>
+              </form>
+              <p className="checkins">
+                {area.checkIns.length ? (
+                  area.checkIns.map((c) => <span key={c.key}>{c.label}</span>)
+                ) : (
+                  <span>Reports to {COORDINATOR.name} · plans its week on Sundays</span>
+                )}
+              </p>
+            </section>
+          );
+        })}
+        <section className="card area area-jonny">
+          <div className="card-head">
+            <h3>
+              <span className="emoji">✨</span> {COORDINATOR.name}
+            </h3>
+            <span className="muted">chief of staff</span>
+          </div>
+          <p className="muted small">Talks to you on Telegram and coordinates the area agents.</p>
+          <p className="checkins">
+            {COORDINATOR.checkIns.map((c) => (
+              <span key={c.key}>{c.label}</span>
+            ))}
+          </p>
+          <p className="subhead">Quick log</p>
+          <form action={addLogAction} className="log-form">
+            <AreaSelect defaultValue="fitness" />
+            <input name="metric" placeholder="metric (workout, sleep_hours…)" required />
+            <input name="value" placeholder="value" inputMode="decimal" />
+            <input name="note" placeholder="note" />
+            <button type="submit">Log</button>
+          </form>
+        </section>
+      </div>
+    </div>
   );
+}
+
+function AreaSelect({ defaultValue }: { defaultValue?: string }) {
+  return (
+    <select name="area" defaultValue={defaultValue ?? "life"} aria-label="area">
+      {AREAS.map((a) => (
+        <option key={a.id} value={a.id}>
+          {a.emoji} {a.name}
+        </option>
+      ))}
+    </select>
+  );
+}
+
+const SOURCE_LABEL: Record<string, string> = {
+  user: "you",
+  chat: "Jonny",
+  checkin: "Jonny · check-in",
+  reminder: "reminder",
+  system: "system",
+};
+
+function greeting(hour: number): string {
+  if (hour < 5) return "Late night";
+  if (hour < 12) return "Good morning";
+  if (hour < 18) return "Good afternoon";
+  return "Good evening";
 }
