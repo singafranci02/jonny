@@ -13,6 +13,7 @@ class Tool:
     description: str  # prescriptive: say WHEN to call it, not just what it does
     parameters: dict  # JSON schema, {"type": "object", ...}
     func: Callable[..., str]
+    timeout: float = 20.0  # seconds the agent loop waits; delegate needs minutes
 
     def anthropic_schema(self) -> dict:
         return {

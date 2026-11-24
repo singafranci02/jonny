@@ -43,6 +43,23 @@ llm:
       provider: ollama
       model: qwen3:8b
       max_tokens: 700
+    # Life HQ: Jarvis as the main agent on text channels (Telegram, the
+    # dashboard) and in scheduled check-ins, where judgement beats latency
+    coordinator:
+      provider: anthropic
+      model: claude-opus-5-5
+      thinking: adaptive
+      effort: medium
+      max_tokens: 8000
+      fallbacks: default     # server-side refusal fallbacks (beta)
+    # Life HQ: the area subagents (Work, Projects, Fitness, Health, Life)
+    area:
+      provider: anthropic
+      model: claude-sonnet-5-5
+      thinking: adaptive
+      effort: medium
+      max_tokens: 8000
+      fallbacks: default
 
   ollama:
     url: http://localhost:11434
@@ -53,6 +70,8 @@ llm:
   pricing:
     claude-sonnet-5:  { input: 2.00, output: 10.00, cache_write: 2.50, cache_read: 0.20 }
     claude-haiku-4-5: { input: 1.00, output: 5.00,  cache_write: 1.25, cache_read: 0.10 }
+    claude-opus-5-5:   { input: 4.00, output: 20.00, cache_write: 5.00, cache_read: 0.20 }
+    claude-sonnet-5-5: { input: 2.00, output: 10.00, cache_write: 2.50, cache_read: 0.10 }
 
   # Escape hatch: point any tier at an OpenAI-style endpoint
   # (DeepSeek, Qwen cloud, Kimi, GLM...). Text-only, no tool calling.
@@ -100,11 +119,121 @@ turn:
   barge_energy_floor: 1400
 
 workspace:
-  # the ONE folder Jarvis may write files in (created on first use; a
-  # Finder-visible symlink on the Desktop points here — real writes stay in
-  # the home dir so macOS TCC doesn't silently block the background service)
-  path: ~/JarvisWorkspace
+  # The ONE folder Jarvis may write files in: iCloud Drive/Jarvis, so it is
+  # the same folder on every Mac signed in to your Apple ID. It holds one
+  # subfolder per life area (see life.areas) plus Inbox/.
+  # iCloud Drive is privacy-protected: the background service (make
+  # install-web) needs Full Disk Access for its python, or writes are
+  # silently refused. `make life` checks; the website's Setup page shows it.
+  # Also: Finder > iCloud Drive > Jarvis > right-click > Keep Downloaded,
+  # so files are always on the Mac mini's disk, not cloud-only.
+  path: ~/Library/Mobile Documents/com~apple~CloudDocs/Jarvis
   trash_subdir: "_trash"    # old versions land here before any overwrite/edit
+
+# Life HQ: Jarvis as the main agent of a personal organiser. He talks to you
+# (voice, Telegram, the website) and delegates to one agent per life area;
+# each area agent owns its folder in iCloud Drive/Jarvis, a CONTEXT.md brief,
+# and that area's reminders/tasks/logs. Code: src/life/.
+life:
+  owner: Francesco
+  timezone: Australia/Sydney
+  db: data/life.db            # reminders, tasks, logs: local SQLite, NEVER in iCloud
+  inbox: Inbox
+  backup_keep: 14             # nightly copies of the database in Jarvis/_backups
+  coordinator_tier: coordinator   # Jarvis on Telegram, the dashboard and check-ins
+  area_tier: area                 # the area agents
+  subagent_max_rounds: 12
+  subagent_timeout_s: 240
+  telegram:
+    enabled: true             # needs TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID in .env
+
+  areas:
+    - id: work
+      name: Work
+      emoji: "💼"
+      folder: Work
+      blurb: Job, meetings, deadlines, career
+      focus: >-
+        You run the Work area. Keep work tasks prioritised and deadlines
+        visible, help plan the week, and turn vague intentions into concrete
+        next actions with dates. Flag anything overdue or at risk early.
+    - id: projects
+      name: Projects
+      emoji: "🚀"
+      folder: Projects
+      blurb: Side projects and personal builds
+      focus: >-
+        You run the Projects area. For each active project keep a clear goal,
+        the next milestone with a date, and one concrete next action, with a
+        subfolder per project for its notes and plans. Notice stalled projects
+        and help either restart them or consciously park them.
+    - id: fitness
+      name: Fitness
+      emoji: "🏋️"
+      folder: Fitness
+      blurb: Training, activity, sport
+      focus: >-
+        You are the fitness coach. Track workouts and activity from the logs,
+        keep the training plan realistic, and encourage consistency without
+        guilt. Log workouts as metric "workout" with the duration in minutes as
+        the value and the details in the note. Keep the current plan in
+        training-plan.md.
+    - id: health
+      name: Health
+      emoji: "🩺"
+      folder: Health
+      blurb: Sleep, food, meds, appointments, mood
+      focus: >-
+        You look after the Health area: sleep, nutrition, hydration,
+        medication, appointments, mood and body metrics. Spot trends in the
+        logs and keep appointments and refills from slipping. Use the metrics
+        "sleep_hours", "mood" (1-5) and "energy" (1-5) consistently. You are
+        not a doctor: for symptoms or medical decisions, suggest seeing one.
+    - id: life
+      name: Life
+      emoji: "🏡"
+      folder: Life
+      blurb: Admin, money, home, people, errands
+      focus: >-
+        You run the Life area: personal admin, bills and finances, home,
+        errands, birthdays, friends and family. Keep recurring obligations on
+        reminders so nothing is forgotten, and batch small errands sensibly.
+
+  # Scheduled messages ("one voice": only Jarvis messages you). Times are in
+  # life.timezone. If the Mac was off at the time, a check-in still runs if
+  # it is back within catch_up_minutes (default 120), otherwise it is skipped.
+  checkins:
+    - key: morning-brief
+      label: Daily 07:30 · morning brief
+      time: "07:30"
+      days: daily
+      task: >-
+        Morning brief. Call life_overview, then write one compact message:
+        today's reminders and deadlines grouped by area with the area emoji,
+        anything overdue, and the top 3 things to focus on today. On Mondays,
+        also list this week's deadlines.
+    - key: evening-checkin
+      label: Daily 21:00 · evening check-in
+      time: "21:00"
+      days: daily
+      task: >-
+        Evening check-in, at most four short lines. Call life_overview to see
+        what is logged today, then ask how today went and invite a one-line
+        reply covering whatever isn't logged yet: sleep last night (hours),
+        training today, mood and energy (1-5). Mention tomorrow's first
+        reminder or deadline if there is one.
+    - key: weekly-review
+      label: Sun 19:00 · weekly review and plan
+      time: "19:00"
+      days: [sun]
+      catch_up_minutes: 240
+      task: >-
+        Weekly review and plan. In a single turn, delegate to all five area
+        agents (work, projects, fitness, health, life) at once: each reviews
+        its area for the past 7 days, plans the coming week, creates the
+        reminders and tasks that are clearly needed, and reports wins, what
+        slipped, next week's focus and what it created. Then write one combined
+        message: one or two lines per area, then the reminders created.
 
 profile:
   file: data/profile.md     # your hand-edited "About Me" (gitignored, private)

@@ -23,6 +23,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+dev = ["pytest>=8"]
 voice = [
     "RealtimeSTT>=1.0",
     "faster-whisper>=1.1",

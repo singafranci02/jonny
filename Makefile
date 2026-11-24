@@ -4,7 +4,7 @@ VENV := .venv
 PIP := $(VENV)/bin/pip
 PY := $(VENV)/bin/python
 
-.PHONY: setup setup-voice run chat voice talk memory ingest research serve install-agent uninstall-agent install-web uninstall-web install-tunnel uninstall-tunnel install-watchdog uninstall-watchdog doctor status push test-once clean
+.PHONY: setup setup-voice run chat voice talk memory ingest research life test serve install-agent uninstall-agent install-web uninstall-web install-tunnel uninstall-tunnel install-watchdog uninstall-watchdog doctor status push test-once clean
 
 setup:
 	$(PYTHON) -m venv $(VENV)
@@ -137,10 +137,16 @@ status:
 heard:
 	@tail -15 data/stt.log 2>/dev/null || echo "no utterances logged yet"
 
-# the one folder Jarvis may write in: path + contents + recent writes
+# the one folder Jarvis may write in (iCloud Drive/Jarvis): contents + recent writes
+WORKSPACE := $(HOME)/Library/Mobile Documents/com~apple~CloudDocs/Jarvis
 workspace:
-	@echo "workspace: $$HOME/JarvisWorkspace"; ls -la $$HOME/JarvisWorkspace 2>/dev/null | grep -v "^total" || echo "  (empty)"
+	@echo "workspace: $(WORKSPACE)"; ls -la "$(WORKSPACE)" 2>/dev/null | grep -v "^total" || echo "  (missing: run make life ARGS=folders)"
 	@echo "--- recent writes ---"; tail -10 data/workspace_audit.log 2>/dev/null || echo "  (none yet)"
+
+# life organiser: status (default) | folders | today | test-telegram | backup | python-path
+#   make life ARGS="delegate fitness 'summarise my training this month'"
+life:
+	$(PY) -m src.life.cli $(ARGS)
 
 # publish committed Jarvis work into the shared jonny repo (jarvis/ subtree)
 JONNY_REPO := $(HOME)/jonny
@@ -148,6 +154,11 @@ push:
 	cd $(JONNY_REPO) && git pull -q && \
 	git subtree pull --prefix=jarvis $(CURDIR) main -m "Update jarvis/ from local work" && \
 	git push
+
+# unit tests (no network): the life organiser + the turn loop hooks
+test:
+	$(PIP) install -q pytest
+	$(PY) -m pytest -q tests
 
 test-once:
 	$(PY) -m src.main --once "Say hello in one short sentence."
