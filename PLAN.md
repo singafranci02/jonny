@@ -1,212 +1,215 @@
-# Jonny · Life HQ: plan
+# Jarvis · Life HQ: plan
 
-_Last updated 2026-11-25. Status: the foundation is built on branch `life-hq`, on top of the current `main`, and tested locally. It is not deployed and has not yet run against real Telegram, database or Anthropic accounts._
+_Last updated 2026-11-25. Status: built on branch `life-hq` (on top of `main`) and tested on the MacBook with fakes for Telegram and Claude. Not yet running on the Mac mini; that is Phase 1._
 
 ## Goal
 
-Keep work, projects, fitness, health and life admin organised in one place that comes to you on Telegram: reminders at the right moment, a short morning brief, an evening check-in, and a Sunday review that plans the week.
+Jarvis, the assistant that runs always-on on the Mac mini, becomes the **main agent** of a personal organiser. You talk to Jarvis on Telegram, by voice, or on the website.
 
-**Jonny**, the chief of staff, is the one voice you talk to. Behind him, one specialist agent runs each life area. The web dashboard shows everything at a glance.
+Behind him sits **one specialist agent per life area**: Work, Projects, Fitness, Health and Life. Each knows its area better than Jarvis could in every conversation, because it has three things of its own:
 
-**Jarvis**, the voice assistant in `jarvis/` that runs always-on on the Mac mini, is parked. Its voice face keeps working at `/talk`, but no new Jarvis work happens until Phase 3, when it plugs into the same system.
+- its folder in iCloud Drive;
+- a `CONTEXT.md` brief about that part of your life;
+- that area's reminders, tasks and logs.
+
+The area agents report to Jarvis, and Jarvis talks to you.
 
 ## Decisions
 
 | Topic | Decision | Notes |
 |---|---|---|
-| Channel | Telegram bot | You write free text. Reminders and updates come back with ✅ Done / ⏰ +1h / 🌙 Tomorrow buttons |
-| Cadence | One voice | Only Jonny messages on a schedule: 07:30 brief, 21:00 check-in, Sunday 19:00 review |
-| Areas | Work · Projects · Fitness · Health · Life (admin, money, home, people) | Defined in `lib/areas.ts` |
-| Agents | Claude Managed Agents (hosted by Anthropic, beta) | Jonny plus 5 area agents. Scheduled check-ins run on Anthropic's scheduler |
-| Models | Jonny: Claude Opus 5.5. Area agents: Claude Sonnet 5.5 | Change in `lib/areas.ts`, then re-sync |
-| Hosting | Vercel (the existing project) | Dashboard and all endpoints |
-| Database | Neon Postgres via the Vercel Marketplace | Pick the region closest to you |
-| Reminder trigger | GitHub Actions, every 5 minutes | Free. Can run 5–15 minutes late (see Risks) |
-| Timezone | `TIMEZONE` env var | All reminders and check-ins use it |
-| Jarvis | Parked | Its voice face moves from `/` to `/talk` and keeps working. It joins Life HQ in Phase 3 |
+| Main agent | Jarvis on the Mac mini | Opus 5.5 for Telegram, the website and check-ins; voice keeps its existing fast models |
+| Area agents | Work · Projects · Fitness · Health · Life | Sonnet 5.5, run by Jarvis on the Mac; several can work in parallel |
+| Files | `iCloud Drive/Jarvis/`: one main folder, a subfolder per area, plus `Inbox/` | The same folder on the MacBook and the Mac mini |
+| Data | Reminders, tasks, goals, notes, logs in a database on the Mac mini (`jarvis/data/life.db`) | A live database must not sit in iCloud; a nightly copy goes to `iCloud/Jarvis/_backups/` |
+| Channel | A Telegram bot, polled by the Mac | No webhook and no cloud service in between |
+| Cadence | One voice: 07:30 brief, 21:00 check-in, Sunday 19:00 review | Only Jarvis messages you; the area agents plan their week in the review |
+| Website | A thin face onto the Mac | Dashboard, Setup, and the voice orb at `/talk`; no new Vercel settings |
+| Mac off | Telegram holds your messages for 24 hours; reminders and check-ins wait | A check-in still runs if the Mac is back within 2 hours (4 for the Sunday review), otherwise it is skipped. The website says "offline" |
 
 ## How it works
 
 ```
-   You ── Telegram ──► /api/telegram ──► Jonny (today's chat session) ──┐
-    ▲                                      │ delegates when it needs    │
-    │                                      ▼ a specialist               │  tools
-    │                           Work · Projects · Fitness ·             ├──► /api/mcp ──► Postgres
-    │                           Health · Life agents ───────────────────┘                (reminders, tasks,
-    │                                                                                     goals, notes, logs,
-    ├── reminders ◄── /api/cron/tick ◄── GitHub Actions (every 5 min)                     messages)
-    ├── brief · check-in · review ◄── send_telegram ◄── scheduled runs (Anthropic)            ▲
-    └── dashboard (Vercel, password) ─────────────────────────────────────────────────────────┘
+ You ── Telegram ──────────┐
+ You ── voice (/talk, Mac) ┼──►  JARVIS  (main agent, on the Mac mini)
+ You ── website ───────────┘        │  quick things himself (a reminder, a log entry)
+                                    │  delegate: several areas at once, in parallel
+                                    ▼
+        ┌────────┬──────────┬─────────┬────────┬────────┐
+        │  Work  │ Projects │ Fitness │ Health │  Life  │   area agents (Sonnet 5.5)
+        └───┬────┴────┬─────┴────┬────┴───┬────┴───┬────┘
+            ▼ files: only their own folder, each with CONTEXT.md
+   iCloud Drive/Jarvis/   Work/  Projects/  Fitness/  Health/  Life/  Inbox/
+            ▼ data: only their own area
+   Mac: data/life.db       reminders · tasks · goals · notes · logs · message feed
+
+   scheduler (inside Jarvis): due reminders every 20s · 07:30 · 21:00 · Sun 19:00 · nightly backup
 ```
 
-The agents never touch the database directly. The app exposes a small set of tools at `/api/mcp`. MCP is the standard way to hand tools to AI agents. The tools are `get_overview`, `add_reminder`, `update_reminder`, `add_item`, `update_item`, `log_entry`, `get_logs` and `send_telegram`. Jarvis will use the same tools.
+**You text the bot.** The Mac fetches your message from Telegram. Jarvis gets your message, the recent conversation, and anything you were just sent, so a reply like "7h sleep, ran 30 min, mood 4" to the evening check-in makes sense. He handles quick things himself, or delegates. For example, "plan my training week" goes to the Fitness agent: it reads `Fitness/CONTEXT.md` and your recent workouts, writes `Fitness/training-plan.md`, creates reminders for the sessions, and reports back. Jarvis then replies to you.
 
-**You text the bot.** Telegram calls `/api/telegram`, which accepts only Telegram's secret header and your chat id. The message goes to today's Jonny session, which starts fresh each day because lasting memory lives in the database. It carries a note of anything you were sent since you last wrote, so a reply like "7h, ran 30 min" makes sense. Jonny reads and writes through the tools, and hands off to an area agent when the request needs specialist planning. His reply is relayed to Telegram. If a reply takes longer than the webhook's 5-minute window, the next tick relays it.
+**A reminder comes due.** You get a Telegram message with ✅ Done, ⏰ +1h and 🌙 Tomorrow buttons. Repeating reminders roll forward in local time, so "every day at 9:00" stays at 9:00 across daylight-saving changes.
 
-**A reminder comes due.** GitHub Actions calls `/api/cron/tick` every 5 minutes. Due reminders are claimed atomically, so none is sent twice, and arrive with the Done/Snooze buttons. Repeating reminders roll forward in local time, so "every day at 9:00" stays at 9:00 across daylight-saving changes. If Telegram fails, the reminder is retried on the next tick.
+**A check-in fires.** Jarvis runs a scheduled turn and sends you the result. The Sunday review delegates to all five area agents at once, then sends one combined message.
 
-**A scheduled check-in fires.** Anthropic starts Jonny in a fresh session at 07:30, 21:00 and Sunday 19:00, each with a hard spend cap. He reads the overview and sends one message with `send_telegram`, or nothing if there is nothing useful to say.
+## The iCloud folder
 
-**Sunday review.** Jonny starts a workflow run in which each area agent reviews its last 7 days and plans the next week, creating the reminders and tasks it needs. Jonny then sends one combined message.
+```
+iCloud Drive/Jarvis/
+  README.md
+  Inbox/            anything not sorted yet (Jarvis can sort it)
+  Work/  CONTEXT.md  + plans, notes, documents
+  Projects/ CONTEXT.md + one subfolder per project
+  Fitness/ CONTEXT.md + training-plan.md, ...
+  Health/  CONTEXT.md
+  Life/    CONTEXT.md
+  _backups/         nightly copies of the reminders/tasks/logs database
+  _trash/           older versions, kept automatically before any overwrite (also inside each area)
+```
+
+- **Fill in the `CONTEXT.md` files.** Add goals, routines, people and important dates. Each area agent reads its brief before every task and adds what it learns, so this is the single biggest upgrade to how useful the agents are. You can edit them from either Mac.
+- **Each area agent can only touch its own folder.** Jarvis can reach the whole folder. Nothing can delete files: overwrites keep the old version in `_trash/`.
+- **Where it lives:** the folder already exists, created from the MacBook on 2026-11-25. iCloud syncs it to the Mac mini.
 
 ## Your week with it
 
 | When | What arrives | From |
 |---|---|---|
-| Daily 07:30 | Morning brief: today's reminders and deadlines by area, anything overdue, top 3 to focus on. On Mondays, also the week's deadlines. Warns if the reminder trigger has stalled | Jonny |
+| Daily 07:30 | Morning brief: today's reminders and deadlines by area, anything overdue, top 3 to focus on (on Mondays, also the week's deadlines) | Jarvis |
 | Any time | Your reminders, with Done / +1h / Tomorrow | Reminder |
-| Daily 21:00 | Evening check-in. Reply in one line, e.g. "7h sleep, ran 30 min, mood 4, energy 3", and Jonny logs it | Jonny |
-| Sunday 19:00 | Weekly review and plan: wins, what slipped and next week's focus per area, plus the reminders created | Jonny and the area agents |
+| Daily 21:00 | Evening check-in. Reply in one line ("7h sleep, ran 30 min, mood 4") and Jarvis logs it | Jarvis |
+| Sunday 19:00 | Weekly review and plan: each area agent reviews its week and plans the next; you get one combined message | Jarvis and the area agents |
 
-Things to text Jonny:
+Things to say to Jarvis:
 
 - "remind me to call mum Sunday at 6pm"
 - "every weekday at 8:30 remind me to plan my day"
-- "new project goal: launch the side project by March"
-- "log 45 min run, felt strong"
-- "plan my training for next week" (the Fitness agent does this)
-- "what's on today?", or `/today` for an instant summary with no AI involved
+- "log 45 min run", "slept 7h"
+- "plan my training for next week" (Fitness agent)
+- "how is the side project going?" (Projects agent)
+- "save this in Work: …"
+- `/today` on Telegram for an instant summary with no AI involved
 
 ## What's in the repo
 
 | Path | What it does |
 |---|---|
-| `lib/areas.ts` | **The one file to edit**: areas, each agent's focus, models, check-in times, spend caps |
-| `lib/agents.ts` | Creates or updates the hosted agents, the vault holding `MCP_TOKEN`, and the schedules (Setup → Sync) |
-| `lib/chat.ts` | Telegram ↔ Jonny bridge: daily session, relaying replies exactly once |
-| `lib/mcp-tools.ts`, `app/api/mcp/` | The tools the agents (and later Jarvis) use |
-| `lib/store.ts`, `lib/db.ts` | Data access and table definitions |
-| `lib/time.ts` | Timezone, date parsing, repeating reminders |
-| `lib/telegram.ts`, `app/api/telegram/` | Bot API calls and the webhook |
-| `app/api/cron/tick/`, `.github/workflows/reminder-tick.yml` | The reminder trigger |
-| `app/page.tsx`, `app/setup/` | Dashboard and setup checklist |
-| `app/talk/`, `app/about/`, `app/files/`, `lib/brain.ts`, `app/api/{chat,chat-stream,stt,tts,profile,research,workspace,ws-ticket}/` | Jarvis's voice face (moved from `/` to `/talk`), proxied to the Mac over the tunnel. Unchanged |
-| `jarvis/` | Parked voice assistant (untouched) |
-
-**Data:** `items` (task / goal / note per area), `reminders`, `logs` (workouts, sleep, mood…), `messages` (the activity feed), plus `settings` and `processed_keys` (stored agent ids, de-duplication). The agents only see this through the tools.
+| `jarvis/config.yaml` → `life:` | **The one place to edit:** owner, timezone, areas (name, folder, focus), check-in times and wording, models (`llm.tiers.coordinator` / `area`) |
+| `jarvis/src/life/agents.py` | The area agents and Jarvis's `delegate` tool |
+| `jarvis/src/life/tools.py` | `life_*` tools for reminders, tasks, goals, notes and logs (area agents get copies locked to their area) |
+| `jarvis/src/life/service.py` | Runs inside the brain server: Telegram, the reminder sender, check-ins, backups, dashboard data |
+| `jarvis/src/life/store.py`, `clock.py`, `areas.py` | Database, time and recurrence, iCloud folders and `CONTEXT.md` |
+| `jarvis/src/life/api.py`, `telegram.py`, `cli.py` | Website API (`/life/*`), Telegram client, `make life` |
+| `jarvis/src/main.py`, `server.py`, `llm/anthropic_client.py` | Small hooks: separate text-channel history, parallel tool calls, model options |
+| `jarvis/prompts/system.md` | Jarvis's persona, now including the folder and when to delegate |
+| `jarvis/tests/test_life.py` | 20 tests, no network (`make test`) |
+| `app/page.tsx`, `app/setup/`, `lib/life.ts` | The website dashboard and Setup page, reading from the Mac |
+| `app/talk/`, `app/about/`, `app/files/`, `lib/brain.ts` | The voice face and its pages (unchanged apart from the nav bar and a timeout option) |
 
 ## Cost
 
-These are rough estimates, to check against real numbers after week 1:
+These are rough estimates; check them against `jarvis/data/life_agents.log`, which records each area agent run with its cost.
 
-- **Chatting with Jonny (Opus 5.5):** about $0.03–0.08 per message, so roughly $10–25/month at ~10 messages a day.
-- **Scheduled runs:** 15 a week, so about $5/month. The Sunday review costs the most at about $0.50.
-- **Everything else is free tier:** Neon, Vercel Hobby, Telegram and GitHub Actions on a public repo.
-- **Total:** roughly **$15–30/month**.
-- **Hard caps, enforced by Anthropic:**
-  - $3 per day for the chat. Chat pauses until tomorrow if it's hit.
-  - $1 per check-in.
-  - $2.50 per Sunday review.
-- **Real spend:** Anthropic Console → Managed Agents → Sessions shows the cost of each session.
+- **A text message with Jarvis (Opus 5.5):** about $0.03–0.08. Each area agent he brings in adds about $0.02–0.10 (Sonnet 5.5).
+- **Check-ins:** about $5/month. The brief and check-in cost about $0.05 each, daily; the Sunday review about $0.40.
+- **At ~10 messages a day:** roughly **$15–30/month**. Voice keeps its current cheap models.
+- **Spend limits:** no platform-enforced cap applies to these calls. Set a monthly spend limit in the Anthropic Console. Per run, the area agents are bounded at 12 tool rounds and 4 minutes.
 
 ## Security and privacy
 
-- **Access to each part:**
-  - **Dashboard:** a password and a signed cookie. Every page and action requires it.
-  - **`/api/telegram`:** requires Telegram's secret header, and only accepts your chat id. Everyone else is ignored.
-  - **`/api/mcp`:** requires the bearer `MCP_TOKEN`. The agents hold it in an Anthropic vault, never in prompts.
-  - **`/api/cron/tick`:** requires the bearer `CRON_SECRET`.
-- **The GitHub repo is public.** No secrets are in code, but the agent prompts and this plan are visible. Your name only enters the prompts through the `OWNER_NAME` env var.
-- **Where your data lives:**
-  - Neon (the database).
-  - Anthropic (Managed Agents keeps session history until it's deleted).
-  - Telegram (bot chats are not end-to-end encrypted, so keep anything you consider very sensitive out of them).
-- **Managed Agents is a beta product,** so its API can change.
+- **The website** stays password-gated and reaches the Mac only through the existing token and tunnel.
+- **Telegram:** Jarvis answers only your chat id and ignores everyone else.
+- **Area agents** can only touch files inside their own folder (real paths are checked, so `../` and symlinks can't escape), can't delete anything, and their data tools are locked to their own area.
+- **Where your data goes:**
+  - Your data stays on your Macs and in iCloud.
+  - Model calls go to Anthropic.
+  - Telegram chats aren't end-to-end encrypted.
+- **The repo is public:** no secrets are in code, and the Telegram token lives only in Jarvis's `.env` on the Mac.
 
 ## Roadmap
 
-### Phase 0 · Foundation ✅
+### Phase 0 · Built ✅
 
-Built on branch `life-hq`. The pre-change state of `main` is tagged `pre-life-hq` locally.
+**What was built:**
+- Jarvis's `delegate` tool and the five area agents.
+- The iCloud folder structure, which already exists in your iCloud Drive.
+- Reminders, tasks, goals, notes and logs on the Mac.
+- Telegram with Done/Snooze buttons.
+- The scheduler with the three check-ins and nightly backups.
+- The website dashboard, Setup page, and "Ask Jarvis".
 
-- **What it contains:**
-  - Database tables.
-  - The MCP tools.
-  - The Telegram webhook with Done/Snooze buttons.
-  - The reminder trigger with atomic sending and daylight-saving-safe repeats.
-  - The daily Jonny chat session.
-  - Agent, vault and schedule sync.
-  - The dashboard and the Setup page. The orb moved to `/talk`.
-- **Verified:**
-  - Type-check and production build.
-  - Every database query run against a local Postgres: 23 checks covering reminders, snooze/done, repeats across daylight saving, failed sends and recovery, items, logs, and the check-in context.
-  - A local run: all endpoints reject missing or wrong secrets, and the MCP server answers and lists its 8 tools.
-- **Not verified yet:** anything that needs your real Telegram, Neon or Anthropic accounts. That happens in Phase 1.
+**Verified:**
+- 20 unit tests (no network): time and daylight-saving recurrence, the database, area locks on tools, folder setup, the area agent loop including folder confinement, Telegram handling, the scheduler, the website API, and the turn-loop hooks.
+- The real Anthropic SDK sends the right requests: checked against a local stand-in API.
+- The website builds, and renders real data from the real `/life` API.
 
-### Phase 1 · Go live (about an hour, together)
+**Not verified yet:** real Telegram, real Claude calls, and the Mac mini's iCloud permissions. That is Phase 1.
+
+### Phase 1 · Go live on the Mac mini (about 30 minutes)
 
 1. **Telegram:** message @BotFather → `/newbot` → copy the token.
-2. **Database:** Vercel → project → Storage → Create → Neon Postgres (nearest region). Connecting it sets `DATABASE_URL`.
-3. **Secrets:** run `openssl rand -hex 32` three times, for `TELEGRAM_WEBHOOK_SECRET`, `MCP_TOKEN` and `CRON_SECRET`.
-4. **Vercel env vars:** add the new ones (see `.env.example`) and set `TIMEZONE` and `OWNER_NAME`. Keep `DASHBOARD_PASSWORD`, `MAC_BRAIN_URL` and `JARVIS_TOKEN` as they are. `ANTHROPIC_API_KEY` may be missing, because the voice face never needed it; add it if `/setup` shows it unset.
-5. **Ship:** merge `life-hq` into `main`. Vercel deploys production. The orb lives on at `/talk`.
-6. **Setup page:**
-   1. Create tables.
-   2. Connect webhook.
-   3. Send `/start` to the bot to see your chat id.
-   4. Add `TELEGRAM_CHAT_ID` and redeploy.
-   5. Send test message.
-7. **Setup page:** Sync agents & schedules, then press "Run now" on the morning brief. It should arrive on Telegram within about 2 minutes.
-8. **GitHub:** repo Settings → Secrets → Actions: add `APP_URL` and `CRON_SECRET`. Then Actions → "Reminder tick" → Run workflow once.
-9. **Seed:** tell Jonny your current goals and recurring obligations (meds, bills, birthdays, training days) and check the dashboard.
+2. **Push:** push the `life-hq` branch to GitHub (Claude asks before pushing; the repo is public).
+3. **Get the code onto the Mac mini.** Jarvis runs there from its own repo, so pull the new Jarvis code into it from the `jonny` checkout:
+
+   ```sh
+   cd ~/jonny && git fetch origin && git checkout life-hq
+   git subtree split --prefix=jarvis -b jarvis-life-hq     # Jarvis-only history, incl. the new work
+   cd <your Jarvis folder> && git pull ~/jonny jarvis-life-hq
+   make setup && make test                                 # deps + the 20 tests
+   ```
+
+4. **Telegram on the Mac:**
+   1. Add `TELEGRAM_BOT_TOKEN=…` to Jarvis's `.env`, then run `make install-web` to restart.
+   2. Send `/start` to your bot: it replies with your chat id.
+   3. Add `TELEGRAM_CHAT_ID=…` and restart again.
+5. **iCloud access for the background service:**
+   1. Run `make life ARGS=python-path`.
+   2. In System Settings → Privacy & Security → Full Disk Access, add that file, then restart.
+   3. In Finder → iCloud Drive → Jarvis, right-click → **Keep Downloaded**.
+   4. Run `make life`: everything should be green.
+6. **Website:** merge `life-hq` into `main`. Vercel deploys, and no new settings are needed.
 
 **Done when all of these pass:**
 
-- "remind me to drink water in 10 minutes" arrives with buttons, and Done works.
-- "log 45 min run" shows up under Fitness.
-- "what's on today?" answers from your data.
-- Running the evening check-in, then replying in one line, logs the right things.
-- Setup shows a recent tick.
+- `/help` answers.
+- "remind me in 5 minutes to stand up" arrives with buttons, and Done works.
+- "plan my training week" makes the Fitness agent write `Fitness/training-plan.md`, which shows up on the MacBook too.
+- The website's Setup page is all green.
+- "Run now" on the morning brief arrives on Telegram.
 
-### Phase 2 · Shake-down and tune (first two weeks)
+**Then:** fill in the five `CONTEXT.md` files.
 
-Use it daily, then adjust from real use:
+### Phase 2 · Tune (first two weeks)
 
-- Tune times, wording and what the brief and check-in include (`lib/areas.ts`, then re-sync).
-- Show spend on the dashboard, using each session's reported cost.
-- Send alerts to Telegram when a scheduled run fails, a schedule pauses, or the chat cap is hit.
-- Projects: link tasks to a goal or project (sub-tasks, milestones).
-- Habits and streaks, with one-tap check-offs in Telegram.
-- Quiet hours: hold messages overnight until the morning.
-- Edit and delete items inline on the dashboard. Polish the mobile layout.
-- Fix monthly repeats that start on the 29th–31st, which drift to the 28th.
-- If GitHub's timing is too loose, point a free per-minute service such as cron-job.org at the same endpoint.
+- Adjust times, wording and the `CONTEXT.md` files from real use.
+- Show weekly spend on the dashboard, from `life_agents.log`.
+- Let Jarvis search the iCloud folder with his existing knowledge search, so he can answer from area files without delegating.
+- Delegate in the background on voice: the website's voice face times out after 2 minutes, so long planning requests are better on Telegram for now.
+- Quiet hours.
+- Habits and streaks with one-tap check-offs.
+- A "Mac offline" alert from an outside uptime monitor watching `/health`.
+- Consider running Jarvis straight from the `jonny` repo on the Mac mini, so there is one copy of the code instead of two.
 
-### Phase 3 · Jarvis joins
+### Phase 3 · Later
 
-Jarvis becomes a voice channel into the same system:
-
-Jarvis already runs always-on on the Mac mini, with its own tool loop and a voice face at `/talk`. Joining means:
-
-- **Give Jarvis the Life HQ tools.** Add the MCP server (`/api/mcp`, with `MCP_TOKEN`) to its tool loop. Then "hey Jarvis, remind me to…" or "what's on today?" reads and writes the same reminders, tasks and logs as Telegram.
-- **Or hand longer requests to Jonny.** Jarvis forwards them to an authenticated endpoint (e.g. `/api/jarvis`) and speaks the reply, so planning stays with the area agents.
-- **First, fix two issues still present in Jarvis:**
-  - Its cost logging uses Sonnet 5's intro price, which expired on 2026-08-31, so turn costs read about a third low.
-  - `make push` is unsafe to run from inside a `jonny/` checkout.
-
-### Phase 4 · Later ideas
-
-- Telegram voice notes, transcribed and passed to Jonny.
-- Photo logging (meals, receipts).
 - Calendar sync, so the brief knows your meetings.
-- Dashboard charts (sleep, training volume, mood).
+- Telegram voice notes and photos (meals, receipts).
 - A weekly email digest.
-- Data export and backup.
+- More areas (Finance, Learning): one entry each in `config.yaml`.
 
 ## Risks and mitigations
 
 | Risk | Mitigation |
 |---|---|
-| GitHub runs the tick late, skips it, or disables it after 60 days without commits | The morning brief warns when the last tick is over 60 minutes old, and Setup shows the last tick. Any scheduler can call the same endpoint, e.g. cron-job.org (free, every minute) |
-| Managed Agents is in beta | The SDK version is pinned. Sync is idempotent and can be re-run. The tools are plain HTTP, so the agent loop could move to the Messages API if needed |
-| A long reply outlives the webhook's 5 minutes | The next tick relays any unsent reply |
-| An agent files something wrong (time, area) | Every change is confirmed in the reply with its time. Fix it on the dashboard or tell Jonny. The tools reject times they can't parse and one-off reminders in the past |
-| Too many messages | One-voice cadence, and check-ins send nothing when there's nothing useful |
-| Spend creeps up | Hard caps per day and per run. Check the Console weekly at first |
-| Privacy of health data | See Security and privacy |
+| The Mac mini is off, asleep, or stuck at the FileVault login after a power cut: nothing is sent | Your existing liveness script (no sleep, power back on) and watchdog. Telegram holds messages for 24h; check-ins catch up within 2h; the website shows "offline". Phase 2 adds an outside alert |
+| macOS blocks the background service from iCloud Drive | Full Disk Access for its python (`make life ARGS=python-path`). `make life` and the Setup page detect the problem from inside the server |
+| iCloud keeps files cloud-only ("Optimize Mac Storage") | "Keep Downloaded" on the Jarvis folder on the Mac mini |
+| The same file edited on both Macs at once | iCloud keeps both ("file 2.md"); the agents write mostly on the Mac mini, so this should be rare |
+| Spend | A spend limit in the Anthropic Console; per-run bounds on the area agents; costs logged per run |
+| Two copies of the Jarvis code (its own repo on the Mac mini, and `jonny/jarvis`) | Phase 1 step 3 syncs them; Phase 2 suggests keeping one |
 
 ## Open questions (not blocking)
 
-- Are 07:30, 21:00 and Sunday 19:00 the right times?
-- What should the evening check-in track by default: sleep, training, mood, energy, anything else?
-- What should be seeded on day one in each area?
+- Are 07:30, 21:00 and Sunday 19:00 the right times, and is the timezone `Australia/Sydney` right?
+- What should the evening check-in track by default: sleep, training, mood, energy?
+- Anything to seed on day one in each `CONTEXT.md`?

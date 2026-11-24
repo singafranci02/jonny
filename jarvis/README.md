@@ -87,6 +87,30 @@ Jarvis announces the summary when done.
 3. **Memory** — Mem0: retrieve before / extract-and-write after each turn ✅
 4. **Knowledge/RAG** — `knowledge/` folder → Ollama embeddings → Chroma ✅
 5. **Wake word + polish** — transcript gate, LaunchAgent, local fallback ✅
+6. **Life HQ** — Jarvis as the main agent: area agents, iCloud folders, reminders, Telegram ✅
+
+## Life HQ: Jarvis as the main agent
+
+Jarvis runs your personal organiser. You talk to him on Telegram, by voice,
+or on the Jonny website. He brings in one agent per life area (Work,
+Projects, Fitness, Health, Life), each with its own folder in
+`iCloud Drive/Jarvis/`, a `CONTEXT.md` brief, and that area's reminders,
+tasks and logs. Reminders and check-ins (07:30 brief, 21:00 check-in, Sunday
+review) arrive on Telegram. Everything is configured in `config.yaml` →
+`life:`; the whole design is in `SYSTEM.md` §6b and in `../PLAN.md`.
+
+```sh
+make life ARGS=folders         # create iCloud Drive/Jarvis and the area folders
+make life                      # status: folder, permissions, Telegram, models
+make life ARGS=python-path     # the file to give Full Disk Access (iCloud)
+make life ARGS=test-telegram   # send yourself a test message
+make life ARGS=today           # today's reminders and due items
+make test                      # unit tests, no network
+```
+
+Telegram: put `TELEGRAM_BOT_TOKEN` (from @BotFather) in `.env` and restart
+(`make install-web`). Send `/start` to the bot to get your chat id, then set
+`TELEGRAM_CHAT_ID` and restart again.
 
 ## Wake word ("hey jarvis")
 

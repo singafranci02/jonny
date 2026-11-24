@@ -203,6 +203,52 @@ and it announces the summary when done. CLI: `make research ARGS='"topic"'`.
 
 ---
 
+## 6b. Life HQ — Jarvis as the main agent (`src/life/`)
+
+Jarvis is also the head of a personal organiser. Behind him sits one **area
+agent** per part of life: Work, Projects, Fitness, Health and Life (defined
+in `config.yaml` → `life.areas`). Each area agent has more context about its
+area than Jarvis carries in every turn:
+
+- **its folder** in the main folder, `iCloud Drive/Jarvis/<Area>/`. The
+  workspace now lives in iCloud, so it is the same on every Mac. Its file
+  tools are confined to that folder.
+- **a `CONTEXT.md` brief**: goals, routines, people, dates. It is read before
+  every task, and the agent adds what it learns.
+- **that area's reminders, tasks, goals, notes and logs.**
+
+```
+you (Telegram / voice / website) ──► Jarvis ── delegate (parallel) ──► area agents
+                                       │                                   │
+                       life_* tools    ▼                                   ▼ files
+                         data/life.db (SQLite)           iCloud Drive/Jarvis/Work, Projects, ...
+```
+
+- **Delegation** (`src/life/agents.py`): Jarvis's `delegate` tool runs an
+  area agent, its own Messages-API tool loop on Sonnet 5.5 (tier `area`),
+  and returns its report. Several delegations in one turn run in parallel.
+  Each run is logged with its cost in `data/life_agents.log`.
+- **Data** (`src/life/store.py`): reminders, tasks/goals/notes and logs live in
+  `data/life.db`, a local SQLite file. It is never put in iCloud, because a
+  synced live database corrupts; a nightly copy goes to `Jarvis/_backups/`.
+  The `life_*` tools (`src/life/tools.py`) read and write it; area agents get
+  copies locked to their area.
+- **Telegram + scheduler** (`src/life/service.py`, inside `make serve`): the
+  Mac long-polls the bot, so no webhook is involved, and only the owner's
+  chat id is answered. It does three things:
+  - Text turns use their own conversation and the `coordinator` tier (Opus 5.5).
+  - Due reminders are sent every 20s with Done / +1h / Tomorrow buttons.
+  - Check-ins run at 07:30, 21:00 and Sunday 19:00; the Sunday review
+    delegates to every area agent.
+- **Website** (`src/life/api.py` → `/life/*`): the Jonny dashboard and Setup
+  page read and edit this data through the same token and tunnel.
+- **Ops:** `make life` (status), `make life ARGS=folders|today|test-telegram|backup|python-path`,
+  and `make test`. iCloud Drive is privacy-protected: the background service
+  needs Full Disk Access for its python (`make life ARGS=python-path` prints
+  which file).
+
+---
+
 ## 7. Where it lives & how it stays on (hosting)
 
 Everything runs on the **Mac mini**, which is always on. Three background
@@ -295,6 +341,9 @@ Jarvis/  (the brain)
     knowledge/           your documents → vector DB + file-watcher
     profile.py           the editable "About Me"
     research/            plan → gather → cite → save pipeline
+    life/                Life HQ: area agents + delegate, reminders/tasks/logs (SQLite),
+                         Telegram polling, scheduler + check-ins, /life/* API, `make life`
+  tests/                 `make test` (no network): the life organiser + turn-loop hooks
     context.py           assembles profile + memories + knowledge into the prompt
     wakeword/            "hey jarvis" gate + conversation window
     audio/echo.py        stops it hearing its own voice
@@ -303,7 +352,10 @@ Jarvis/  (the brain)
   scripts/               LaunchAgent files, ngrok tunnel, mac-liveness.sh
 
 jonny/  (the website — same repo, deployed on Vercel)
-  app/page.tsx           the orb + voice-first UI
+  app/page.tsx           Life HQ dashboard (reminders, tasks, areas, Ask Jarvis)
+  app/talk/page.tsx      the orb + voice-first UI
+  app/setup/page.tsx     what's connected: Mac, iCloud folder, Telegram, check-ins
+  lib/life.ts            client for the Mac's /life/* API
   app/about/page.tsx     edit your profile
   app/api/*              thin proxies to the Mac brain
   lib/brain.ts           holds the token, forwards to the Mac
