@@ -102,7 +102,7 @@ Things to say to Jarvis:
 | `jarvis/src/life/api.py`, `telegram.py`, `cli.py` | Website API (`/life/*`), Telegram client, `make life` |
 | `jarvis/src/main.py`, `server.py`, `llm/anthropic_client.py` | Small hooks: separate text-channel history, parallel tool calls, model options |
 | `jarvis/prompts/system.md` | Jarvis's persona, now including the folder and when to delegate |
-| `jarvis/tests/test_life.py` | 29 tests, no network (`make test`) |
+| `jarvis/tests/test_life.py` | 30 tests, no network (`make test`) |
 | `app/page.tsx`, `app/setup/`, `lib/life.ts` | The website dashboard and Setup page, reading from the Mac |
 | `app/talk/`, `app/about/`, `app/files/`, `lib/brain.ts` | The voice face and its pages (unchanged apart from the nav bar and a timeout option) |
 
@@ -139,7 +139,7 @@ These are rough estimates; check them against `jarvis/data/life_agents.log`, whi
 - The website dashboard, Setup page, and "Ask Jarvis".
 
 **Verified:**
-- 29 unit tests (no network): time and daylight-saving recurrence, the database, area locks on tools, folder setup, the area agent loop including folder confinement, Telegram handling, the scheduler, the website API, and the turn-loop hooks.
+- 30 unit tests (no network): time and daylight-saving recurrence, the database, area locks on tools, folder setup, the area agent loop including folder confinement, Telegram handling, the scheduler, the website API, and the turn-loop hooks.
 - The real Anthropic SDK sends the right requests: checked against a local stand-in API.
 - The website builds, and renders real data from the real `/life` API.
 
@@ -155,7 +155,7 @@ These are rough estimates; check them against `jarvis/data/life_agents.log`, whi
    cd ~/jonny && git fetch origin && git checkout life-hq
    git subtree split --prefix=jarvis -b jarvis-life-hq     # Jarvis-only history, incl. the new work
    cd <your Jarvis folder> && git pull ~/jonny jarvis-life-hq
-   make setup && make test                                 # deps + the 29 tests
+   make setup && make test                                 # deps + the 30 tests
    ```
 
 4. **Telegram on the Mac:**
@@ -213,6 +213,6 @@ These are rough estimates; check them against `jarvis/data/life_agents.log`, whi
 
 ## Open questions (not blocking)
 
-- Are 07:30, 21:00 and Sunday 19:00 the right times, and is the timezone `Australia/Sydney` right?
+- Are 07:30, 21:00 and Sunday 19:00 the right times? (They follow the Mac mini's own timezone; set `life.timezone` in `config.yaml` to override.)
 - What should the evening check-in track by default: sleep, training, mood, energy?
 - Anything to seed on day one in each `CONTEXT.md`?
