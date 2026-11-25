@@ -897,3 +897,12 @@ def test_session_research_stays_with_its_turn(monkeypatch):
     s.llm = ScriptedLLM(script())
     resp = asyncio.run(s.turn("research solar panels please now"))
     assert s.pending_research == "solar panels"  # voice callers keep reading this
+
+
+def test_system_timezone_default():
+    from zoneinfo import ZoneInfo
+
+    from src.life import system_timezone
+
+    tz = system_timezone()
+    assert tz is None or ZoneInfo(tz)  # a real zone name, e.g. "Europe/London"

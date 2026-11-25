@@ -137,7 +137,7 @@ workspace:
 # and that area's reminders/tasks/logs. Code: src/life/.
 life:
   owner: Francesco
-  timezone: Australia/Sydney
+  timezone: ""                # empty = this Mac's own timezone; or e.g. Europe/London
   db: data/life.db            # reminders, tasks, logs: local SQLite, NEVER in iCloud
   inbox: Inbox
   backup_keep: 14             # nightly copies of the database in Jarvis/_backups
