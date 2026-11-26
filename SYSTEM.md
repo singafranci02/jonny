@@ -225,9 +225,17 @@ you (Telegram / voice / website) ──► Jarvis ── delegate (parallel) ─
 ```
 
 - **Delegation** (`src/life/agents.py`): Jarvis's `delegate` tool runs an
-  area agent, its own Messages-API tool loop on Sonnet 5.5 (tier `area`),
+  area agent, its own Messages-API tool loop on Opus 5.5 (tier `area`, the same model as Jarvis),
   and returns its report. Several delegations in one turn run in parallel.
   Each run is logged with its cost in `data/life_agents.log`.
+- **His other projects** (`src/life/sources.py`): a private list in
+  `data/project_sources.yaml` (gitignored; format in
+  `project_sources.example.yaml`) names his project folders and GitHub repos.
+  `project_list`, `project_activity` and `project_read` read them, never
+  write: Jarvis sees all, each area agent only its own area's. Spreadsheets,
+  PDFs and Word files come back as text. `.env` files, keys and credential
+  files are refused, and key-like strings in any text are masked. GitHub goes
+  through the `gh` CLI's own login.
 - **Memory that survives restarts** (ideas from LangGraph, without the
   library): each area agent's runs are recorded in `agent_runs` as they
   happen (task, every verified change, report), and the agent sees its last

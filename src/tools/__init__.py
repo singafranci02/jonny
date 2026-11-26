@@ -15,6 +15,7 @@ class Tool:
     func: Callable[..., str]
     timeout: float = 20.0  # seconds the agent loop waits; delegate needs minutes
     timeout_message: str | None = None  # what the model is told if that wait runs out
+    max_output: int = 8000  # characters of the result the model gets
 
     def anthropic_schema(self) -> dict:
         return {
@@ -41,7 +42,7 @@ class Tool:
         arguments = {k: v for k, v in (arguments or {}).items() if k in valid}
         try:
             result = self.func(**arguments)
-            return str(result)[:8000], False
+            return str(result)[: self.max_output], False
         except Exception as e:
             return f"{type(e).__name__}: {e}", True
 

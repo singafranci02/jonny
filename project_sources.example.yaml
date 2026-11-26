@@ -1,0 +1,21 @@
+# Copy to data/project_sources.yaml (private: data/ is gitignored) and list
+# your projects. Jarvis can read every entry; each area agent reads only the
+# entries for its area. Nothing is ever written to them, and secrets
+# (.env files, keys, credential files) are never read.
+#
+# name:                 lowercase, used in the tools
+#   area: projects      work | projects | fitness | health | life
+#   about: one line on what it is
+#   path: ~/code/thing  a folder on this Mac, and/or
+#   github: owner/repo  a GitHub repo, read with your `gh` login
+
+my-app:
+  area: projects
+  about: The web app I'm building
+  path: ~/code/my-app
+  github: someone/my-app
+
+side-business:
+  area: work
+  about: Plans, trackers and finances for the business
+  path: ~/Documents/side-business

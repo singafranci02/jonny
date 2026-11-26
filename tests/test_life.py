@@ -1188,3 +1188,140 @@ def test_cut_off_checkin_runs_again_once(cfg, store, clock, monkeypatch):
     store.set_setting(marker, {"slot": to_iso(utc_now() - timedelta(minutes=3)), "attempt": 2})
     asyncio.run(tick())
     assert len(svc.tg.sent) == 1 and store.get_setting(marker) is None  # cut off twice: given up
+
+
+# ---------------------------------------------------------------- project sources (read-only)
+
+
+def _xlsx(path: Path) -> Path:
+    """A minimal workbook: shared strings, a date-styled cell and a gap column."""
+    import zipfile
+
+    m = 'xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"'
+    r = 'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"'
+    with zipfile.ZipFile(path, "w") as z:
+        z.writestr("xl/workbook.xml", f'<workbook {m} {r}><sheets><sheet name="Tracker" sheetId="1" r:id="rId1"/>'
+                                      "</sheets></workbook>")
+        z.writestr("xl/_rels/workbook.xml.rels",
+                   '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+                   '<Relationship Id="rId1" Target="worksheets/sheet1.xml" Type="x"/></Relationships>')
+        z.writestr("xl/sharedStrings.xml", f"<sst {m}><si><t>Task</t></si><si><t>Agree contributions</t></si>"
+                                           "<si><t>Due</t></si></sst>")
+        z.writestr("xl/styles.xml", f'<styleSheet {m}><numFmts><numFmt numFmtId="164" formatCode="d mmm yyyy"/>'
+                                    '</numFmts><cellXfs><xf numFmtId="0"/><xf numFmtId="164"/></cellXfs></styleSheet>')
+        z.writestr("xl/worksheets/sheet1.xml",
+                   f'<worksheet {m}><sheetData>'
+                   '<row r="1"><c r="A1" t="s"><v>0</v></c><c r="C1" t="s"><v>2</v></c></row>'
+                   '<row r="2"><c r="A2" t="s"><v>1</v></c><c r="C2" s="1"><v>46341</v></c>'
+                   '<c r="D2"><v>1750</v></c></row></sheetData></worksheet>')
+    return path
+
+
+def test_project_sources_are_read_only_and_safe(cfg, tmp_path, monkeypatch):
+    import subprocess
+
+    from src.life import sources
+
+    proj = tmp_path / "proj"
+    (proj / "node_modules").mkdir(parents=True)
+    (proj / "docs").mkdir()
+    (proj / "README.md").write_text("# Proj\nA thing.")
+    (proj / ".env").write_text("ANTHROPIC_API_KEY=sk-ant-api03-abcdefghijklmnopqrstuvwxyz")
+    (proj / ".env.example").write_text("ANTHROPIC_API_KEY=")
+    (proj / "config.py").write_text('API_KEY = "sk-ant-api03-abcdefghijklmnopqrstuvwxyz0123"\nmax_tokens = 8000\n'
+                                    "bot = '123456789:AAHabcdefghijklmnopqrstuvwxyz0123456'\n")
+    (proj / "docs" / "long.md").write_text("\n".join(f"line {i} " + "x" * 80 for i in range(600)))
+    _xlsx(proj / "tracker.xlsx")
+    (tmp_path / "outside.txt").write_text("not yours")
+    (proj / "escape.txt").symlink_to(tmp_path / "outside.txt")
+    git = ["git", "-C", str(proj), "-c", "user.email=t@example.com", "-c", "user.name=t"]
+    subprocess.run([*git, "init", "-q"], check=True)
+    subprocess.run([*git, "add", "README.md"], check=True)
+    subprocess.run([*git, "commit", "-qm", "First steps"], check=True)
+
+    reg = tmp_path / "sources.yaml"
+    reg.write_text(f"""
+proj: {{area: work, about: My thing, path: "{proj}"}}
+remote: {{area: work, about: Remote only, github: someone/remote}}
+gym: {{area: fitness, about: Gym log, path: "{proj / 'docs'}"}}
+Bad Name: {{area: projects, path: "{proj}"}}
+wrongarea: {{area: money, path: "{proj}"}}
+nowhere: {{area: projects, about: nothing}}
+home: {{area: projects, path: "~"}}
+""")
+    cfg["life"]["sources_file"] = str(reg)
+    srcs = sources.load_sources(cfg, [a.id for a in load_areas(cfg)])
+    assert [s.name for s in srcs] == ["proj", "remote", "gym"]  # bad entries skipped, not fatal
+
+    areas = {a.id: a for a in load_areas(cfg)}
+    assert sources.build_source_tools(srcs, areas["health"]) == []  # no projects there: no tools
+    fit = {t.name: t for t in sources.build_source_tools(srcs, areas["fitness"])}
+    assert fit["project_read"].parameters["properties"]["name"]["enum"] == ["gym"]  # its own area only
+    t = {x.name: x for x in sources.build_source_tools(srcs)}  # Jarvis: all of them
+    read = lambda **kw: t["project_read"].run(kw)  # noqa: E731
+
+    listing, err = read(name="proj")
+    assert not err and "README.md" in listing and ".env.example" in listing and "docs/" in listing
+    assert ".env (" not in listing and "node_modules" not in listing and ".git/" not in listing
+    for bad in (".env", "../outside.txt", "escape.txt", "node_modules", ".git/config"):
+        assert read(name="proj", path=bad)[1] is True, bad
+    cfg_text = read(name="proj", path="config.py")[0]
+    assert "sk-ant" not in cfg_text and "AAHabc" not in cfg_text and "max_tokens = 8000" in cfg_text
+    sheet = read(name="proj", path="tracker.xlsx")[0]
+    assert "== sheet: Tracker" in sheet and "Task |  | Due" in sheet
+    assert "Agree contributions |  | 2026-11-15 | 1750" in sheet  # dates as dates, gaps kept
+    first, second = read(name="proj", path="docs/long.md")[0], read(name="proj", path="docs/long.md", part=2)[0]
+    assert first.startswith("line 0") and "part 1 of 3" in first and second.startswith("line ")
+    assert len(first) <= sources.MAX_CHARS + 200 and "read part 3" in second
+    assert "First steps" in t["project_activity"].run({"name": "proj"})[0]
+    sources._cache.clear()
+    assert "last commit" in sources.last_activity(srcs[0]) and "First steps" in sources.last_activity(srcs[0])
+
+    calls = []
+
+    def fake_gh(endpoint):
+        calls.append(endpoint)
+        if endpoint.startswith("repos/someone/remote/commits"):
+            return [{"commit": {"author": {"date": "2026-11-20T10:00:00Z"}, "message": "Ship it\n\nbody"}}]
+        if endpoint.startswith("repos/someone/remote/pulls"):
+            return [{"number": 7, "title": "Add billing"}]
+        if endpoint == "repos/someone/remote/contents/":
+            return [{"name": "src", "type": "dir"}, {"name": ".env", "type": "file", "size": 10},
+                    {"name": "README.md", "type": "file", "size": 2048}]
+        if endpoint == "repos/someone/remote/contents/README.md":
+            return {"name": "README.md", "content": base64.b64encode(b"# Remote\ntoken = ghp_abcdefghijklmnopqrstuvwxyz0123").decode()}
+        raise AssertionError(endpoint)
+
+    import base64
+
+    monkeypatch.setattr(sources, "_gh", fake_gh)
+    listing = read(name="remote")[0]
+    assert "src/" in listing and "README.md (2 KB)" in listing and ".env" not in listing
+    readme = read(name="remote", path="README.md")[0]
+    assert readme.startswith("# Remote") and "ghp_" not in readme
+    act = t["project_activity"].run({"name": "remote", "days": 7})[0]
+    assert "2026-11-20 Ship it" in act and "#7 Add billing" in act
+    assert "since=" in calls[-2]
+    assert "remote (work): Remote only | GitHub someone/remote | last commit 2026-11-20 Ship it" in \
+        t["project_list"].run({})[0]
+
+
+def test_area_agents_get_their_own_projects(cfg, store, clock, tmp_path):
+    from src.life.sources import Source
+
+    (tmp_path / "p").mkdir()
+    srcs = [Source("site", "projects", "My site", tmp_path / "p")]
+    fake = FakeAnthropic([_resp("end_turn", _block("text", text="ok"))] * 2)
+    agents = _agents(cfg, store, clock, fake)
+    agents.sources = srcs
+    assert "project_read" not in {t.name for t in agents.tools_for(agents.by_id["fitness"])}
+    agents.run("fitness", "x")
+    assert "project_list" not in fake.requests[0]["system"][0]["text"]
+    cfg["life"]["areas"].append({"id": "projects", "name": "Projects", "emoji": "🚀", "folder": "Projects",
+                                 "blurb": "Builds", "focus": "Ship."})
+    agents = _agents(cfg, store, clock, fake)
+    agents.sources = srcs
+    assert {"project_list", "project_read", "project_activity"} <= {t.name for t in agents.tools_for(agents.by_id["projects"])}
+    agents.run("projects", "where is the site at?")
+    system = fake.requests[1]["system"][0]["text"]
+    assert "project_list, project_activity and project_read" in system and "strike it through" in system

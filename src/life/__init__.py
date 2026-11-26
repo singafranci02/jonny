@@ -6,8 +6,10 @@
         ▼                                   ▼
     data/life.db (reminders, tasks, logs)   iCloud Drive/Jarvis/<Area>/...
 
-attach(session) gives a Session the life tools and the delegate tool. The
-server additionally runs LifeService (Telegram + scheduler); see service.py.
+attach(session) gives a Session the life tools, the delegate tool and the
+read-only project_* tools over his other projects (sources.py; each area
+agent sees only its own area's). The server additionally runs LifeService
+(Telegram + scheduler); see service.py.
 """
 
 from __future__ import annotations
@@ -18,6 +20,7 @@ from dataclasses import dataclass
 from .agents import AreaAgents
 from .areas import Area, load_areas
 from .clock import Clock
+from .sources import Source, build_source_tools, load_sources
 from .store import LifeStore
 from .tools import build_life_tools
 
@@ -28,6 +31,7 @@ class LifeContext:
     store: LifeStore
     areas: list[Area]
     agents: AreaAgents
+    sources: list[Source] | None = None
 
 
 def system_timezone() -> str | None:
@@ -58,13 +62,15 @@ def make_context(cfg: dict, base_tools: list) -> LifeContext:
     clock = Clock(lcfg.get("timezone") or os.environ.get("TIMEZONE") or system_timezone() or "UTC")
     store = LifeStore(ROOT / lcfg.get("db", "data/life.db"), clock)
     areas = load_areas(cfg)
-    agents = AreaAgents(cfg, store, clock, areas, base_tools, ROOT / "data" / "life_agents.log")
-    return LifeContext(clock=clock, store=store, areas=areas, agents=agents)
+    sources = load_sources(cfg, [a.id for a in areas])
+    agents = AreaAgents(cfg, store, clock, areas, base_tools, ROOT / "data" / "life_agents.log", sources)
+    return LifeContext(clock=clock, store=store, areas=areas, agents=agents, sources=sources)
 
 
 def attach(session) -> LifeContext:
     """Add the life tools and `delegate` to a Session's tool list."""
     ctx = make_context(session.cfg, base_tools=list(session.tools))
     session.tools.extend(build_life_tools(ctx.store, ctx.clock, ctx.areas))
+    session.tools.extend(build_source_tools(ctx.sources or []))
     session.tools.append(ctx.agents.delegate_tool())
     return ctx

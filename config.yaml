@@ -52,10 +52,12 @@ llm:
       effort: medium
       max_tokens: 8000
       fallbacks: default     # server-side refusal fallbacks (beta)
-    # Life HQ: the area subagents (Work, Projects, Fitness, Health, Life)
+    # Life HQ: the area subagents (Work, Projects, Fitness, Health, Life).
+    # Same model as Jarvis: they do the deep work. claude-sonnet-5-5 here
+    # halves their cost (~$0.03 vs ~$0.07 a run) if that ever matters more.
     area:
       provider: anthropic
-      model: claude-sonnet-5-5
+      model: claude-opus-5-5
       thinking: adaptive
       effort: medium
       max_tokens: 8000
@@ -139,6 +141,9 @@ life:
   owner: Francesco
   timezone: ""                # empty = this Mac's own timezone; or e.g. Europe/London
   db: data/life.db            # reminders, tasks, logs: local SQLite, NEVER in iCloud
+  # his other projects (folders, GitHub repos) that Jarvis and the area agents may
+  # READ: private list, kept out of git. Format: project_sources.example.yaml
+  sources_file: data/project_sources.yaml
   inbox: Inbox
   backup_keep: 14             # nightly copies of the database in Jarvis/_backups
   coordinator_tier: coordinator   # Jarvis on Telegram, the dashboard and check-ins
