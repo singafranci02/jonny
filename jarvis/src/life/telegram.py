@@ -122,7 +122,8 @@ class TelegramClient:
         except Exception:
             pass
 
-    async def edit_text(self, chat_id: int, message_id: int, text: str) -> None:
+    async def edit_text(self, chat_id: int, message_id: int, text: str, keyboard: dict | None = None) -> None:
+        """Replace a message's text (and its inline buttons, when given)."""
         try:
             await self.call(
                 "editMessageText",
@@ -130,7 +131,15 @@ class TelegramClient:
                 message_id=message_id,
                 text=text[:MAX_LEN],
                 link_preview_options={"is_disabled": True},
+                reply_markup=keyboard,
             )
+        except Exception:
+            pass  # e.g. "message is not modified" after a repeated tap
+
+    async def edit_keyboard(self, chat_id: int, message_id: int, keyboard: dict) -> None:
+        """Swap only the inline buttons (the text stays as it is)."""
+        try:
+            await self.call("editMessageReplyMarkup", chat_id=chat_id, message_id=message_id, reply_markup=keyboard)
         except Exception:
             pass
 

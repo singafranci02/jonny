@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from datetime import timedelta
 
 from ..context import Conversation
+from . import board
 from .areas import ensure_folders, folder_status, full_disk_access_target, workspace_root
 from .clock import from_iso, parse_days, to_iso, utc_now
 from .telegram import TelegramClient, TelegramError, reminder_keyboard
@@ -26,12 +27,12 @@ from .telegram import TelegramClient, TelegramError, reminder_keyboard
 log = logging.getLogger("jarvis.life")
 
 HELP = (
-    "I'm Jarvis. Just talk to me:\n"
-    "• \"remind me to call mum Sunday at 6pm\"\n"
-    "• \"log 45 min run\", \"slept 7h\"\n"
-    "• \"plan my training this week\" (the Fitness agent does it)\n"
-    "• \"what's on today?\"\n\n"
-    "/today: instant summary, no AI involved"
+    "I'm Jarvis. Tap the buttons below, or just text me.\n"
+    "📋 Board: your projects by area. Tap one to move it or set its next step\n"
+    "➕ Add: a new project\n"
+    "📅 Today: what's on\n"
+    "📝 Log: sleep, mood, training in one tap\n\n"
+    "Text works too: \"remind me to call mum Sunday 6pm\", \"plan my training week\""
 )
 
 
@@ -43,6 +44,7 @@ class CheckIn:
     days: list[int] | None  # None = every day
     task: str
     catch_up_min: int = 120
+    buttons: str | None = None  # "daily-log": tap-to-log sleep/mood/training under the message
 
 
 class LifeService:
@@ -68,6 +70,7 @@ class LifeService:
                 days=parse_days(c.get("days", "daily")),
                 task=" ".join(str(c["task"]).split()),
                 catch_up_min=int(c.get("catch_up_minutes", 120)),
+                buttons=c.get("buttons"),
             )
             for c in lcfg.get("checkins", []) or []
         ]
@@ -95,6 +98,7 @@ class LifeService:
             log.warning("could not prepare the Jarvis folder: %s", e)
         if self.tg:
             self._tasks.append(asyncio.ensure_future(self._poll_loop()))
+            self._tasks.append(asyncio.ensure_future(self.announce_menu()))
         self._tasks.append(asyncio.ensure_future(self._scheduler_loop()))
 
     async def stop(self) -> None:
@@ -231,10 +235,24 @@ class LifeService:
         if not text:
             await self.tg.send(chat_id, "I can only read text for now.")
             return
-        if text.startswith(("/start", "/help")):
-            await self.tg.send(chat_id, HELP)
+        if text.startswith(("/start", "/help", "/menu")):
+            await self.tg.send(chat_id, HELP, board.menu_keyboard())
+            await asyncio.to_thread(self.store.set_setting, "menu_version", board.MENU_VERSION)
             return
-        if text.startswith("/today"):
+        if text == board.MENU_BOARD or text.startswith("/board"):
+            await self.send_board(chat_id)
+            return
+        if text == board.MENU_ADD:
+            await self._ask_input(chat_id, {"kind": "new_project", "area": None},
+                                  "New project: what's it called?", "Project name")
+            return
+        if text == board.MENU_LOG:
+            await self.tg.send(chat_id, "Log today:", board.log_keyboard(await self._log_values()))
+            return
+        reply_to = (msg.get("reply_to_message") or {}).get("message_id")
+        if reply_to and await self._answer_prompt(chat_id, reply_to, text):
+            return
+        if text == board.MENU_TODAY or text.startswith("/today"):
             await asyncio.to_thread(self.store.log_message, "in", "command", text)
             summary = await asyncio.to_thread(self.store.today_text, lambda a: self.labels.get(a, a))
             await self.tg.send(chat_id, summary)
@@ -268,6 +286,18 @@ class LifeService:
             await self.tg.answer_callback(q["id"])
             return
         action, _, rest = (q.get("data") or "").partition(":")
+        if action in ("done", "snooze"):
+            await self._on_reminder_button(q, message, chat_id, action, rest)
+        elif action in ("bd", "pj", "ps", "pn", "pa", "pc", "lg"):
+            try:
+                await self._on_board_button(q, message, chat_id, action, rest)
+            except Exception:
+                log.exception("board button %r failed", q.get("data"))
+                await self.tg.answer_callback(q["id"], "Something went wrong there.")
+        else:
+            await self.tg.answer_callback(q["id"])
+
+    async def _on_reminder_button(self, q: dict, message: dict, chat_id: int, action: str, rest: str) -> None:
         rid_text, _, arg = rest.partition(":")
         rid = int(rid_text) if rid_text.isdigit() else -1
         reminder = await asyncio.to_thread(self.store.get_reminder, rid)
@@ -290,6 +320,133 @@ class LifeService:
         await asyncio.to_thread(
             self.store.log_message, "in", "button", f"{status}: {reminder['text']}", reminder["area"]
         )
+
+    # ---------------- board, menu and tap-to-log (no model calls) ----------------
+
+    async def announce_menu(self) -> None:
+        """Send the menu bar once per MENU_VERSION, so the buttons appear
+        without the user having to type /start again."""
+        try:
+            if not self.can_message():
+                return
+            if await asyncio.to_thread(self.store.get_setting, "menu_version") == board.MENU_VERSION:
+                return
+            await self.tg.send(self.owner_chat, "Buttons are ready below. 📋 Board for your projects, "
+                               "📝 Log for sleep, mood and training.", board.menu_keyboard())
+            await asyncio.to_thread(self.store.set_setting, "menu_version", board.MENU_VERSION)
+        except Exception as e:
+            log.warning("could not send the menu bar: %s", e)
+
+    def _area(self, area_id: str | None):
+        return next((a for a in self.areas if a.id == area_id), None)
+
+    async def send_board(self, chat_id: int) -> None:
+        projects = await asyncio.to_thread(self.store.projects)
+        text, keyboard = board.board_view(projects, self.areas)
+        await self.tg.send(chat_id, text, keyboard)
+
+    async def _ask_input(self, chat_id: int, pending: dict, prompt: str, placeholder: str) -> None:
+        """Ask for typed text with a force-reply prompt; the reply to that
+        exact message is the answer (anything else is normal chat)."""
+        mid = await self.tg.send(chat_id, prompt, board.force_reply(placeholder))
+        await asyncio.to_thread(self.store.set_setting, "pending_input", {**pending, "prompt_id": mid})
+
+    async def _answer_prompt(self, chat_id: int, reply_to: int, text: str) -> bool:
+        pending = await asyncio.to_thread(self.store.get_setting, "pending_input")
+        if not pending or pending.get("prompt_id") != reply_to:
+            return False
+        await asyncio.to_thread(self.store.set_setting, "pending_input", None)
+        await asyncio.to_thread(self.store.log_message, "in", "button", text)
+        if pending["kind"] == "next_step":
+            item = await asyncio.to_thread(lambda: self.store.update_item(int(pending["item"]), next_step=text))
+            if item is None:
+                await self.tg.send(chat_id, "That project no longer exists.")
+                return True
+            await self.tg.send(chat_id, *board.project_card(item, self._area(item["area"])))
+        elif pending["kind"] == "new_project":
+            title = " ".join(text.split())[:120]
+            if pending.get("area") and self._area(pending["area"]):
+                await self._create_project(chat_id, pending["area"], title)
+            else:
+                await asyncio.to_thread(self.store.set_setting, "pending_project_title", title)
+                await self.tg.send(chat_id, f"Which area for \"{title}\"?", board.area_picker(self.areas))
+        return True
+
+    async def _create_project(self, chat_id: int, area_id: str, title: str, message_id: int | None = None) -> None:
+        item = await asyncio.to_thread(self.store.add_item, area_id, "project", title)
+        text, keyboard = board.project_card(item, self._area(area_id))
+        if message_id is None:
+            await self.tg.send(chat_id, text, keyboard)
+        else:
+            await self.tg.edit_text(chat_id, message_id, text, keyboard)
+
+    async def _log_values(self) -> dict:
+        ids = [a.id for a in self.areas]
+
+        def read() -> dict:
+            out = {}
+            for key in board.LOG_ROWS:
+                area, metric, _ = board.log_target(key, ids)
+                out[key] = self.store.today_value(area, metric)
+            return out
+
+        return await asyncio.to_thread(read)
+
+    async def _on_board_button(self, q: dict, message: dict, chat_id: int, action: str, rest: str) -> None:
+        mid = message.get("message_id")
+        first, _, second = rest.partition(":")
+        if action == "bd":
+            projects = await asyncio.to_thread(self.store.projects)
+            area = first if self._area(first) else None
+            await self.tg.answer_callback(q["id"])
+            await self.tg.edit_text(chat_id, mid, *board.board_view(projects, self.areas, area))
+            return
+        if action == "pa":
+            await self.tg.answer_callback(q["id"])
+            await self._ask_input(chat_id, {"kind": "new_project", "area": first or None},
+                                  "New project: what's it called?", "Project name")
+            return
+        if action == "pc":
+            title = await asyncio.to_thread(self.store.get_setting, "pending_project_title")
+            if not title or not self._area(first):
+                await self.tg.answer_callback(q["id"], "Tap ➕ Add and send the name again.")
+                return
+            await asyncio.to_thread(self.store.set_setting, "pending_project_title", None)
+            await self.tg.answer_callback(q["id"], "Added")
+            await self._create_project(chat_id, first, title, mid)
+            return
+        if action == "lg":
+            if first not in board.LOG_ROWS:
+                await self.tg.answer_callback(q["id"])
+                return
+            value = float(second)
+            area, metric, unit = board.log_target(first, [a.id for a in self.areas])
+            await asyncio.to_thread(self.store.set_today_log, area, metric, value, unit)
+            label = board.log_confirmation(first, value)
+            await asyncio.to_thread(self.store.log_message, "in", "button", label, area)
+            await self.tg.answer_callback(q["id"], f"{label} ✓")
+            await self.tg.edit_keyboard(chat_id, mid, board.log_keyboard(await self._log_values()))
+            return
+
+        # project actions: pj / ps / pn carry the project id first
+        item = await asyncio.to_thread(self.store.get_item, int(first)) if first.isdigit() else None
+        if item is None or item["kind"] != "project":
+            await self.tg.answer_callback(q["id"], "That project no longer exists.")
+            return
+        if action == "pn":
+            await self.tg.answer_callback(q["id"])
+            await self._ask_input(chat_id, {"kind": "next_step", "item": item["id"]},
+                                  f"Next step for \"{item['title']}\"?", "Next step")
+            return
+        if action == "ps" and second in ("todo", "doing", "waiting", "done"):
+            patch = {"status": "done"} if second == "done" else {"stage": second}
+            item = await asyncio.to_thread(lambda: self.store.update_item(item["id"], **patch))
+            label = f"{board.STAGE_ICON[second]} {board.STAGE_NAME[second]}"
+            await asyncio.to_thread(self.store.log_message, "in", "button", f"{label}: {item['title']}", item["area"])
+            await self.tg.answer_callback(q["id"], label)
+        else:
+            await self.tg.answer_callback(q["id"])
+        await self.tg.edit_text(chat_id, mid, *board.project_card(item, self._area(item["area"])))
 
     # ---------------- scheduler ----------------
 
@@ -372,7 +529,8 @@ class LifeService:
         )
         text = (resp.text or "").strip()
         if text and text.upper() != "NOTHING":
-            await self.notify(text, "checkin")
+            keyboard = board.log_keyboard(await self._log_values()) if ci.buttons == "daily-log" else None
+            await self.notify(text, "checkin", keyboard=keyboard)
         if resp.extra.get("research_topic"):
             asyncio.ensure_future(self._research(resp.extra["research_topic"]))
         return text
