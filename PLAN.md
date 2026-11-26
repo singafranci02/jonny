@@ -19,7 +19,7 @@ The area agents report to Jarvis, and Jarvis talks to you.
 | Topic | Decision | Notes |
 |---|---|---|
 | Main agent | Jarvis on the Mac mini | Opus 5.5 for Telegram, the website and check-ins; voice keeps its existing fast models |
-| Area agents | Work · Projects · Fitness · Health · Life | Sonnet 5.5, run by Jarvis on the Mac; several can work in parallel |
+| Area agents | Work · Projects · Fitness · Health · Life | Opus 5.5 like Jarvis, run by Jarvis on the Mac; several can work in parallel. Each can read its own area's projects (folders, GitHub repos) |
 | Files | `iCloud Drive/Jarvis/`: one main folder, a subfolder per area, plus `Inbox/` | The same folder on the MacBook and the Mac mini |
 | Data | Reminders, tasks, goals, notes, logs in a database on the Mac mini (`jarvis/data/life.db`) | A live database must not sit in iCloud; a nightly copy goes to `iCloud/Jarvis/_backups/` |
 | Channel | A Telegram bot, polled by the Mac | No webhook and no cloud service in between |
@@ -36,7 +36,7 @@ The area agents report to Jarvis, and Jarvis talks to you.
                                     │  delegate: several areas at once, in parallel
                                     ▼
         ┌────────┬──────────┬─────────┬────────┬────────┐
-        │  Work  │ Projects │ Fitness │ Health │  Life  │   area agents (Sonnet 5.5)
+        │  Work  │ Projects │ Fitness │ Health │  Life  │   area agents (Opus 5.5)
         └───┬────┴────┬─────┴────┬────┴───┬────┴───┬────┘
             ▼ files: only their own folder, each with CONTEXT.md
    iCloud Drive/Jarvis/   Work/  Projects/  Fitness/  Health/  Life/  Inbox/
@@ -110,7 +110,7 @@ Things to say to Jarvis:
 
 These are rough estimates; check them against `jarvis/data/life_agents.log`, which records each area agent run with its cost.
 
-- **A text message with Jarvis (Opus 5.5):** about $0.03–0.08. Each area agent he brings in adds about $0.02–0.10 (Sonnet 5.5).
+- **A text message with Jarvis (Opus 5.5):** about $0.03–0.08. Each area agent he brings in adds about $0.05–0.20 (Opus 5.5; a big read like a whole project tracker can reach about $0.50).
 - **Check-ins:** about $5/month. The brief and check-in cost about $0.05 each, daily; the Sunday review about $0.40.
 - **At ~10 messages a day:** roughly **$15–30/month**. Voice keeps its current cheap models.
 - **Spend limits:** no platform-enforced cap applies to these calls. Set a monthly spend limit in the Anthropic Console. Per run, the area agents are bounded at 12 tool rounds and 4 minutes.
