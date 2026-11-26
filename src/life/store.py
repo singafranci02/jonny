@@ -1,6 +1,8 @@
 """The organiser's structured data, in a local SQLite file on the Mac.
 
-Reminders, tasks/goals/notes ("items"), logs and the message feed. The file
+Reminders, tasks/goals/notes ("items"), logs, the message feed and the area
+agents' run history (agent_runs: what each agent was asked, reported and
+changed, so its next run picks up where it left off). The file
 lives in data/ (never in iCloud: a live database synced by iCloud corrupts);
 a nightly copy goes into the iCloud folder instead (see backup_to).
 
@@ -11,6 +13,7 @@ threads and from a second process (the CLI) at the same time.
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import threading
 from contextlib import contextmanager
@@ -78,6 +81,20 @@ create table if not exists messages (
   text text not null,
   created_at text not null
 );
+create table if not exists agent_runs (
+  id integer primary key autoincrement,
+  area text not null,
+  task text not null,
+  status text not null,
+  report text,
+  changes text not null default '[]',
+  rounds integer,
+  cost real,
+  pid integer,
+  started_at text not null,
+  finished_at text
+);
+create index if not exists agent_runs_area on agent_runs (area, id);
 """
 
 
@@ -493,6 +510,30 @@ class LifeStore:
             rows = c.execute("select * from messages order by id desc limit ?", (limit,)).fetchall()
         return [dict(r) for r in rows]
 
+    def thread_history(self, max_turns: int) -> list[dict]:
+        """The text conversation rebuilt from the message feed, so a restart
+        doesn't wipe it (a checkpointed thread, as in LangGraph). Only the
+        user's own messages and Jarvis's chat replies count, as pairs: a
+        message whose turn failed has no reply and is dropped."""
+        with self._db() as c:
+            rows = c.execute(
+                "select direction, source, text from messages where (direction = 'in' and source = 'user') "
+                "or (direction = 'out' and source = 'chat') order by id desc limit ?",
+                (max_turns * 4,),
+            ).fetchall()
+        pairs: list[tuple[str, str]] = []
+        pending = None
+        for r in reversed(rows):
+            if r["direction"] == "in":
+                pending = r["text"]  # a newer message replaces one that got no reply
+            elif pending is not None:
+                pairs.append((pending, r["text"]))
+                pending = None
+        out: list[dict] = []
+        for user, reply in pairs[-max_turns:] if max_turns > 0 else []:
+            out += [{"role": "user", "content": user}, {"role": "assistant", "content": reply}]
+        return out
+
     def unseen_outbound(self) -> list[dict]:
         """Check-ins and reminders sent since the user last wrote (within 24h):
         the text conversation never saw these, so they ride along as context
@@ -509,6 +550,56 @@ class LifeStore:
                 (last_in, since),
             ).fetchall()
         return [dict(r) for r in rows]
+
+    # ---------------- area agent runs ----------------
+    # Written as the run goes (start, each verified change, finish), so a run
+    # cut off by a restart still shows what it had already changed.
+
+    def start_agent_run(self, area: str, task: str) -> int:
+        with self._db() as c:
+            cur = c.execute(
+                "insert into agent_runs (area, task, status, pid, started_at) values (?, ?, 'running', ?, ?)",
+                (area, task, os.getpid(), to_iso(utc_now())),
+            )
+            return int(cur.lastrowid)
+
+    def add_agent_change(self, run_id: int, change: str) -> None:
+        with self._db(write=True) as c:
+            row = c.execute("select changes from agent_runs where id = ?", (run_id,)).fetchone()
+            if row is None:
+                return
+            changes = json.loads(row["changes"] or "[]") + [change]
+            c.execute("update agent_runs set changes = ? where id = ?", (json.dumps(changes), run_id))
+
+    def finish_agent_run(self, run_id: int, report: str, rounds: int, cost: float) -> None:
+        with self._db() as c:
+            c.execute(
+                "update agent_runs set status = 'done', report = ?, rounds = ?, cost = ?, finished_at = ? "
+                "where id = ?",
+                (report, rounds, cost, to_iso(utc_now()), run_id),
+            )
+
+    def recent_agent_runs(self, area: str, limit: int = 3, days: int = 14, stale_after_s: float = 600) -> list[dict]:
+        """An area's latest runs, oldest first. A run still marked running
+        whose process is gone (a restart, a crash) or that is older than
+        stale_after_s (longer than any run may last) was cut off: it reports
+        as "interrupted"."""
+        since = to_iso(utc_now() - timedelta(days=days))
+        with self._db() as c:
+            rows = c.execute(
+                "select * from agent_runs where area = ? and started_at > ? order by id desc limit ?",
+                (area, since, limit),
+            ).fetchall()
+        out = []
+        for r in reversed(rows):
+            d = dict(r)
+            d["changes"] = json.loads(d["changes"] or "[]")
+            if d["status"] == "running" and (
+                not _alive(d["pid"]) or (utc_now() - from_iso(d["started_at"])).total_seconds() > stale_after_s
+            ):
+                d["status"] = "interrupted"
+            out.append(d)
+        return out
 
     # ---------------- overview ----------------
 
@@ -587,6 +678,20 @@ class LifeStore:
             src.close()
         tmp.replace(dest)
         return dest
+
+
+def _alive(pid) -> bool:
+    if not pid:
+        return False
+    if pid == os.getpid():
+        return True
+    try:
+        os.kill(int(pid), 0)  # signal 0: only asks whether the process exists
+    except ProcessLookupError:
+        return False
+    except (PermissionError, OSError):
+        return True
+    return True
 
 
 def _priority(value) -> int:

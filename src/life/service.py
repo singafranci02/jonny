@@ -26,6 +26,11 @@ from .telegram import TelegramClient, TelegramError, reminder_keyboard
 
 log = logging.getLogger("jarvis.life")
 
+# Durable turns (LangGraph's checkpoint-and-resume, done on life.db): work in
+# progress is checkpointed, and what a restart cut off is resumed on start.
+INFLIGHT = "inflight_turns"  # Telegram messages whose reply is being worked on
+RESUME_WINDOW = timedelta(minutes=20)  # older than this, just tell him instead
+
 HELP = (
     "I'm Jarvis. Tap the buttons below, or just text me.\n"
     "📋 Board: your projects by area. Tap one to move it or set its next step\n"
@@ -60,7 +65,18 @@ class LifeService:
         tiers = self.cfg["llm"]["tiers"]
         tier = lcfg.get("coordinator_tier", "coordinator")
         self.coordinator_tier = tier if tier in tiers else "hard"
-        self.text_convo = Conversation(self.cfg["llm"].get("max_history_turns", 10))
+        max_turns = self.cfg["llm"].get("max_history_turns", 10)
+        self.text_convo = Conversation(max_turns)
+        self._cut_off: list[dict] = []
+        try:
+            # the chat thread survives restarts: rebuilt from the message feed
+            self.text_convo.messages = self.store.thread_history(max_turns)
+            self._cut_off = self.store.get_setting(INFLIGHT) or []
+        except Exception as e:
+            log.warning("could not restore the chat thread: %s", e)
+        self._inflight: dict[str, dict] = {}
+        self._inflight_lock = asyncio.Lock()
+        self._running_checkins: set[str] = set()
         self.text_lock = asyncio.Lock()
         self.checkins = [
             CheckIn(
@@ -99,6 +115,7 @@ class LifeService:
         if self.tg:
             self._tasks.append(asyncio.ensure_future(self._poll_loop()))
             self._tasks.append(asyncio.ensure_future(self.announce_menu()))
+            self._tasks.append(asyncio.ensure_future(self.resume_cut_off()))
         self._tasks.append(asyncio.ensure_future(self._scheduler_loop()))
 
     async def stop(self) -> None:
@@ -121,8 +138,13 @@ class LifeService:
 
     # ---------------- text conversation (Telegram + dashboard) ----------------
 
-    def _note(self, channel: str, outside: list[dict]) -> str:
+    def _note(self, channel: str, outside: list[dict], resumed: bool = False) -> str:
         parts = []
+        if resumed:
+            parts.append(
+                "A restart cut off your first reply to this message; part of it may already be done. Check "
+                "life_overview before adding or changing anything so nothing is duplicated, then reply as normal."
+            )
         if outside:
             lines = [
                 f"- {'reminder' if m['source'] == 'reminder' else 'check-in'}: {m['text'][:600]}"
@@ -140,7 +162,7 @@ class LifeService:
         )
         return "\n\n".join(parts)
 
-    async def chat(self, text: str, channel: str = "telegram") -> str:
+    async def chat(self, text: str, channel: str = "telegram", resumed: bool = False) -> str:
         """One text turn with Jarvis on the coordinator tier. Serialised: the
         text conversation has a single history."""
         async with self.text_lock:
@@ -150,7 +172,7 @@ class LifeService:
                 text,
                 conversation=self.text_convo,
                 tier=self.coordinator_tier,
-                note=self._note(channel, outside),
+                note=self._note(channel, outside, resumed),
             )
             reply = resp.text
             await asyncio.to_thread(self.store.log_message, "out", "chat", reply)
@@ -258,14 +280,23 @@ class LifeService:
             await self.tg.send(chat_id, summary)
             return
 
+        await self._reply(chat_id, text, key=str(msg.get("message_id") or to_iso(utc_now())))
+
+    async def _reply(self, chat_id: int, text: str, key: str, resumed: bool = False) -> None:
+        """Answer a message through Jarvis. While the turn runs, the message
+        is checkpointed in life.db: if a restart cuts the turn off, the
+        checkpoint is still there when Jarvis starts again (resume_cut_off)."""
+        await self._checkpoint(key, {"key": key, "text": text, "at": to_iso(utc_now()), "resumed": resumed})
         typing = asyncio.ensure_future(self._keep_typing())
         try:
-            reply = await self.chat(text, "telegram")
+            reply = await self.chat(text, "telegram", resumed=resumed)
         except Exception as e:
             log.exception("chat turn failed")
             reply = f"Sorry, something went wrong on my side ({type(e).__name__}). Try again in a moment."
         finally:
             typing.cancel()
+        # skipped when a shutdown cancels the turn: the checkpoint stays
+        await self._checkpoint(key, None)
         try:
             await self.tg.send(chat_id, reply)  # retries transient failures itself
         except Exception as e:
@@ -273,6 +304,37 @@ class LifeService:
             await asyncio.to_thread(
                 self.store.log_message, "out", "system", f"(This reply couldn't be delivered to Telegram: {e})"
             )
+
+    async def _checkpoint(self, key: str, entry: dict | None) -> None:
+        async with self._inflight_lock:
+            if entry is None:
+                self._inflight.pop(key, None)
+            else:
+                self._inflight[key] = entry
+            await asyncio.to_thread(self.store.set_setting, INFLIGHT, list(self._inflight.values()))
+
+    async def resume_cut_off(self) -> None:
+        """Messages whose reply a restart cut off: answered now, once. If
+        that's too late (the Mac was off a while) or the retry was cut off
+        too, he gets one line instead of silence."""
+        cut_off, self._cut_off = self._cut_off, []
+        if not cut_off or not self.can_message():
+            return
+        for e in cut_off:
+            try:
+                fresh = utc_now() - from_iso(e["at"]) < RESUME_WINDOW
+                if fresh and not e.get("resumed"):
+                    log.info("resuming a reply cut off by a restart")
+                    await self._reply(self.owner_chat, e["text"], key=e["key"], resumed=True)
+                else:
+                    short = " ".join(e["text"].split())
+                    short = short if len(short) <= 60 else short[:59] + "…"
+                    await self.notify(f"A restart cut off my reply to \"{short}\". Send it again if it still matters.",
+                                      "system")
+            except Exception:
+                log.exception("could not resume a cut-off reply")
+        async with self._inflight_lock:  # drop leftovers the loop above didn't re-save
+            await asyncio.to_thread(self.store.set_setting, INFLIGHT, list(self._inflight.values()))
 
     async def _keep_typing(self) -> None:
         while True:
@@ -497,20 +559,38 @@ class LifeService:
                 # first run after install: start counting from now, don't fire late
                 await asyncio.to_thread(self.store.set_setting, key, to_iso(slot))
                 continue
+            running = f"checkin_running:{ci.key}"
+            if ci.key not in self._running_checkins:
+                cut = await asyncio.to_thread(self.store.get_setting, running)
+                if cut:
+                    # a restart cut this check-in off mid-run: run it again, once, if still in time
+                    await asyncio.to_thread(self.store.set_setting, running, None)
+                    if cut.get("attempt", 1) < 2 and utc_now() - from_iso(cut["slot"]) <= timedelta(
+                            minutes=ci.catch_up_min):
+                        log.info("resuming check-in %s cut off by a restart", ci.key)
+                        asyncio.ensure_future(self._run_checkin_safe(ci, cut["slot"], attempt=2))
+                        continue
             if last >= to_iso(slot):
                 continue
             await asyncio.to_thread(self.store.set_setting, key, to_iso(slot))
             if utc_now() - slot > timedelta(minutes=ci.catch_up_min):
                 log.info("skipped check-in %s: the Mac was off at %s", ci.key, slot)
                 continue
-            asyncio.ensure_future(self._run_checkin_safe(ci))
+            asyncio.ensure_future(self._run_checkin_safe(ci, to_iso(slot)))
 
-    async def _run_checkin_safe(self, ci: CheckIn) -> None:
+    async def _run_checkin_safe(self, ci: CheckIn, slot: str | None = None, attempt: int = 1) -> None:
+        running = f"checkin_running:{ci.key}"
+        self._running_checkins.add(ci.key)
+        await asyncio.to_thread(self.store.set_setting, running, {"slot": slot or to_iso(utc_now()), "attempt": attempt})
         try:
             await self.run_checkin(ci)
         except Exception as e:
             log.exception("check-in %s failed", ci.key)
             await self.notify(f"My {ci.label} check-in failed ({type(e).__name__}). I'll try again next time.", "system")
+        finally:
+            self._running_checkins.discard(ci.key)
+        # skipped when a shutdown cancels the run: the marker stays for the next start
+        await asyncio.to_thread(self.store.set_setting, running, None)
 
     async def run_checkin(self, ci: CheckIn) -> str:
         """A scheduled turn: a fresh conversation on the coordinator tier,
