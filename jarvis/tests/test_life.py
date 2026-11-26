@@ -549,7 +549,7 @@ def test_checkins_schedule_and_nothing(cfg, store, clock, monkeypatch):
     svc = _service(cfg, store, clock, monkeypatch, reply="Good morning. Three things today.")
     started = []
 
-    def fake_run(ci):  # records at call time; the scheduled task itself is a no-op
+    def fake_run(ci, *args, **kwargs):  # records at call time; the scheduled task itself is a no-op
         started.append(ci.key)
         return asyncio.sleep(0)
 
@@ -1065,3 +1065,126 @@ def test_checkin_buttons_and_delegate_contract(cfg, store, clock, monkeypatch):
     first = fake.requests[0]
     assert "YOUR REPORT MUST INCLUDE: the 3 sessions with days" in first["messages"][0]["content"]
     assert "Line 1: the answer" in first["system"][0]["text"] and "stage and next step" in first["system"][0]["text"]
+
+
+# ---------------------------------------------------------------- durable threads (LangGraph ideas)
+
+
+def test_chat_thread_survives_a_restart(cfg, store, clock, monkeypatch):
+    for direction, source, text in [
+        ("in", "user", "a"), ("out", "chat", "A"),
+        ("in", "user", "b"),  # its turn failed: no reply, dropped
+        ("out", "checkin", "How was today?"), ("in", "command", "/today"),
+        ("in", "user", "c"), ("out", "chat", "C"),
+    ]:
+        store.log_message(direction, source, text)
+    assert store.thread_history(10) == [
+        {"role": "user", "content": "a"}, {"role": "assistant", "content": "A"},
+        {"role": "user", "content": "c"}, {"role": "assistant", "content": "C"},
+    ]
+    assert [m["content"] for m in store.thread_history(1)] == ["c", "C"]
+    assert store.thread_history(0) == []
+    svc = _service(cfg, store, clock, monkeypatch)  # a fresh process: the thread is back
+    assert [m["content"] for m in svc.text_convo.messages] == ["a", "A", "c", "C"]
+
+
+def test_area_agent_thread_and_cut_off_runs(cfg, store, clock):
+    future = (clock.now() + timedelta(days=1)).strftime("%Y-%m-%dT%H:%M")
+    fake = FakeAnthropic([
+        _resp("tool_use", _block("tool_use", id="t1", name="life_add_reminder",
+                                 input={"text": "Long run", "due_at": future})),
+        _resp("end_turn", _block("text", text="Plan set: long run tomorrow.\nQuestion: morning or evening?")),
+        _resp("end_turn", _block("text", text="Moved to the morning.")),
+    ])
+    agents = _agents(cfg, store, clock, fake)
+    agents.run("fitness", "Plan my training week")
+    (run,) = store.recent_agent_runs("fitness")
+    assert run["status"] == "done" and run["rounds"] == 1 and "Long run" in run["changes"][0]
+    assert "Question: morning or evening?" in run["report"]
+
+    agents.run("fitness", "He says morning")  # the follow-up sees the earlier run
+    first = fake.requests[2]["messages"][0]["content"]
+    assert "YOUR RECENT RUNS" in first and "Plan my training week" in first
+    assert "Question: morning or evening?" in first and "Long run" in first
+    assert first.index("YOUR RECENT RUNS") < first.index("TASK FROM JARVIS:\nHe says morning")
+    assert "Verified changes" not in first  # the change list is shown once, as Changes
+    assert "Your last few runs" in fake.requests[2]["system"][0]["text"]
+    assert store.recent_agent_runs("work") == []  # threads are per area
+
+    # a run whose process died mid-way (a restart): reported as cut off, with its changes
+    cut = store.start_agent_run("health", "Book the dentist")
+    store.add_agent_change(cut, 'Reminder #9 "Dentist" set for Fri 09:00')
+    assert store.recent_agent_runs("health")[0]["status"] == "running"  # this process: still alive
+    with store._db() as c:
+        c.execute("update agent_runs set pid = null where id = ?", (cut,))
+    assert store.recent_agent_runs("health")[0]["status"] == "interrupted"
+    text = agents.recent_work(agents.by_id["health"])
+    assert "CUT OFF" in text and "Dentist" in text and "Book the dentist" in text
+    assert "remembers its last few runs" in agents.delegate_tool().description
+
+
+def test_cut_off_telegram_reply_is_resumed(cfg, store, clock, monkeypatch):
+    from src.life.service import INFLIGHT
+
+    svc = _service(cfg, store, clock, monkeypatch, reply="Week planned.")
+    asyncio.run(svc._on_message({"chat": {"id": 42}, "text": "hi", "message_id": 5}))
+    assert store.get_setting(INFLIGHT) == []  # a finished turn leaves no checkpoint
+
+    # a shutdown cancels a turn mid-way: its checkpoint stays behind
+    class Stuck(FakeSession):
+        async def turn(self, *a, **k):
+            await asyncio.Event().wait()
+
+    async def cut_off():
+        task = asyncio.ensure_future(svc._on_message({"chat": {"id": 42}, "text": "plan my week", "message_id": 6}))
+        await asyncio.sleep(0.05)
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    svc.session = Stuck(cfg, store, clock)
+    asyncio.run(cut_off())
+    (left,) = store.get_setting(INFLIGHT)
+    assert left["text"] == "plan my week" and left["resumed"] is False
+    stale = {"key": "1", "text": "an old question from before the Mac slept", "resumed": False,
+             "at": to_iso(utc_now() - timedelta(hours=3))}
+    store.set_setting(INFLIGHT, [left, stale])
+
+    svc = _service(cfg, store, clock, monkeypatch, reply="Week planned.")  # Jarvis starts again
+    asyncio.run(svc.resume_cut_off())
+    call = svc.session.calls[-1]
+    assert call["text"] == "plan my week" and "restart cut off your first reply" in call["note"]
+    sent = [t for _, t, _ in svc.tg.sent]
+    assert "Week planned." in sent
+    assert any(t.startswith('A restart cut off my reply to "an old question') for t in sent)
+    assert store.get_setting(INFLIGHT) == []
+    assert store.thread_history(5)[-2:] == [{"role": "user", "content": "plan my week"},
+                                             {"role": "assistant", "content": "Week planned."}]
+
+    # a retry that was cut off as well isn't tried a third time
+    store.set_setting(INFLIGHT, [{**left, "resumed": True}])
+    svc = _service(cfg, store, clock, monkeypatch)
+    n = len(svc.session.calls)
+    asyncio.run(svc.resume_cut_off())
+    assert len(svc.session.calls) == n and svc.tg.sent[-1][1].startswith("A restart cut off my reply")
+
+
+def test_cut_off_checkin_runs_again_once(cfg, store, clock, monkeypatch):
+    svc = _service(cfg, store, clock, monkeypatch, reply="Brief: two things.")
+    ci = svc.checkins[0]
+    slot = clock.last_slot(ci.time, ci.days)
+    store.set_setting(f"checkin_last:{ci.key}", to_iso(slot))  # this slot already started...
+    marker = f"checkin_running:{ci.key}"
+    store.set_setting(marker, {"slot": to_iso(utc_now() - timedelta(minutes=3)), "attempt": 1})  # ...and was cut off
+
+    async def tick():
+        await svc._due_checkins()
+        await asyncio.gather(*(t for t in asyncio.all_tasks() if t is not asyncio.current_task()))
+
+    asyncio.run(tick())
+    assert svc.tg.sent[-1][1] == "Brief: two things." and store.get_setting(marker) is None
+    asyncio.run(tick())
+    assert len(svc.tg.sent) == 1  # not again for the same slot
+
+    store.set_setting(marker, {"slot": to_iso(utc_now() - timedelta(minutes=3)), "attempt": 2})
+    asyncio.run(tick())
+    assert len(svc.tg.sent) == 1 and store.get_setting(marker) is None  # cut off twice: given up

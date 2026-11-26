@@ -9,11 +9,18 @@ which Jarvis relays to the user.
 
 Runs on the Mac with the Claude Messages API (its own small tool loop), so
 the file tools act directly on the iCloud folder.
+
+Each agent keeps a thread of its own (an idea from LangGraph, without the
+library): every run is recorded in life.db as it happens (task, each verified
+change, the report), and the agent's next run sees its last few. A follow-up
+("make Tuesday Wednesday", his answer to the agent's Question) continues the
+earlier work, and a run cut off by a restart is finished, not duplicated.
 """
 
 from __future__ import annotations
 
 import concurrent.futures
+import logging
 import time
 from pathlib import Path
 
@@ -34,6 +41,9 @@ MUTATING_TOOLS = frozenset({
     "ws_create_file", "ws_edit_file", "ws_move",
 })
 CHANGES_HEADER = "Verified changes:"
+RECENT_RUNS = 3  # how many of its own past runs an agent sees with each task
+
+log = logging.getLogger(__name__)
 
 
 def area_system(area: Area, owner: str, tz_name: str) -> str:
@@ -46,6 +56,8 @@ Your folder is "{area.folder}/" inside the Jarvis folder in iCloud Drive (it syn
 CONTEXT.md in your folder is your standing brief about this part of {owner}'s life; its current text comes with every task. When a task reveals something durable about this area (a goal, a routine, a preference, a person, an important date), add it to CONTEXT.md under the right heading with ws_edit_file. Never remove what {owner} wrote there.
 
 Your reminder, task and log tools only cover the {area.name} area. Time zone: {tz_name}; each task message states the current local time. Pass date-times as local "YYYY-MM-DDTHH:mm". Check life_overview before creating reminders or tasks so you don't duplicate existing ones.
+
+Your last few runs in this area come with each task. When the task follows up on one (an answer to your Question, a change to a plan you made), continue from it instead of starting over. If a run was cut off, check what it already changed before redoing anything.
 
 Projects on {owner}'s board that belong to your area are items of kind project, each with a stage (todo, doing, waiting) and one concrete next step. Keep them current: when your work moves a project, update its stage and next step; when a plan you write covers one, make its next step the first action of that plan.
 
@@ -129,6 +141,36 @@ class AreaAgents:
         except OSError:
             pass
 
+    # ---------------- the agent's thread ----------------
+
+    def _record(self, fn, *args):
+        """Run history is a help, never a blocker: a failed write is logged."""
+        try:
+            return fn(*args)
+        except Exception as e:
+            log.warning("agent run history: %s failed: %s", fn.__name__, e)
+            return None
+
+    def recent_work(self, area: Area) -> str:
+        runs = self._record(self.store.recent_agent_runs, area.id, RECENT_RUNS, 14, self.timeout_s + 120) or []
+        if not runs:
+            return ""
+        out = []
+        for r in runs:
+            head = f"[{self.clock.when(r['started_at'])}]"
+            task = _squash(r["task"], 300)
+            changes = "; ".join(_squash(c, 160) for c in r["changes"][:8])
+            if r["status"] == "interrupted":
+                out.append(f"{head} CUT OFF before finishing (a restart or crash). Task: {task}\n"
+                           f"Changes it made before the cut: {changes or 'none'}")
+                continue
+            if r["status"] == "running":
+                out.append(f"{head} still running in parallel. Task: {task}")
+                continue
+            prose = (r["report"] or "").split(f"\n\n{CHANGES_HEADER}")[0]
+            out.append(f"{head} Task: {task}\nYour report: {_squash(prose, 500)}\nChanges: {changes or 'none'}")
+        return "YOUR RECENT RUNS in this area (oldest first; for continuity, don't redo them):\n" + "\n\n".join(out)
+
     # ---------------- the subagent loop ----------------
 
     def run(self, area_id: str, task: str, expected_output: str | None = None) -> str:
@@ -139,6 +181,8 @@ class AreaAgents:
 
         started = time.monotonic()
         deadline = started + self.timeout_s
+        recent = self.recent_work(area)  # read before this run is recorded
+        run_id = self._record(self.store.start_agent_run, area.id, task)
         model_cfg = self.model_cfg()
         tools = self.tools_for(area)
         kwargs = {
@@ -160,7 +204,8 @@ class AreaAgents:
                 "content": (
                     f"CURRENT TIME: {self.clock.label_now()}\n\n"
                     f"YOUR CONTEXT.md ({area.folder}/CONTEXT.md):\n{read_context(self.cfg, area)}\n\n"
-                    f"TASK FROM JARVIS:\n{task}"
+                    + (f"{recent}\n\n" if recent else "")
+                    + f"TASK FROM JARVIS:\n{task}"
                     + (f"\n\nYOUR REPORT MUST INCLUDE: {expected_output}" if expected_output else "")
                 ),
             }
@@ -199,7 +244,9 @@ class AreaAgents:
             results = self._run_tools(tools, calls, deadline)
             for call, result in zip(calls, results):
                 if call.name in MUTATING_TOOLS and not result.get("is_error"):
-                    changes.append(" ".join(str(result["content"]).split())[:240])
+                    changes.append(_squash(result["content"], 240))
+                    if run_id is not None:  # saved now: survives a restart mid-run
+                        self._record(self.store.add_agent_change, run_id, changes[-1])
             messages.append({"role": "assistant", "content": resp.content})
             messages.append({"role": "user", "content": results})
 
@@ -210,6 +257,8 @@ class AreaAgents:
         report = text or f"The {area.name} agent finished without a report."
         report += f"\n\n{CHANGES_HEADER}" + ("".join(f"\n- {c}" for c in changes) if changes else " none.")
         self._log(area, task, report, rounds, cost, time.monotonic() - started)
+        if run_id is not None:
+            self._record(self.store.finish_agent_run, run_id, report, rounds, cost)
         return report
 
     def _run_tools(self, tools: list[Tool], calls, deadline: float) -> list[dict]:
@@ -259,7 +308,9 @@ class AreaAgents:
                 "the details that matter, what to report back. For several areas, call delegate once per area "
                 "in the same turn: they run in parallel. The report's first line is written for the user; "
                 f"its \"{CHANGES_HEADER}\" list is what really happened (taken from the agent's tools), so trust "
-                "it over the agent's wording and never tell the user about a change that isn't on it."
+                "it over the agent's wording and never tell the user about a change that isn't on it. Each agent "
+                "remembers its last few runs, so send a follow-up (his answer to its Question, a tweak to its "
+                "plan) back to the same agent and say which earlier work it refers to."
             ),
             parameters={
                 "type": "object",
@@ -283,3 +334,9 @@ class AreaAgents:
                 "and check life_overview before retrying so nothing gets duplicated."
             ),
         )
+
+
+def _squash(text, limit: int) -> str:
+    """One line, at most `limit` characters."""
+    flat = " ".join(str(text).split())
+    return flat if len(flat) <= limit else flat[: limit - 1] + "…"

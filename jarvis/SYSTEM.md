@@ -228,6 +228,14 @@ you (Telegram / voice / website) ──► Jarvis ── delegate (parallel) ─
   area agent, its own Messages-API tool loop on Sonnet 5.5 (tier `area`),
   and returns its report. Several delegations in one turn run in parallel.
   Each run is logged with its cost in `data/life_agents.log`.
+- **Memory that survives restarts** (ideas from LangGraph, without the
+  library): each area agent's runs are recorded in `agent_runs` as they
+  happen (task, every verified change, report), and the agent sees its last
+  3 with each new task, so follow-ups continue its earlier work. A run cut off
+  by a restart shows as cut off, with what it had already changed. The
+  Telegram chat thread is rebuilt from the `messages` table on start. A reply
+  or check-in that a restart cut off is run again once on start (within 20
+  minutes for a reply, the check-in's catch-up window for a check-in).
 - **Data** (`src/life/store.py`): reminders, tasks/goals/notes and logs live in
   `data/life.db`, a local SQLite file. It is never put in iCloud, because a
   synced live database corrupts; a nightly copy goes to `Jarvis/_backups/`.
