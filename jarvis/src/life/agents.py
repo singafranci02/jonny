@@ -27,6 +27,7 @@ from pathlib import Path
 from ..tools import Tool, run_tool
 from .areas import Area, read_context, workspace_root
 from .clock import Clock
+from .sources import Source, build_source_tools
 from .store import LifeStore
 from .tools import build_life_tools
 
@@ -46,14 +47,14 @@ RECENT_RUNS = 3  # how many of its own past runs an agent sees with each task
 log = logging.getLogger(__name__)
 
 
-def area_system(area: Area, owner: str, tz_name: str) -> str:
+def area_system(area: Area, owner: str, tz_name: str, projects: bool = False) -> str:
     return f"""You are the {area.name} agent in {owner}'s personal life organiser. Jarvis, the main assistant who talks to {owner}, hands you tasks about the {area.name} area and passes your report on.
 
 {area.focus}
 
 Your folder is "{area.folder}/" inside the Jarvis folder in iCloud Drive (it syncs to all of {owner}'s Macs). Your file tools work only inside it. Keep it organised: list it before creating files, use clear lowercase-with-dashes filenames, one file per plan or topic, subfolders for bigger topics (for example one per project), and update existing files instead of creating near-duplicates.
 
-CONTEXT.md in your folder is your standing brief about this part of {owner}'s life; its current text comes with every task. When a task reveals something durable about this area (a goal, a routine, a preference, a person, an important date), add it to CONTEXT.md under the right heading with ws_edit_file. Never remove what {owner} wrote there.
+CONTEXT.md in your folder is your standing brief about this part of {owner}'s life; its current text comes with every task. When a task reveals something durable about this area (a goal, a routine, a preference, a person, an important date), add it to CONTEXT.md under the right heading with ws_edit_file. Never remove what {owner} wrote there: when a fact stops being true, strike it through (~~old~~) and write the new one beside it, so the history stays.
 
 Your reminder, task and log tools only cover the {area.name} area. Time zone: {tz_name}; each task message states the current local time. Pass date-times as local "YYYY-MM-DDTHH:mm". Check life_overview before creating reminders or tasks so you don't duplicate existing ones.
 
@@ -61,11 +62,17 @@ Your last few runs in this area come with each task. When the task follows up on
 
 Projects on {owner}'s board that belong to your area are items of kind project, each with a stage (todo, doing, waiting) and one concrete next step. Keep them current: when your work moves a project, update its stage and next step; when a plan you write covers one, make its next step the first action of that plan.
 
-Do the task fully, then reply to Jarvis in this shape (plain text, no headings or tables):
+{_projects_line(owner) if projects else ""}Do the task fully, then reply to Jarvis in this shape (plain text, no headings or tables):
 Line 1: the answer for {owner} in one short sentence; Jarvis may pass it on word for word.
 Then, only if needed, up to 4 short lines of detail Jarvis needs.
 Last, only if something needs {owner}'s decision: "Question: ...".
 Don't list what you changed: a verified list of your changes is attached to your report automatically."""
+
+
+def _projects_line(owner: str) -> str:
+    return (f"Some of {owner}'s projects live outside your folder, in their own folders and GitHub repos. "
+            "project_list, project_activity and project_read read them (never change them). Check them before "
+            "saying where a project stands, and quote dates and owners from the source, not from memory.\n\n")
 
 
 class AreaAgents:
@@ -77,6 +84,7 @@ class AreaAgents:
         areas: list[Area],
         base_tools: list[Tool],
         log_path: Path,
+        sources: list[Source] | None = None,
     ):
         self.cfg = cfg
         self.store = store
@@ -85,6 +93,7 @@ class AreaAgents:
         self.by_id = {a.id: a for a in areas}
         self.base_tools = base_tools
         self.log_path = log_path
+        self.sources = sources or []
         lcfg = cfg.get("life", {}) or {}
         self.owner = lcfg.get("owner", "the user")
         self.tier_name = lcfg.get("area_tier", "area")
@@ -116,6 +125,7 @@ class AreaAgents:
         return [
             *workspace.build(area_cfg),  # confined to this area's folder
             *build_life_tools(self.store, self.clock, self.areas, fixed=area),
+            *build_source_tools(self.sources, area),  # read-only: this area's projects only
             *shared,
         ]
 
@@ -191,7 +201,8 @@ class AreaAgents:
             "system": [
                 {
                     "type": "text",
-                    "text": area_system(area, self.owner, self.clock.tz_name),
+                    "text": area_system(area, self.owner, self.clock.tz_name,
+                                        projects=any(t.name == "project_list" for t in tools)),
                     "cache_control": {"type": "ephemeral"},
                 }
             ],
