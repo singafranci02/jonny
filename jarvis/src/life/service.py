@@ -126,8 +126,13 @@ class LifeService:
             ]
             parts.append("Since your last exchange, the user was sent:\n" + "\n".join(lines))
         parts.append(
-            f"[{self.clock.label_now()}] Channel: {channel} (text, not voice). Short lines are fine, and "
-            "up to about 10 lines when relaying a plan or summary. Plain text, no markdown."
+            f"[{self.clock.label_now()}] Channel: {channel} (text chat, not voice). Text like a person "
+            "in a chat: one short line, a few words when that's enough. A capture gets a terse receipt "
+            "(\"Logged: 5 km run, 9:42/km.\", \"Done. Sunday 18:00.\"). Never restate his message, explain "
+            "a conversion or offer alternatives. If something could be read two ways, take the obvious "
+            "reading and move on: he corrects you if needed. Don't ask for anything he didn't bring up "
+            "unless you can't act without it. Longer only for a plan or summary he asked for, and then "
+            "at most 6 short lines. Plain text, no markdown."
         )
         return "\n\n".join(parts)
 
@@ -359,7 +364,8 @@ class LifeService:
             tier=self.coordinator_tier,
             note=(
                 f"[{self.clock.label_now()}] Automated check-in: nobody is waiting on a live reply. Your "
-                "reply text is sent to the user on Telegram as one message. Plain text, short lines, no "
+                "reply text is sent to the user on Telegram as one message, like a text from a friend: "
+                "as few words as possible, no greeting or sign-off, skip anything empty. Plain text, no "
                 "markdown. Reply with just NOTHING if there is genuinely nothing worth sending."
             ),
             learn=False,
