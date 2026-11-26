@@ -126,6 +126,47 @@ def ensure_folders(cfg: dict) -> dict:
     return {"root": str(root), "created": created}
 
 
+PROJECT_TEMPLATE = """# {title}: project brief
+
+The {area} agent reads this with every task about this project and keeps it
+current. Edit it any time. Concrete tasks live on the project's tracker
+(Telegram: Board, then the project), not here.
+
+## What it is
+-
+
+## Where it stands
+-
+
+## Decisions
+-
+
+## Next
+-
+"""
+
+
+def project_folder_name(title: str) -> str:
+    """A safe folder name for a project title ("YardBird", "Jarvis website")."""
+    import re
+
+    name = re.sub(r"[^\w .&()-]+", "", title, flags=re.UNICODE).strip(" .")
+    return " ".join(name.split())[:60] or "Project"
+
+
+def ensure_project_folder(cfg: dict, area: Area, project: dict) -> tuple[str, str]:
+    """The project's folder inside its area's (created with a brief on first
+    use; never overwritten). Returns (folder name, CONTEXT.md text)."""
+    name = project.get("folder") or project_folder_name(project["title"])
+    folder = workspace_root(cfg) / area.folder / name
+    folder.mkdir(parents=True, exist_ok=True)
+    ctx = folder / "CONTEXT.md"
+    if not ctx.exists():
+        ctx.write_text(PROJECT_TEMPLATE.format(title=project["title"], area=area.name))
+    text = ctx.read_text()
+    return name, (text if len(text) <= 12000 else text[:12000] + "\n…(truncated)")
+
+
 def read_context(cfg: dict, area: Area, limit: int = 12000) -> str:
     p = workspace_root(cfg) / area.folder / "CONTEXT.md"
     try:

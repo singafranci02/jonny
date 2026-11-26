@@ -30,14 +30,29 @@ log = logging.getLogger("jarvis.life")
 # progress is checkpointed, and what a restart cut off is resumed on start.
 INFLIGHT = "inflight_turns"  # Telegram messages whose reply is being worked on
 RESUME_WINDOW = timedelta(minutes=20)  # older than this, just tell him instead
+STRAVA_EVERY = timedelta(minutes=30)
+STRAVA_SETUP = (
+    "Strava needs a free API app first (2 minutes):\n"
+    "1. strava.com/settings/api: create an app. Category: Training. Website: anything. "
+    "Authorization Callback Domain: localhost\n"
+    "2. Put its Client ID and Client Secret in Jarvis's .env on the Mac mini as STRAVA_CLIENT_ID and "
+    "STRAVA_CLIENT_SECRET, then make install-web\n"
+    "3. Send /strava again."
+)
+STRAVA_CONNECT = (
+    "Tap Connect Strava and approve. You'll land on a page that won't load: that's expected. "
+    "Copy its address (it starts with http://localhost/exchange_token) and send it to me here."
+)
 
 HELP = (
     "I'm Jarvis. Tap the buttons below, or just text me.\n"
-    "📋 Board: your projects by area. Tap one to move it or set its next step\n"
+    "📋 Board: your projects by area. Tap one for its tracker; tap a task to tick it off\n"
     "➕ Add: a new project\n"
     "📅 Today: what's on\n"
-    "📝 Log: sleep, mood, training in one tap\n\n"
-    "Text works too: \"remind me to call mum Sunday 6pm\", \"plan my training week\""
+    "📝 Log: sleep, mood, training in one tap\n"
+    "/strava: connect Strava, so workouts log themselves\n\n"
+    "Text works too: \"remind me to call mum Sunday 6pm\", \"plan my training week\", "
+    "\"work on YardBird: draft the founder contributions note\""
 )
 
 
@@ -261,6 +276,9 @@ class LifeService:
             await self.tg.send(chat_id, HELP, board.menu_keyboard())
             await asyncio.to_thread(self.store.set_setting, "menu_version", board.MENU_VERSION)
             return
+        if text.startswith("/strava") or self._strava() and self._strava().looks_like_callback(text):
+            await self._on_strava(chat_id, text)
+            return
         if text == board.MENU_BOARD or text.startswith("/board"):
             await self.send_board(chat_id)
             return
@@ -336,6 +354,53 @@ class LifeService:
         async with self._inflight_lock:  # drop leftovers the loop above didn't re-save
             await asyncio.to_thread(self.store.set_setting, INFLIGHT, list(self._inflight.values()))
 
+    def _strava(self):
+        return getattr(self.life, "strava", None)
+
+    async def _on_strava(self, chat_id: int, text: str) -> None:
+        """/strava connects (or reports and syncs); the pasted localhost
+        address from Strava's consent page finishes connecting."""
+        strava = self._strava()
+        if strava is None:
+            await self.tg.send(chat_id, "Strava isn't available here.")
+            return
+        if not strava.keys():
+            await self.tg.send(chat_id, STRAVA_SETUP)
+            return
+        if strava.looks_like_callback(text):
+            try:
+                name = await asyncio.to_thread(strava.finish_connect, text)
+                summary = await asyncio.to_thread(strava.sync)
+            except Exception as e:
+                await self.tg.send(chat_id, f"Strava didn't connect: {e}")
+                return
+            await asyncio.to_thread(self.store.log_message, "in", "command", "/strava (connected)")
+            await self.tg.send(chat_id, f"Strava connected, {name}. {summary.splitlines()[0]}")
+            return
+        await asyncio.to_thread(self.store.log_message, "in", "command", "/strava")
+        if strava.tokens() and "connect" not in text:
+            try:
+                summary = await asyncio.to_thread(strava.sync)
+            except Exception as e:
+                summary = f"Sync failed: {e}"
+            await self.tg.send(chat_id, f"{summary.splitlines()[0]} (/strava connect to link again)")
+            return
+        url = await asyncio.to_thread(strava.connect_url)
+        await self.tg.send(chat_id, STRAVA_CONNECT, {"inline_keyboard": [[{"text": "Connect Strava", "url": url}]]})
+
+    async def _maybe_sync_strava(self) -> None:
+        strava = self._strava()
+        if strava is None or not strava.connected():
+            return
+        last = await asyncio.to_thread(self.store.get_setting, "strava_last_sync")
+        if last and utc_now() - from_iso(last) < STRAVA_EVERY:
+            return
+        try:
+            await asyncio.to_thread(strava.sync)
+        except Exception as e:  # quiet: the next sweep tries again
+            log.warning("strava sync failed: %s", e)
+            await asyncio.to_thread(self.store.set_setting, "strava_last_sync", to_iso(utc_now()))
+
     async def _keep_typing(self) -> None:
         while True:
             await self.tg.typing(self.owner_chat)
@@ -350,7 +415,7 @@ class LifeService:
         action, _, rest = (q.get("data") or "").partition(":")
         if action in ("done", "snooze"):
             await self._on_reminder_button(q, message, chat_id, action, rest)
-        elif action in ("bd", "pj", "ps", "pn", "pa", "pc", "lg"):
+        elif action in ("bd", "pj", "ps", "pn", "pa", "pc", "lg", "tk"):
             try:
                 await self._on_board_button(q, message, chat_id, action, rest)
             except Exception:
@@ -402,10 +467,18 @@ class LifeService:
     def _area(self, area_id: str | None):
         return next((a for a in self.areas if a.id == area_id), None)
 
-    async def send_board(self, chat_id: int) -> None:
+    async def _board_view(self, area_id: str | None = None) -> tuple[str, dict]:
         projects = await asyncio.to_thread(self.store.projects)
-        text, keyboard = board.board_view(projects, self.areas)
-        await self.tg.send(chat_id, text, keyboard)
+        counts = await asyncio.to_thread(self.store.task_counts)
+        return board.board_view(projects, self.areas, area_id, counts)
+
+    async def _card(self, item: dict) -> tuple[str, dict]:
+        """A project card with its tracker (open tasks, and the last 3 days' ticks)."""
+        tasks = await asyncio.to_thread(self.store.project_tasks, item["id"], 3)
+        return board.project_card(item, self._area(item["area"]), tasks)
+
+    async def send_board(self, chat_id: int) -> None:
+        await self.tg.send(chat_id, *(await self._board_view()))
 
     async def _ask_input(self, chat_id: int, pending: dict, prompt: str, placeholder: str) -> None:
         """Ask for typed text with a force-reply prompt; the reply to that
@@ -424,7 +497,7 @@ class LifeService:
             if item is None:
                 await self.tg.send(chat_id, "That project no longer exists.")
                 return True
-            await self.tg.send(chat_id, *board.project_card(item, self._area(item["area"])))
+            await self.tg.send(chat_id, *(await self._card(item)))
         elif pending["kind"] == "new_project":
             title = " ".join(text.split())[:120]
             if pending.get("area") and self._area(pending["area"]):
@@ -436,7 +509,7 @@ class LifeService:
 
     async def _create_project(self, chat_id: int, area_id: str, title: str, message_id: int | None = None) -> None:
         item = await asyncio.to_thread(self.store.add_item, area_id, "project", title)
-        text, keyboard = board.project_card(item, self._area(area_id))
+        text, keyboard = await self._card(item)
         if message_id is None:
             await self.tg.send(chat_id, text, keyboard)
         else:
@@ -458,10 +531,22 @@ class LifeService:
         mid = message.get("message_id")
         first, _, second = rest.partition(":")
         if action == "bd":
-            projects = await asyncio.to_thread(self.store.projects)
             area = first if self._area(first) else None
             await self.tg.answer_callback(q["id"])
-            await self.tg.edit_text(chat_id, mid, *board.board_view(projects, self.areas, area))
+            await self.tg.edit_text(chat_id, mid, *(await self._board_view(area)))
+            return
+        if action == "tk":
+            task = await asyncio.to_thread(self.store.get_item, int(first)) if first.isdigit() else None
+            parent = await asyncio.to_thread(self.store.get_item, task["parent_id"]) if task and task.get("parent_id") else None
+            if parent is None:
+                await self.tg.answer_callback(q["id"], "That task is no longer on a tracker.")
+                return
+            if task["status"] == "open":
+                await asyncio.to_thread(lambda: self.store.update_item(task["id"], status="done"))
+                await asyncio.to_thread(self.store.log_message, "in", "button", f"☑ {task['title']} ({parent['title']})",
+                                        parent["area"])
+            await self.tg.answer_callback(q["id"], f"☑ {task['title'][:60]}")
+            await self.tg.edit_text(chat_id, mid, *(await self._card(parent)))
             return
         if action == "pa":
             await self.tg.answer_callback(q["id"])
@@ -508,7 +593,7 @@ class LifeService:
             await self.tg.answer_callback(q["id"], label)
         else:
             await self.tg.answer_callback(q["id"])
-        await self.tg.edit_text(chat_id, mid, *board.project_card(item, self._area(item["area"])))
+        await self.tg.edit_text(chat_id, mid, *(await self._card(item)))
 
     # ---------------- scheduler ----------------
 
@@ -519,6 +604,7 @@ class LifeService:
                 await asyncio.to_thread(self.store.set_setting, "scheduler_last_sweep", to_iso(utc_now()))
                 await self._due_checkins()
                 await self._maybe_backup()
+                await self._maybe_sync_strava()
             except asyncio.CancelledError:
                 raise
             except Exception:
