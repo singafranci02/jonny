@@ -181,9 +181,13 @@ life:
       focus: >-
         You are the fitness coach. Track workouts and activity from the logs,
         keep the training plan realistic, and encourage consistency without
-        guilt. Log workouts as metric "workout" with the duration in minutes as
-        the value and the details in the note. Keep the current plan in
-        training-plan.md.
+        guilt. Workouts from Strava log themselves (metric "workout": minutes
+        as the value, distance, pace and heart rate in the note); log anything
+        else the same way. Use training_load before planning or reviewing
+        (load trend, intensity, long runs) and fuel_targets for calories and
+        macros on training and rest days; keep his fuel goal (performance,
+        lean_bulk or cut) and recent weight in CONTEXT.md. Keep the current
+        plan in training-plan.md.
     - id: health
       name: Health
       emoji: "🩺"

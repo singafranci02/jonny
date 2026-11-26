@@ -25,10 +25,11 @@ import time
 from pathlib import Path
 
 from ..tools import Tool, run_tool
-from .areas import Area, read_context, workspace_root
+from .areas import Area, ensure_project_folder, read_context, workspace_root
 from .clock import Clock
 from .sources import Source, build_source_tools
 from .store import LifeStore
+from .strava import build_strava_tools
 from .tools import build_life_tools
 
 # Read-mostly helpers every area agent may use, taken from Jarvis's own tools.
@@ -62,6 +63,8 @@ Your last few runs in this area come with each task. When the task follows up on
 
 Projects on {owner}'s board that belong to your area are items of kind project, each with a stage (todo, doing, waiting) and one concrete next step. Keep them current: when your work moves a project, update its stage and next step; when a plan you write covers one, make its next step the first action of that plan.
 
+When a task names one of your projects, you get its own folder, its brief (CONTEXT.md in that folder) and its tracker (the project's tasks). Then you work on that project for {owner}: research, plans, drafts, documents, decisions; whatever the task asks, done properly. Save what you make in the project's folder. Keep the brief current (what it is, where it stands, decisions, next) and the tracker as the list of concrete tasks: add them with life_add_item (kind task, project = its id, a due date when there is one), tick them off with life_update_item (status done), and keep the project's next step equal to the most important open task.
+
 {_projects_line(owner) if projects else ""}Do the task fully, then reply to Jarvis in this shape (plain text, no headings or tables):
 Line 1: the answer for {owner} in one short sentence; Jarvis may pass it on word for word.
 Then, only if needed, up to 4 short lines of detail Jarvis needs.
@@ -94,6 +97,7 @@ class AreaAgents:
         self.base_tools = base_tools
         self.log_path = log_path
         self.sources = sources or []
+        self.strava = None  # set by make_context; its tools go to the Strava area's agent
         lcfg = cfg.get("life", {}) or {}
         self.owner = lcfg.get("owner", "the user")
         self.tier_name = lcfg.get("area_tier", "area")
@@ -126,6 +130,7 @@ class AreaAgents:
             *workspace.build(area_cfg),  # confined to this area's folder
             *build_life_tools(self.store, self.clock, self.areas, fixed=area),
             *build_source_tools(self.sources, area),  # read-only: this area's projects only
+            *(build_strava_tools(self.strava) if self.strava and self.strava.area == area.id else []),
             *shared,
         ]
 
@@ -183,10 +188,40 @@ class AreaAgents:
 
     # ---------------- the subagent loop ----------------
 
-    def run(self, area_id: str, task: str, expected_output: str | None = None) -> str:
+    def project_block(self, area: Area, project) -> str:
+        """Everything about one project for the agent: card, tracker, folder
+        and brief. Creates the folder and brief the first time."""
+        p = self.store.find_project(project, area.id)
+        if p is None:
+            raise ValueError(f"no {area.name} project {project!r} on the board")
+        name, brief = ensure_project_folder(self.cfg, area, p)
+        if p.get("folder") != name:
+            self.store.update_item(p["id"], folder=name)
+        tasks = self.store.project_tasks(p["id"], done_days=14)
+        stage = "done" if p["status"] == "done" else p.get("stage") or "todo"
+        lines = [f"PROJECT #{p['id']} {p['title']} ({stage}). Next step: {p.get('next_step') or 'none set'}"
+                 + (f". Due {p['due_date']}" if p.get("due_date") else "") + "."]
+        lines.append(f"Its folder: {name}/ (save this project's files there). Its brief: {name}/CONTEXT.md.")
+        if tasks:
+            lines.append("Its tracker:")
+            for t in tasks:
+                mark = "open" if t["status"] == "open" else "done"
+                lines.append(f"- #{t['id']} [{mark}] {t['title']}" + (f" (due {t['due_date']})" if t.get("due_date") else ""))
+        else:
+            lines.append("Its tracker is empty.")
+        lines.append(f"\nITS BRIEF ({name}/CONTEXT.md):\n{brief}")
+        return "\n".join(lines)
+
+    def run(self, area_id: str, task: str, expected_output: str | None = None, project=None) -> str:
         area = self.by_id.get(area_id)
         if area is None:
             return f"unknown area '{area_id}'; use one of: {', '.join(self.by_id)}"
+        project_text = ""
+        if project not in (None, ""):
+            try:
+                project_text = self.project_block(area, project)
+            except (ValueError, OSError) as e:
+                return f"Couldn't open the project: {e}. Check the board (life_overview) for its id and area."
         from ..llm.anthropic_client import request_options
 
         started = time.monotonic()
@@ -216,6 +251,7 @@ class AreaAgents:
                     f"CURRENT TIME: {self.clock.label_now()}\n\n"
                     f"YOUR CONTEXT.md ({area.folder}/CONTEXT.md):\n{read_context(self.cfg, area)}\n\n"
                     + (f"{recent}\n\n" if recent else "")
+                    + (f"{project_text}\n\n" if project_text else "")
                     + f"TASK FROM JARVIS:\n{task}"
                     + (f"\n\nYOUR REPORT MUST INCLUDE: {expected_output}" if expected_output else "")
                 ),
@@ -321,13 +357,20 @@ class AreaAgents:
                 f"its \"{CHANGES_HEADER}\" list is what really happened (taken from the agent's tools), so trust "
                 "it over the agent's wording and never tell the user about a change that isn't on it. Each agent "
                 "remembers its last few runs, so send a follow-up (his answer to its Question, a tweak to its "
-                "plan) back to the same agent and say which earlier work it refers to."
+                "plan) back to the same agent and say which earlier work it refers to. When the work is about "
+                "one board project, pass project: the agent then works in that project's folder and keeps its "
+                "brief and tracker."
             ),
             parameters={
                 "type": "object",
                 "properties": {
                     "area": {"type": "string", "enum": [a.id for a in self.areas]},
                     "task": {"type": "string"},
+                    "project": {
+                        "type": "string",
+                        "description": "optional: the board project this is about (its id or exact title). The "
+                                       "agent then works inside that project's own folder, brief and tracker.",
+                    },
                     "expected_output": {
                         "type": "string",
                         "description": 'optional: what the report must contain, e.g. "the 3 sessions with days '
@@ -336,7 +379,7 @@ class AreaAgents:
                 },
                 "required": ["area", "task"],
             },
-            func=lambda area, task, expected_output=None: self.run(area, task, expected_output),
+            func=lambda area, task, expected_output=None, project=None: self.run(area, task, expected_output, project),
             # run() returns by its own deadline; this outer wait is the backstop
             timeout=self.timeout_s + 60,
             timeout_message=(

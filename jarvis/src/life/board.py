@@ -9,6 +9,7 @@ Callback data (Telegram caps it at 64 bytes):
   pj:<id>         open a project card
   ps:<id>:<stage> set todo / doing / waiting, or done
   pn:<id>         ask for a new next step (force-reply)
+  tk:<id>         tick a task on a project's tracker done (the card refreshes)
   pa:<area|>      start a new project (force-reply for its name)
   pc:<area>       file the pending new project under an area
   lg:<key>:<val>  log today's sleep / mood / training
@@ -58,13 +59,18 @@ def _short_date(iso: str | None) -> str:
     return f"{d.day} {d:%b}"
 
 
-def project_line(p: dict) -> str:
+def _project_line(p: dict, tasks: int = 0) -> str:
     line = f"{STAGE_ICON[stage_of(p)]} {p['title']}"
     if p.get("next_step"):
         line += f" → {p['next_step']}"
     if p.get("due_date"):
         line += f" · {_short_date(p['due_date'])}"
+    if tasks:
+        line += f" · {tasks} task{'s' if tasks != 1 else ''}"
     return line
+
+
+project_line = _project_line
 
 
 def _rows(buttons: list[dict], per_row: int) -> list[list[dict]]:
@@ -75,8 +81,15 @@ def _btn(text: str, data: str) -> dict:
     return {"text": text, "callback_data": data[:64]}
 
 
-def board_view(projects: list[dict], areas: list, area_id: str | None = None) -> tuple[str, dict]:
-    """The whole board (area_id None) or one area's list, plus its buttons."""
+def board_view(projects: list[dict], areas: list, area_id: str | None = None,
+               counts: dict[int, int] | None = None) -> tuple[str, dict]:
+    """The whole board (area_id None) or one area's list, plus its buttons.
+    counts: open tracker tasks per project id."""
+    counts = counts or {}
+
+    def project_line(p: dict) -> str:
+        return _project_line(p, counts.get(p["id"], 0))
+
     by_area = {a.id: [p for p in projects if p["area"] == a.id] for a in areas}
     if area_id and area_id in by_area:
         area = next(a for a in areas if a.id == area_id)
@@ -105,12 +118,28 @@ def board_view(projects: list[dict], areas: list, area_id: str | None = None) ->
     return text, {"inline_keyboard": keyboard}
 
 
-def project_card(p: dict, area) -> tuple[str, dict]:
+TASKS_SHOWN = 8  # tracker lines on a card; the first TASK_BUTTONS get a tick button
+TASK_BUTTONS = 5
+
+
+def project_card(p: dict, area, tasks: list[dict] | None = None) -> tuple[str, dict]:
+    """A project with its stage buttons and its tracker (open tasks first,
+    then ones ticked off lately)."""
     stage = stage_of(p)
     lines = [f"{area.emoji if area else ''} {p['title']}".strip(), f"{STAGE_ICON[stage]} {STAGE_NAME[stage]}"]
     lines.append(f"Next: {p['next_step']}" if p.get("next_step") else "Next: (none yet)")
     if p.get("due_date"):
         lines.append(f"Due: {_short_date(p['due_date'])}")
+    tasks = tasks or []
+    open_tasks = [t for t in tasks if t["status"] == "open"]
+    if tasks:
+        lines.append("")
+        lines.append(f"Tracker ({len(open_tasks)} open)")
+        for t in tasks[:TASKS_SHOWN]:
+            mark = "☐" if t["status"] == "open" else "☑"
+            lines.append(f"{mark} {t['title']}" + (f" · {_short_date(t['due_date'])}" if t.get("due_date") else ""))
+        if len(tasks) > TASKS_SHOWN:
+            lines.append(f"… and {len(tasks) - TASKS_SHOWN} more")
     pid = p["id"]
 
     def stage_btn(s: str) -> dict:
@@ -124,6 +153,8 @@ def project_card(p: dict, area) -> tuple[str, dict]:
             [stage_btn("todo"), stage_btn("doing"), stage_btn("waiting")],
             [_btn("✅ Done", f"ps:{pid}:done"), _btn("✏️ Next step", f"pn:{pid}")],
         ]
+    if stage != "done":
+        rows = [[_btn(f"☐ {t['title'][:40]}", f"tk:{t['id']}")] for t in open_tasks[:TASK_BUTTONS]] + rows
     back = area.name if area else "Board"
     rows.append([_btn(f"◀ {back}", f"bd:{p['area']}")])
     return "\n".join(lines), {"inline_keyboard": rows}

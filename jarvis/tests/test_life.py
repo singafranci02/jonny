@@ -1325,3 +1325,195 @@ def test_area_agents_get_their_own_projects(cfg, store, clock, tmp_path):
     agents.run("projects", "where is the site at?")
     system = fake.requests[1]["system"][0]["text"]
     assert "project_list, project_activity and project_read" in system and "strike it through" in system
+
+
+# ---------------------------------------------------------------- project trackers + folders
+
+
+def test_project_trackers(cfg, store, clock, monkeypatch):
+    p = store.add_item("work", "project", "YardBird", stage="doing")
+    other = store.add_item("fitness", "project", "Marathon")
+    t1 = store.add_item("health", "task", "Agree contributions", due_date="2026-11-15", parent_id=p["id"])
+    assert t1["area"] == "work" and t1["parent_id"] == p["id"]  # a tracker task lives in its project's area
+    t2 = store.add_item("work", "task", "Taste samples", parent_id=p["id"])
+    with pytest.raises(ValueError):
+        store.add_item("work", "task", "x", parent_id=t1["id"])  # only projects have trackers
+    assert [t["title"] for t in store.project_tasks(p["id"])] == ["Agree contributions", "Taste samples"]
+    assert store.task_counts() == {p["id"]: 2}
+    assert store.find_project("yardbird")["id"] == p["id"] and store.find_project(f"#{p['id']}")["id"] == p["id"]
+    assert store.find_project("YardBird", area="fitness") is None
+    store.update_item(t2["id"], status="done")
+    assert [t["title"] for t in store.project_tasks(p["id"], done_days=3)] == ["Agree contributions", "Taste samples"]
+    assert store.task_counts() == {p["id"]: 1}
+    store.update_item(p["id"], area="health")  # moving a project moves its tracker
+    assert store.get_item(t1["id"])["area"] == "health"
+    store.update_item(p["id"], area="work")
+    store.update_item(t1["id"], parent_id=None)
+    assert store.task_counts() == {}
+    assert store.overview()["open_items"][0].get("project") is None
+
+    areas = load_areas(cfg)
+    fit = {t.name: t for t in build_life_tools(store, clock, areas, fixed=areas[1])}  # the fitness agent
+    out, err = run_tool(list(fit.values()), "life_add_item", {"kind": "task", "title": "x", "project": p["id"]})
+    assert err and "belongs to" in out  # another area's project: refused
+    out, err = run_tool(list(fit.values()), "life_add_item",
+                        {"kind": "task", "title": "Long run Sunday", "project": other["id"]})
+    assert not err and "on project" in out and "Marathon" in out
+    jarvis = build_life_tools(store, clock, areas)
+    out, err = run_tool(jarvis, "life_add_item", {"area": "work", "kind": "task", "title": "Ring Matthew",
+                                                  "project": "YardBird"})
+    assert not err, out
+    assert store.project_tasks(p["id"])[-1]["title"] == "Ring Matthew"
+
+    # Telegram: the card shows the tracker and a tap ticks a task off
+    from src.life import board
+
+    tasks = store.project_tasks(p["id"], done_days=3)
+    text, kb = board.project_card(store.get_item(p["id"]), areas[0], tasks)
+    assert "Tracker (1 open)" in text and "☐ Ring Matthew" in text and "☑ Taste samples" in text
+    assert _buttons(kb)[f"tk:{tasks[0]['id']}"] == "☐ Ring Matthew"
+    text, _ = board.board_view(store.projects(), areas, None, store.task_counts())
+    assert "YardBird → " not in text and "· 1 task" in text
+
+    svc = _service(cfg, store, clock, monkeypatch)
+    ring = store.project_tasks(p["id"])[0]
+    q = {"id": "cb", "data": f"tk:{ring['id']}", "message": {"chat": {"id": 42}, "message_id": 9}}
+    asyncio.run(svc._on_button(q))
+    assert store.get_item(ring["id"])["status"] == "done" and svc.tg.answers[-1].startswith("☑ Ring Matthew")
+    assert "Tracker (0 open)" in svc.tg.edits[-1] and "☑ Ring Matthew" in svc.tg.edits[-1]
+
+
+def test_delegating_a_project_gives_its_folder_brief_and_tracker(cfg, store, clock):
+    p = store.add_item("work", "project", "Yard/Bird: v2", stage="doing", next_step="Agree contributions")
+    store.add_item("work", "task", "Agree contributions", due_date="2026-11-15", parent_id=p["id"])
+    fake = FakeAnthropic([_resp("end_turn", _block("text", text="Drafted."))] * 2)
+    agents = _agents(cfg, store, clock, fake)
+    report = agents.run("work", "Draft the founder note", project=str(p["id"]))
+    assert report.startswith("Drafted.")
+    root = Path(cfg["workspace"]["path"]) / "Work"
+    folder = store.get_item(p["id"])["folder"]
+    assert folder == "YardBird v2" and (root / folder / "CONTEXT.md").read_text().startswith("# Yard/Bird: v2: project brief")
+    first = fake.requests[0]["messages"][0]["content"]
+    assert f"PROJECT #{p['id']} Yard/Bird: v2 (doing)" in first and "Agree contributions (due 2026-11-15)" in first
+    assert "ITS BRIEF (YardBird v2/CONTEXT.md)" in first
+    assert first.index("PROJECT #") < first.index("TASK FROM JARVIS")
+    assert "you get its own folder" in fake.requests[0]["system"][0]["text"]
+    (root / folder / "CONTEXT.md").write_text("# mine")  # his edits are never overwritten
+    agents.run("work", "again", project="yard/bird: v2")
+    assert "# mine" in fake.requests[1]["messages"][0]["content"]
+    assert "Couldn't open the project" in agents.run("fitness", "x", project=str(p["id"]))  # wrong area
+    assert "project" in agents.delegate_tool().parameters["properties"]
+
+
+# ---------------------------------------------------------------- strava (ported from MacroClaw)
+
+
+class FakeStravaHTTP:
+    def __init__(self, activities):
+        self.activities = activities
+        self.posts, self.gets = [], []
+
+    def post(self, url, data=None):
+        self.posts.append(data)
+        body = {"access_token": f"acc{len(self.posts)}", "refresh_token": f"ref{len(self.posts)}",
+                "expires_at": int(time.time()) + 6 * 3600, "athlete": {"id": 7, "firstname": "Francesco"}}
+        return SimpleNamespace(status_code=200, json=lambda: body, text="")
+
+    def get(self, url, params=None, headers=None):
+        self.gets.append((params, headers))
+        after = params["after"]
+        page = [a for a in self.activities
+                if datetime.fromisoformat(a["start_date"].replace("Z", "+00:00")).timestamp() > after]
+        return SimpleNamespace(status_code=200, json=lambda: page if params["page"] == 1 else [], text="")
+
+
+def _activity(i, days_ago, **kw):
+    start = (utc_now() - timedelta(days=days_ago)).replace(microsecond=0)
+    return {"id": i, "name": f"Run {i}", "sport_type": "Run", "start_date": start.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "start_date_local": start.strftime("%Y-%m-%dT%H:%M:%S"), "moving_time": 1800, "distance": 5000,
+            "average_speed": 5000 / 1800, "average_heartrate": 150.4, "total_elevation_gain": 42, **kw}
+
+
+def test_strava_connect_sync_and_load(cfg, store, clock, monkeypatch, tmp_path):
+    from src.life import strava as st
+
+    monkeypatch.delenv("STRAVA_CLIENT_ID", raising=False)
+    http = FakeStravaHTTP([_activity(1, 1), _activity(2, 3, sport_type="Ride", name="Commute", distance=20000,
+                                                        moving_time=3600, average_speed=20000 / 3600),
+                           _activity(3, 10, moving_time=5400, distance=16000, average_speed=16000 / 5400)])
+    s = st.Strava(store, clock, tmp_path / "strava.json", http=http)
+    tools = {t.name: t for t in st.build_strava_tools(s)}
+    assert "isn't set up" in tools["strava_sync"].run({})[0]
+    monkeypatch.setenv("STRAVA_CLIENT_ID", "123")
+    monkeypatch.setenv("STRAVA_CLIENT_SECRET", "shh")
+    assert "isn't connected" in tools["training_load"].run({})[0]
+
+    url = s.connect_url()
+    assert "client_id=123" in url and "activity%3Aread_all" in url and "localhost%2Fexchange_token" in url
+    state = store.get_setting("strava_state")
+    with pytest.raises(st.StravaError, match="old or not from me"):
+        s.finish_connect("http://localhost/exchange_token?state=nope&code=abc&scope=read,activity:read_all")
+    with pytest.raises(st.StravaError, match="activity access"):
+        s.finish_connect(f"http://localhost/exchange_token?state={state}&code=abc&scope=read")
+    pasted = f"here: http://localhost/exchange_token?state={state}&code=abc&scope=read,activity:read_all"
+    assert st.Strava.looks_like_callback(pasted)
+    assert s.finish_connect(pasted) == "Francesco"
+    assert http.posts[-1]["grant_type"] == "authorization_code" and http.posts[-1]["client_secret"] == "shh"
+    assert oct((tmp_path / "strava.json").stat().st_mode & 0o777) == "0o600"
+    assert store.get_setting("strava_state") is None  # one use only
+
+    out = s.sync()
+    assert "3 new workouts" in out
+    logs = store.get_logs("fitness", "workout", 30)
+    assert len(logs) == 3 and {l["unit"] for l in logs} == {"min"}
+    run = next(l for l in logs if "Run 1" in l["note"])
+    assert run["value"] == 30 and run["note"] == 'Run: 5.0 km, 6:00/km, avg HR 150, 42 m up. "Run 1"'
+    assert "40.0 km/h" not in out and "Ride: 20.0 km, 20.0 km/h" in out
+    assert "nothing new" in s.sync() and len(store.get_logs("fitness", "workout", 30)) == 3  # never doubled
+
+    tok = json.loads((tmp_path / "strava.json").read_text())
+    tok["expires_at"] = int(time.time()) + 60  # about to expire: refreshed first
+    (tmp_path / "strava.json").write_text(json.dumps(tok))
+    s.sync()
+    assert http.posts[-1]["grant_type"] == "refresh_token" and http.gets[-1][1]["Authorization"] == "Bearer acc2"
+
+    load = s.training_load(14)
+    assert "3 sessions" in load and "41.0 km" in load and "long run" in load
+    assert "Load steady: 13 min/day this week vs 13 last week" in load  # 90 min in each week
+    assert st.intensity(175, 1000 / 260, 100, True) == 10 and st.intensity(110, 9.0, 30, False) == 3
+    feats = st.day_features([_activity(9, 0, moving_time=4800)])
+    assert list(feats.values())[0]["long_run"] is True
+
+    t = st.day_targets("performance", 70, None)
+    assert t == {"kcal": 2571, "protein_g": 140, "fat_g": 77, "carbs_g": 330}  # MacroClaw: (70/70) x 1658.75 x 1.55
+    hard = st.day_targets("cut", 70, {"minutes": 90, "intensity": 8, "long_run": True})
+    assert hard["kcal"] == round(2571 * 0.85) + 700 and hard["protein_g"] == 154 and "56 g carbs" in hard["timing"]  # 40 + 2 x intensity
+    store.add_log("health", "weight", 72.5, "kg")
+    fuel = s.fuel_targets("performance")
+    assert "weight 72.5 kg (logged" in fuel and "Rest day: 2,663 kcal" in fuel and "not medical advice" in fuel
+
+
+def test_strava_on_telegram(cfg, store, clock, monkeypatch, tmp_path):
+    from src.life import strava as st
+
+    svc = _service(cfg, store, clock, monkeypatch)
+    monkeypatch.delenv("STRAVA_CLIENT_ID", raising=False)
+    http = FakeStravaHTTP([_activity(1, 1)])
+    svc.life.strava = st.Strava(store, clock, tmp_path / "strava.json", http=http)
+    msg = lambda text: {"chat": {"id": 42}, "text": text}  # noqa: E731
+    asyncio.run(svc._on_message(msg("/strava")))
+    assert "strava.com/settings/api" in svc.tg.sent[-1][1]
+    monkeypatch.setenv("STRAVA_CLIENT_ID", "123")
+    monkeypatch.setenv("STRAVA_CLIENT_SECRET", "shh")
+    asyncio.run(svc._on_message(msg("/strava")))
+    text, kb = svc.tg.sent[-1][1], svc.tg.sent[-1][2]
+    assert "localhost/exchange_token" in text and kb["inline_keyboard"][0][0]["url"].startswith(st.AUTH_URL)
+    state = store.get_setting("strava_state")
+    asyncio.run(svc._on_message(msg(f"http://localhost/exchange_token?state={state}&code=c&scope=read,activity:read_all")))
+    assert svc.tg.sent[-1][1] == "Strava connected, Francesco. Strava synced: 1 new workout logged."
+    assert svc.session.calls == []  # never went to the model
+    assert "code=c" not in json.dumps(store.recent_messages(10))  # the code isn't kept
+    store.set_setting("strava_last_sync", to_iso(utc_now() - timedelta(hours=1)))
+    http.activities.append(_activity(2, 0))
+    asyncio.run(svc._maybe_sync_strava())
+    assert len(store.get_logs("fitness", "workout", 7)) == 2

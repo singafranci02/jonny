@@ -228,6 +228,20 @@ you (Telegram / voice / website) ──► Jarvis ── delegate (parallel) ─
   area agent, its own Messages-API tool loop on Opus 5.5 (tier `area`, the same model as Jarvis),
   and returns its report. Several delegations in one turn run in parallel.
   Each run is logged with its cost in `data/life_agents.log`.
+- **Projects: folder, brief, tracker.** A board project (kind `project`) can
+  have a tracker: tasks whose `parent_id` is the project (`life_add_item` with
+  `project`), shown on its Telegram card, where a tap ticks one off. Delegating
+  with `project` gives the area agent that project's own folder
+  (`<Area>/<Project>/`, created with a `CONTEXT.md` brief the first time), its
+  brief and its tracker, and the agent works there and keeps them current.
+- **Strava** (`src/life/strava.py`, ported from MacroClaw): `/strava` on
+  Telegram links an account (OAuth to a localhost address that is pasted
+  back); activities then sync every 30 minutes into Fitness `workout` logs,
+  once each (`logs.ref`). `training_load` (per-day minutes, distance,
+  0-10 intensity, long runs, week-on-week trend) and `fuel_targets`
+  (calories and macros by training day) go to Jarvis and the Fitness agent.
+  Only activity summaries are fetched. Tokens are in `data/strava.json`, outside
+  `life.db`, so they stay out of the iCloud backups.
 - **His other projects** (`src/life/sources.py`): a private list in
   `data/project_sources.yaml` (gitignored; format in
   `project_sources.example.yaml`) names his project folders and GitHub repos.

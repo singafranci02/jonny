@@ -107,11 +107,17 @@ class LifeStore:
         with self._db() as c:
             c.execute("pragma journal_mode=wal")
             c.executescript(_SCHEMA)
-            # databases made before the board: add its columns (data untouched)
-            cols = {r[1] for r in c.execute("pragma table_info(items)")}
-            for col in ("stage", "next_step"):
-                if col not in cols:
-                    c.execute(f"alter table items add column {col} text")
+            # older databases: add newer columns (data untouched)
+            for table, col, typ in (
+                ("items", "stage", "text"), ("items", "next_step", "text"),
+                ("items", "parent_id", "integer"),  # a task on a project's tracker
+                ("items", "folder", "text"),  # a project's own folder, inside its area's
+                ("logs", "ref", "text"),  # an outside id ("strava:123"): logged once only
+            ):
+                if col not in {r[1] for r in c.execute(f"pragma table_info({table})")}:
+                    c.execute(f"alter table {table} add column {col} {typ}")
+            c.execute("create unique index if not exists logs_ref on logs (ref) where ref is not null")
+            c.execute("create index if not exists items_parent on items (parent_id)")
 
     @contextmanager
     def _db(self, write: bool = False):
@@ -340,28 +346,36 @@ class LifeStore:
         due_date: str | None = None,
         stage: str | None = None,
         next_step: str | None = None,
+        parent_id: int | None = None,
     ) -> dict:
+        """parent_id puts a task (or note/goal) on a project's tracker; it
+        then lives in that project's area."""
         if kind not in ITEM_KINDS:
             raise ValueError(f"kind must be one of {', '.join(ITEM_KINDS)}")
         if kind == "project":
             stage = _stage(stage or "todo")
             next_step = (next_step or "").strip() or None
+            parent_id = None  # projects don't nest
         else:
             stage = next_step = None  # only projects sit on the board
+        if parent_id:
+            area = self._project(parent_id)["area"]
         now = to_iso(utc_now())
         with self._db() as c:
             cur = c.execute(
                 "insert into items (area, kind, title, details, priority, due_date, created_at, updated_at, "
-                "stage, next_step) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (area, kind, title.strip(), details, _priority(priority), due_date, now, now, stage, next_step),
+                "stage, next_step, parent_id) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (area, kind, title.strip(), details, _priority(priority), due_date, now, now, stage, next_step,
+                 parent_id or None),
             )
             return self._row(c.execute("select * from items where id = ?", (cur.lastrowid,)).fetchone())
 
     def update_item(self, iid: int, **patch) -> dict | None:
         """patch keys: title, details, status, priority, due_date (None clears
-        it), area, kind, and for projects stage and next_step ("" clears it).
-        Keys that are absent are left unchanged. Moving a finished project to
-        a stage reopens it."""
+        it), area, kind, parent_id (None/0 takes it off a tracker), and for
+        projects stage, next_step ("" clears it) and folder. Keys that are
+        absent are left unchanged. Moving a finished project to a stage
+        reopens it."""
         with self._db(write=True) as c:
             cur = self._row(c.execute("select * from items where id = ?", (iid,)).fetchone())
             if cur is None:
@@ -394,20 +408,75 @@ class LifeStore:
                 new["stage"] = new["stage"] or "todo"
                 if patch.get("next_step") is not None:
                     new["next_step"] = patch["next_step"].strip() or None
+                if patch.get("folder"):
+                    new["folder"] = patch["folder"]
+                new["parent_id"] = None
             else:
-                new["stage"] = new["next_step"] = None
+                new["stage"] = new["next_step"] = new["folder"] = None
+                if "parent_id" in patch:
+                    new["parent_id"] = patch["parent_id"] or None
+                if new["parent_id"]:
+                    parent = self._row(c.execute("select * from items where id = ?", (new["parent_id"],)).fetchone())
+                    if parent is None or parent["kind"] != "project" or parent["id"] == iid:
+                        raise ValueError(f"#{new['parent_id']} is not a project")
+                    new["area"] = parent["area"]
             c.execute(
                 "update items set title = ?, details = ?, area = ?, kind = ?, priority = ?, due_date = ?, "
-                "status = ?, completed_at = ?, stage = ?, next_step = ?, updated_at = ? where id = ?",
+                "status = ?, completed_at = ?, stage = ?, next_step = ?, parent_id = ?, folder = ?, "
+                "updated_at = ? where id = ?",
                 (new["title"], new["details"], new["area"], new["kind"], new["priority"],
                  new["due_date"], new["status"], new["completed_at"], new["stage"], new["next_step"],
-                 to_iso(utc_now()), iid),
+                 new["parent_id"], new["folder"], to_iso(utc_now()), iid),
             )
+            if new["kind"] == "project" and new["area"] != cur["area"]:  # its tracker moves with it
+                c.execute("update items set area = ? where parent_id = ?", (new["area"], iid))
             return self._row(c.execute("select * from items where id = ?", (iid,)).fetchone())
 
     def get_item(self, iid: int) -> dict | None:
         with self._db() as c:
             return self._row(c.execute("select * from items where id = ?", (iid,)).fetchone())
+
+    def _project(self, pid: int) -> dict:
+        p = self.get_item(int(pid))
+        if p is None or p["kind"] != "project":
+            raise ValueError(f"#{pid} is not a project")
+        return p
+
+    def find_project(self, ref, area: str | None = None) -> dict | None:
+        """A project by id or (case-insensitive) title, open ones first."""
+        text = str(ref).strip().lstrip("#")
+        if text.isdigit():
+            p = self.get_item(int(text))
+            ok = p is not None and p["kind"] == "project" and (area is None or p["area"] == area)
+            return p if ok else None
+        with self._db() as c:
+            row = c.execute(
+                "select * from items where kind = 'project' and lower(title) = lower(?) and (? is null or area = ?) "
+                "order by status != 'open', id desc limit 1",
+                (text, area, area),
+            ).fetchone()
+        return self._row(row)
+
+    def project_tasks(self, pid: int, done_days: int = 0) -> list[dict]:
+        """A project's tracker: its open items (by due date, then priority),
+        plus those finished in the last done_days."""
+        since = to_iso(utc_now() - timedelta(days=done_days))
+        with self._db() as c:
+            rows = c.execute(
+                "select * from items where parent_id = ? and (status = 'open' or (status = 'done' and ? > 0 "
+                "and completed_at > ?)) order by status != 'open', due_date is null, due_date, priority, id",
+                (pid, done_days, since),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def task_counts(self) -> dict[int, int]:
+        """Open tracker items per project id."""
+        with self._db() as c:
+            rows = c.execute(
+                "select parent_id, count(*) as n from items where parent_id is not null and status = 'open' "
+                "group by parent_id"
+            ).fetchall()
+        return {r["parent_id"]: r["n"] for r in rows}
 
     def open_items(self, area: str | None = None, limit: int = 100) -> list[dict]:
         with self._db() as c:
@@ -460,6 +529,20 @@ class LifeStore:
                 "insert into logs (area, metric, value, unit, note, logged_at) values (?, ?, ?, ?, ?, ?)",
                 (area, metric, value, unit, note, to_iso(logged_at or utc_now())),
             )
+            return self._row(c.execute("select * from logs where id = ?", (cur.lastrowid,)).fetchone())
+
+    def add_log_once(self, ref: str, area: str, metric: str, value: float | None = None, unit: str | None = None,
+                     note: str | None = None, logged_at: datetime | None = None) -> dict | None:
+        """Like add_log, keyed by an outside id: None if `ref` was already
+        logged (a re-sync never doubles a workout)."""
+        with self._db() as c:
+            cur = c.execute(
+                "insert or ignore into logs (area, metric, value, unit, note, logged_at, ref) "
+                "values (?, ?, ?, ?, ?, ?, ?)",
+                (area, metric, value, unit, note, to_iso(logged_at or utc_now()), ref),
+            )
+            if cur.rowcount == 0:
+                return None
             return self._row(c.execute("select * from logs where id = ?", (cur.lastrowid,)).fetchone())
 
     def _today_log(self, area: str, metric: str) -> dict | None:
@@ -614,6 +697,7 @@ class LifeStore:
                     "id": i["id"], "area": i["area"], "kind": i["kind"], "title": i["title"],
                     "details": i["details"], "priority": i["priority"], "due_date": i["due_date"],
                     "stage": i.get("stage"), "next_step": i.get("next_step"),
+                    "project": i.get("parent_id"), "folder": i.get("folder"),
                 }.items() if v is not None}
                 for i in items
             ],

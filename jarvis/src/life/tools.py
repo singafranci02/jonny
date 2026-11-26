@@ -94,25 +94,36 @@ def build_life_tools(store: LifeStore, clock: Clock, areas: list[Area], fixed: A
         return (f"Reminder #{r['id']}: \"{r['text']}\", {r['status']}, {clock.when(r['due_at'])}, "
                 f"repeats {r['recurrence']} ({labels.get(r['area'], r['area'])}).")
 
+    def parent_for(project) -> int | None:
+        """The project a task goes on (its tracker); for an area agent, only
+        its own area's projects."""
+        if project in (None, "", 0, "0") or str(project).strip().lower() in ("none", "null"):
+            return None
+        p = store.find_project(project)
+        if p is None:
+            raise ValueError(f"no project {project}; project ids come from life_overview")
+        return owned(p, "project", project)["id"]
+
     def add_item(kind: str, title: str, details: str | None = None, priority: int = 2,
                  due_date: str | None = None, area: str | None = None, stage: str | None = None,
-                 next_step: str | None = None) -> str:
-        a = area_for(area)
+                 next_step: str | None = None, project=None) -> str:
+        parent = parent_for(project)
+        a = store.get_item(parent)["area"] if parent else area_for(area)
         due = None
         if due_date:
             due = clock.parse_date(due_date)
             if due is None:
                 raise ValueError(f'could not read the date "{due_date}"; use YYYY-MM-DD')
         i = store.add_item(a, kind, title, details, priority if priority is not None else 2, due,
-                           stage=stage, next_step=next_step)
-        return f"Added {i['kind']} #{i['id']} \"{i['title']}\" to {labels[a]}" + _board(i) + (
+                           stage=stage, next_step=next_step, parent_id=parent)
+        return f"Added {i['kind']} #{i['id']} \"{i['title']}\" to {labels[a]}" + _board(i) + on_tracker(i) + (
             f", due {i['due_date']}." if i["due_date"] else "."
         )
 
     def update_item(id: int, title: str | None = None, details: str | None = None,
                     status: str | None = None, priority: int | None = None, due_date: str | None = None,
                     kind: str | None = None, area: str | None = None, stage: str | None = None,
-                    next_step: str | None = None) -> str:
+                    next_step: str | None = None, project=None) -> str:
         owned(store.get_item(int(id)), "item", id)
         patch: dict = {"title": title, "details": details, "status": status, "priority": priority, "kind": kind,
                        "stage": stage}
@@ -128,10 +139,19 @@ def build_life_tools(store: LifeStore, clock: Clock, areas: list[Area], fixed: A
                 patch["due_date"] = d
         if area is not None and fixed is None:
             patch["area"] = area_for(area)
+        if project is not None:
+            patch["parent_id"] = parent_for(project)
         i = store.update_item(int(id), **patch)
-        return f"Item #{i['id']} \"{i['title']}\": {i['status']}, {labels.get(i['area'], i['area'])}" + _board(i) + (
+        return (f"Item #{i['id']} \"{i['title']}\": {i['status']}, {labels.get(i['area'], i['area'])}" + _board(i)
+                + on_tracker(i) + (
             f", due {i['due_date']}." if i["due_date"] else "."
-        )
+        ))
+
+    def on_tracker(i: dict) -> str:
+        if not i.get("parent_id"):
+            return ""
+        p = store.get_item(i["parent_id"])
+        return f", on project #{i['parent_id']} {p['title']!r}'s tracker" if p else ""
 
     def log_entry(metric: str, value: float | None = None, unit: str | None = None,
                   note: str | None = None, logged_at: str | None = None, area: str | None = None) -> str:
@@ -219,7 +239,8 @@ def build_life_tools(store: LifeStore, clock: Clock, areas: list[Area], fixed: A
     )
     tools.append(Tool(
         name="life_add_item",
-        description=f"Add a task, goal, note or board project{scope}.",
+        description=(f"Add a task, goal, note or board project{scope}. A task that belongs to a board project "
+                     "goes on that project's tracker: pass project (its id)."),
         parameters={"type": "object", "properties": p, "required": req},
         func=add_item,
     ))
@@ -282,6 +303,9 @@ _BOARD_PROPS = {
     "next_step": {"type": "string",
                   "description": 'projects only: the one concrete next action, a few words ("Send draft to Sam"); '
                                  '"none" clears it'},
+    "project": {"type": "integer",
+                "description": "tasks/notes only: id of the board project whose tracker this belongs to; "
+                               "0 takes it off"},
 }
 
 
