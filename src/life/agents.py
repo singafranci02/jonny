@@ -26,6 +26,15 @@ from .tools import build_life_tools
 # Read-mostly helpers every area agent may use, taken from Jarvis's own tools.
 SHARED_TOOL_NAMES = ("web_search", "fetch_page", "get_datetime", "calculate", "search_memory", "search_knowledge")
 
+# Tools that change something. Their successful results become the report's
+# verified change list (a crewAI-style output guardrail, done structurally):
+# Jarvis relays what actually happened, not what the agent says happened.
+MUTATING_TOOLS = frozenset({
+    "life_add_reminder", "life_update_reminder", "life_add_item", "life_update_item", "life_log",
+    "ws_create_file", "ws_edit_file", "ws_move",
+})
+CHANGES_HEADER = "Verified changes:"
+
 
 def area_system(area: Area, owner: str, tz_name: str) -> str:
     return f"""You are the {area.name} agent in {owner}'s personal life organiser. Jarvis, the main assistant who talks to {owner}, hands you tasks about the {area.name} area and passes your report on.
@@ -38,7 +47,13 @@ CONTEXT.md in your folder is your standing brief about this part of {owner}'s li
 
 Your reminder, task and log tools only cover the {area.name} area. Time zone: {tz_name}; each task message states the current local time. Pass date-times as local "YYYY-MM-DDTHH:mm". Check life_overview before creating reminders or tasks so you don't duplicate existing ones.
 
-Do the task fully, then reply to Jarvis with a short report: what you found, what you changed (files, reminders and tasks, with their times), and any question Jarvis should put to {owner}. Plain text, no headings or tables."""
+Projects on {owner}'s board that belong to your area are items of kind project, each with a stage (todo, doing, waiting) and one concrete next step. Keep them current: when your work moves a project, update its stage and next step; when a plan you write covers one, make its next step the first action of that plan.
+
+Do the task fully, then reply to Jarvis in this shape (plain text, no headings or tables):
+Line 1: the answer for {owner} in one short sentence; Jarvis may pass it on word for word.
+Then, only if needed, up to 4 short lines of detail Jarvis needs.
+Last, only if something needs {owner}'s decision: "Question: ...".
+Don't list what you changed: a verified list of your changes is attached to your report automatically."""
 
 
 class AreaAgents:
@@ -109,14 +124,14 @@ class AreaAgents:
             with open(self.log_path, "a") as f:
                 f.write(
                     f"{time.strftime('%Y-%m-%d %H:%M:%S')}  {area.id:<9} rounds={rounds} "
-                    f"cost=${cost:.4f} {secs:.0f}s\n  task: {task[:300]}\n  report: {report[:500]}\n"
+                    f"cost=${cost:.4f} {secs:.0f}s\n  task: {task[:300]}\n  report: {report[:1500]}\n"
                 )
         except OSError:
             pass
 
     # ---------------- the subagent loop ----------------
 
-    def run(self, area_id: str, task: str) -> str:
+    def run(self, area_id: str, task: str, expected_output: str | None = None) -> str:
         area = self.by_id.get(area_id)
         if area is None:
             return f"unknown area '{area_id}'; use one of: {', '.join(self.by_id)}"
@@ -146,10 +161,12 @@ class AreaAgents:
                     f"CURRENT TIME: {self.clock.label_now()}\n\n"
                     f"YOUR CONTEXT.md ({area.folder}/CONTEXT.md):\n{read_context(self.cfg, area)}\n\n"
                     f"TASK FROM JARVIS:\n{task}"
+                    + (f"\n\nYOUR REPORT MUST INCLUDE: {expected_output}" if expected_output else "")
                 ),
             }
         ]
         rounds, cost, text = 0, 0.0, ""
+        changes: list[str] = []
         resp = None
         partial = "(I ran out of time or steps; this is partial.)"
         while True:
@@ -180,6 +197,9 @@ class AreaAgents:
                 break
             rounds += 1
             results = self._run_tools(tools, calls, deadline)
+            for call, result in zip(calls, results):
+                if call.name in MUTATING_TOOLS and not result.get("is_error"):
+                    changes.append(" ".join(str(result["content"]).split())[:240])
             messages.append({"role": "assistant", "content": resp.content})
             messages.append({"role": "user", "content": results})
 
@@ -188,6 +208,7 @@ class AreaAgents:
         elif resp is not None and resp.stop_reason == "max_tokens":
             text = (text + " " if text else "") + "(report cut off)"
         report = text or f"The {area.name} agent finished without a report."
+        report += f"\n\n{CHANGES_HEADER}" + ("".join(f"\n- {c}" for c in changes) if changes else " none.")
         self._log(area, task, report, rounds, cost, time.monotonic() - started)
         return report
 
@@ -236,17 +257,24 @@ class AreaAgents:
                 "organising its files, tracking progress, recording what the user tells you about that area. "
                 "The agent can't see this conversation, so write a self-contained task: what the user asked, "
                 "the details that matter, what to report back. For several areas, call delegate once per area "
-                "in the same turn: they run in parallel. Relay the report in your own words."
+                "in the same turn: they run in parallel. The report's first line is written for the user; "
+                f"its \"{CHANGES_HEADER}\" list is what really happened (taken from the agent's tools), so trust "
+                "it over the agent's wording and never tell the user about a change that isn't on it."
             ),
             parameters={
                 "type": "object",
                 "properties": {
                     "area": {"type": "string", "enum": [a.id for a in self.areas]},
                     "task": {"type": "string"},
+                    "expected_output": {
+                        "type": "string",
+                        "description": 'optional: what the report must contain, e.g. "the 3 sessions with days '
+                                       'and times" or "yes/no plus the one blocker"',
+                    },
                 },
                 "required": ["area", "task"],
             },
-            func=lambda area, task: self.run(area, task),
+            func=lambda area, task, expected_output=None: self.run(area, task, expected_output),
             # run() returns by its own deadline; this outer wait is the backstop
             timeout=self.timeout_s + 60,
             timeout_message=(

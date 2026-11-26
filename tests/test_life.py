@@ -361,7 +361,10 @@ def test_area_agent_runs_tools_in_its_own_folder(cfg, store, clock):
     ])
     agents = _agents(cfg, store, clock, fake)
     report = agents.run("fitness", "Make a training plan")
-    assert report == "Wrote training-plan.md and set a reminder."
+    assert report.startswith("Wrote training-plan.md and set a reminder.\n\nVerified changes:")
+    # only what really happened is listed: the file, the reminder, not the blocked escape
+    changes = report.split("Verified changes:")[1]
+    assert "training-plan.md" in changes and "Run 5k" in changes and "sneaky" not in changes
     root = Path(cfg["workspace"]["path"])
     assert (root / "Fitness" / "training-plan.md").read_text().startswith("# Plan")
     assert not (root / "Health" / "sneaky.md").exists()  # confined to its own folder
@@ -399,7 +402,7 @@ def test_area_agent_limits_and_refusal(cfg, store, clock):
 def test_area_agent_deadline_and_api_errors(cfg, store, clock):
     fake = FakeAnthropic([_resp("end_turn", _block("text", text="ok"))])
     agents = _agents(cfg, store, clock, fake)
-    assert agents.run("work", "x") == "ok"
+    assert agents.run("work", "x") == "ok\n\nVerified changes: none."
     # every model call is held to the time left (and the whole run to timeout_s)
     assert 0 < fake.options[0]["timeout"] <= 60
     agents.timeout_s = 5  # less than the 10s floor: stop before calling the model
@@ -427,6 +430,7 @@ def test_chunks_and_keyboard():
 class FakeTelegram:
     def __init__(self):
         self.sent, self.edits, self.answers = [], [], []
+        self.edit_keyboards, self.keyboard_edits = [], []
         self.fail = False
 
     async def send(self, chat_id, text, keyboard=None):
@@ -441,8 +445,12 @@ class FakeTelegram:
     async def answer_callback(self, cid, text=None):
         self.answers.append(text)
 
-    async def edit_text(self, chat_id, mid, text):
+    async def edit_text(self, chat_id, mid, text, keyboard=None):
         self.edits.append(text)
+        self.edit_keyboards.append(keyboard)
+
+    async def edit_keyboard(self, chat_id, mid, keyboard):
+        self.keyboard_edits.append(keyboard)
 
     async def close(self):
         pass
@@ -906,3 +914,154 @@ def test_system_timezone_default():
 
     tz = system_timezone()
     assert tz is None or ZoneInfo(tz)  # a real zone name, e.g. "Europe/London"
+
+
+# ---------------------------------------------------------------- the board
+
+
+def _buttons(keyboard) -> dict:
+    """callback_data -> button text, for an inline keyboard."""
+    return {b["callback_data"]: b["text"] for row in keyboard["inline_keyboard"] for b in row}
+
+
+def test_board_store_projects_and_migration(tmp_path, clock):
+    import sqlite3
+
+    # a database from before the board: no stage/next_step columns
+    old = tmp_path / "old.db"
+    with sqlite3.connect(old) as c:
+        c.execute("create table items (id integer primary key autoincrement, area text not null, kind text not null "
+                  "default 'task', title text not null, details text, status text not null default 'open', priority "
+                  "integer not null default 2, due_date text, created_at text not null, updated_at text not null, "
+                  "completed_at text)")
+        c.execute("insert into items (area, title, created_at, updated_at) values ('work', 'old task', 'x', 'x')")
+    st = LifeStore(old, clock)
+    assert st.get_item(1)["title"] == "old task" and st.get_item(1)["stage"] is None  # data kept
+
+    p = st.add_item("work", "project", "Pitch deck", next_step="  Send draft to Sam ")
+    assert p["stage"] == "todo" and p["next_step"] == "Send draft to Sam"
+    assert st.add_item("work", "task", "x", stage="doing")["stage"] is None  # only projects get a stage
+    st.update_item(p["id"], stage="in progress")
+    assert st.get_item(p["id"])["stage"] == "doing"
+    with pytest.raises(ValueError):
+        st.update_item(p["id"], stage="someday")
+    st.update_item(p["id"], status="done")
+    assert st.projects() == []
+    st.update_item(p["id"], stage="waiting")  # moving a finished project reopens it
+    again = st.get_item(p["id"])
+    assert again["status"] == "open" and again["stage"] == "waiting" and again["completed_at"] is None
+    st.update_item(p["id"], next_step="")
+    assert st.get_item(p["id"])["next_step"] is None
+    q = st.add_item("fitness", "project", "Half marathon", stage="doing", next_step="Long run 12k")
+    assert [x["title"] for x in st.projects()] == ["Half marathon", "Pitch deck"]  # doing before waiting
+    assert "▶ Half marathon → Long run 12k" in st.today_text()
+    assert any(i.get("stage") == "doing" for i in st.overview()["open_items"])
+    assert q["id"]
+
+
+def test_tap_logs_replace_todays_value(store):
+    assert store.today_value("health", "sleep_hours") is None
+    store.set_today_log("health", "sleep_hours", 7, "hours")
+    store.set_today_log("health", "sleep_hours", 8, "hours")  # re-tap changes it, no duplicate
+    logs = store.get_logs("health", "sleep_hours")
+    assert len(logs) == 1 and logs[0]["value"] == 8 and store.today_value("health", "sleep_hours") == 8
+
+
+def test_board_views(cfg, store):
+    from src.life import board
+
+    areas = load_areas(cfg)
+    text, kb = board.board_view([], areas)
+    assert "empty" in text and "pa:" in _buttons(kb)
+    for i in range(4):
+        store.add_item("work", "project", f"P{i}", stage="doing", next_step=f"step {i}", due_date="2026-12-05")
+    store.add_item("fitness", "project", "Half marathon", stage="waiting")
+    projects = store.projects()
+    text, kb = board.board_view(projects, areas)
+    assert text.startswith("📋 Board") and "▶ P0 → step 0 · 5 Dec" in text and "⏸ Half marathon" in text
+    assert "⚠ 4 in Doing" in text  # focus nudge past 3
+    assert _buttons(kb)["bd:work"] == "💼 Work (4)" and _buttons(kb)["bd:health"] == "🩺 Health"
+    text, kb = board.board_view(projects, areas, "fitness")
+    assert text.startswith("🏋️ Fitness") and "pj:" in "".join(_buttons(kb)) and "pa:fitness" in _buttons(kb)
+    card, kb = board.project_card(projects[0], areas[0])
+    b = _buttons(kb)
+    assert "▶ Doing" in card and "Next: step 0" in card
+    assert b[f"ps:{projects[0]['id']}:doing"].startswith("✓") and f"pn:{projects[0]['id']}" in b
+    assert all(len(k.encode()) <= 64 for k in b)
+    kb = board.log_keyboard({"sleep": 7.0, "mood": None, "trained": 0.0})
+    b = _buttons(kb)
+    assert b["lg:sleep:7"] == "✓7h" and b["lg:sleep:5"] == "😴 5h" and b["lg:trained:0"] == "✓Rest day"
+    assert board.log_target("sleep", ["work", "life"]) == ("work", "sleep_hours", "hours")  # falls back
+
+
+def test_service_menu_board_and_buttons(cfg, store, clock, monkeypatch):
+    from src.life import board
+
+    svc = _service(cfg, store, clock, monkeypatch)
+    msg = lambda text, **kw: {"chat": {"id": 42}, "text": text, **kw}  # noqa: E731
+    btn = lambda data, mid=9: {"id": "cb", "data": data, "message": {"chat": {"id": 42}, "message_id": mid}}  # noqa: E731
+
+    asyncio.run(svc.announce_menu())
+    assert svc.tg.sent[-1][2] == board.menu_keyboard()
+    asyncio.run(svc.announce_menu())
+    assert len(svc.tg.sent) == 1  # once per menu version
+
+    # ➕ Add -> name by force-reply -> pick area -> card; no model calls anywhere
+    asyncio.run(svc._on_message(msg(board.MENU_ADD)))
+    prompt_id = len(svc.tg.sent)
+    assert svc.tg.sent[-1][2]["force_reply"] is True
+    asyncio.run(svc._on_message(msg("Pitch deck", reply_to_message={"message_id": prompt_id})))
+    assert "Which area" in svc.tg.sent[-1][1] and "pc:work" in _buttons(svc.tg.sent[-1][2])
+    asyncio.run(svc._on_button(btn("pc:work")))
+    pid = store.projects()[0]["id"]
+    assert store.get_item(pid)["title"] == "Pitch deck" and "○ To do" in svc.tg.edits[-1]
+
+    asyncio.run(svc._on_button(btn(f"ps:{pid}:doing")))
+    assert store.get_item(pid)["stage"] == "doing" and svc.tg.answers[-1] == "▶ Doing"
+    asyncio.run(svc._on_button(btn(f"pn:{pid}")))
+    prompt_id = len(svc.tg.sent)
+    asyncio.run(svc._on_message(msg("unrelated chat")))  # not a reply: goes to Jarvis as usual
+    assert svc.session.calls and store.get_item(pid)["next_step"] is None
+    asyncio.run(svc._on_message(msg("Send draft to Sam", reply_to_message={"message_id": prompt_id})))
+    assert store.get_item(pid)["next_step"] == "Send draft to Sam" and "Next: Send draft to Sam" in svc.tg.sent[-1][1]
+    calls = len(svc.session.calls)
+
+    asyncio.run(svc._on_message(msg(board.MENU_BOARD)))
+    assert "▶ Pitch deck → Send draft to Sam" in svc.tg.sent[-1][1]
+    asyncio.run(svc._on_button(btn("bd:work")))
+    assert svc.tg.edits[-1].startswith("💼 Work") and f"pj:{pid}" in _buttons(svc.tg.edit_keyboards[-1])
+    asyncio.run(svc._on_button(btn(f"ps:{pid}:done")))
+    assert store.get_item(pid)["status"] == "done" and "↩ Reopen" in svc.tg.edit_keyboards[-1]["inline_keyboard"][0][0]["text"]
+    asyncio.run(svc._on_button(btn("pj:999")))
+    assert "no longer exists" in svc.tg.answers[-1]
+
+    # 📝 Log: taps write today's values, re-tap replaces, keyboard ticks the choice
+    asyncio.run(svc._on_message(msg(board.MENU_LOG)))
+    asyncio.run(svc._on_button(btn("lg:sleep:7")))
+    asyncio.run(svc._on_button(btn("lg:sleep:8")))
+    asyncio.run(svc._on_button(btn("lg:mood:4")))
+    assert store.today_value("health", "sleep_hours") == 8 and len(store.get_logs("health", "sleep_hours")) == 1
+    assert _buttons(svc.tg.keyboard_edits[-1])["lg:mood:4"] == "✓4" and svc.tg.answers[-1] == "🙂 Mood 4/5 ✓"
+    assert len(svc.session.calls) == calls  # none of the taps used the model
+    assert store.unseen_outbound() == []  # taps don't leak into Jarvis's "you were sent" note
+
+
+def test_checkin_buttons_and_delegate_contract(cfg, store, clock, monkeypatch):
+    from src.life import board
+
+    cfg["life"]["checkins"].append({"key": "evening", "label": "Daily 21:00", "time": "21:00", "days": "daily",
+                                    "task": "How was today?", "buttons": "daily-log"})
+    svc = _service(cfg, store, clock, monkeypatch, reply="How was today?")
+    asyncio.run(svc.run_checkin(svc.checkin_by_key("evening")))
+    assert svc.tg.sent[-1][2] == board.log_keyboard({"sleep": None, "mood": None, "trained": None})
+    asyncio.run(svc.run_checkin(svc.checkin_by_key("morning-brief")))
+    assert svc.tg.sent[-1][2] is None
+
+    fake = FakeAnthropic([_resp("end_turn", _block("text", text="Plan ready."))])
+    agents = _agents(cfg, store, clock, fake)
+    tool = agents.delegate_tool()
+    assert "expected_output" in tool.parameters["properties"] and "Verified changes" in tool.description
+    tool.func(area="fitness", task="Plan my week", expected_output="the 3 sessions with days")
+    first = fake.requests[0]
+    assert "YOUR REPORT MUST INCLUDE: the 3 sessions with days" in first["messages"][0]["content"]
+    assert "Line 1: the answer" in first["system"][0]["text"] and "stage and next step" in first["system"][0]["text"]

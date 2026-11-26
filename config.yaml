@@ -211,19 +211,21 @@ life:
       task: >-
         Morning brief. Call life_overview, then text him today's plan in a
         few short lines: what's due today (area emoji + item + time), anything
-        overdue, and one line naming the thing to focus on. Skip empty parts;
-        if nothing is on, one line saying so. On Mondays, add one line with
-        this week's deadlines.
+        overdue, the next step of each project in stage doing, and one line
+        naming the thing to focus on. Skip empty parts; if nothing is on, one
+        line saying so. On Mondays, add one line with this week's deadlines
+        and any project waiting for more than a week.
     - key: evening-checkin
       label: Daily 21:00 · evening check-in
       time: "21:00"
       days: daily
+      buttons: daily-log      # tap-to-log sleep / mood / training under the message
       task: >-
-        Evening check-in, one short line. Call life_overview to see what is
-        logged today, then ask only for what isn't logged yet, out of: sleep
-        (hours), training, mood (1-5). E.g. "How was today? Sleep, training,
-        mood /5." If tomorrow starts with something early, add it in a few
-        words. Never say what's missing or empty.
+        Evening check-in, one short line, e.g. "How was today?". Tap buttons
+        for sleep, mood and training are attached under your message
+        automatically, so don't ask for those numbers. Call life_overview; if
+        tomorrow starts with something early, add it in a few words. Never
+        say what's missing or empty.
     - key: weekly-review
       label: Sun 19:00 · weekly review and plan
       time: "19:00"
@@ -236,7 +238,8 @@ life:
         reminders and tasks that are clearly needed, and reports wins, what
         slipped, next week's focus and what it created. Then text him one
         combined message: one short line per area (emoji + the one thing that
-        matters), then one line listing what was scheduled.
+        matters), then one line listing what was scheduled. Each area agent
+        also brings its board projects up to date (stage and next step).
 
 profile:
   file: data/profile.md     # your hand-edited "About Me" (gitignored, private)

@@ -77,7 +77,7 @@ def build_life_tools(store: LifeStore, clock: Clock, areas: list[Area], fixed: A
             raise ValueError(f"{clock.when(due)} is in the past; check the current time with life_overview")
         r = store.add_reminder(a, text, due, recurrence)
         rep = "" if r["recurrence"] == "none" else f", repeats {r['recurrence']}"
-        return f"Reminder #{r['id']} set for {clock.when(r['due_at'])}{rep} ({labels[a]}).{sender_warning()}"
+        return f"Reminder #{r['id']} \"{r['text']}\" set for {clock.when(r['due_at'])}{rep} ({labels[a]}).{sender_warning()}"
 
     def update_reminder(id: int, text: str | None = None, due_at: str | None = None,
                         recurrence: str | None = None, status: str | None = None,
@@ -95,23 +95,29 @@ def build_life_tools(store: LifeStore, clock: Clock, areas: list[Area], fixed: A
                 f"repeats {r['recurrence']} ({labels.get(r['area'], r['area'])}).")
 
     def add_item(kind: str, title: str, details: str | None = None, priority: int = 2,
-                 due_date: str | None = None, area: str | None = None) -> str:
+                 due_date: str | None = None, area: str | None = None, stage: str | None = None,
+                 next_step: str | None = None) -> str:
         a = area_for(area)
         due = None
         if due_date:
             due = clock.parse_date(due_date)
             if due is None:
                 raise ValueError(f'could not read the date "{due_date}"; use YYYY-MM-DD')
-        i = store.add_item(a, kind, title, details, priority if priority is not None else 2, due)
-        return f"Added {i['kind']} #{i['id']} \"{i['title']}\" to {labels[a]}" + (
+        i = store.add_item(a, kind, title, details, priority if priority is not None else 2, due,
+                           stage=stage, next_step=next_step)
+        return f"Added {i['kind']} #{i['id']} \"{i['title']}\" to {labels[a]}" + _board(i) + (
             f", due {i['due_date']}." if i["due_date"] else "."
         )
 
     def update_item(id: int, title: str | None = None, details: str | None = None,
                     status: str | None = None, priority: int | None = None, due_date: str | None = None,
-                    kind: str | None = None, area: str | None = None) -> str:
+                    kind: str | None = None, area: str | None = None, stage: str | None = None,
+                    next_step: str | None = None) -> str:
         owned(store.get_item(int(id)), "item", id)
-        patch: dict = {"title": title, "details": details, "status": status, "priority": priority, "kind": kind}
+        patch: dict = {"title": title, "details": details, "status": status, "priority": priority, "kind": kind,
+                       "stage": stage}
+        if next_step is not None:
+            patch["next_step"] = "" if next_step.strip().lower() in ("none", "null") else next_step
         if due_date is not None:
             if due_date.strip().lower() in ("", "none", "null"):
                 patch["due_date"] = None
@@ -123,7 +129,7 @@ def build_life_tools(store: LifeStore, clock: Clock, areas: list[Area], fixed: A
         if area is not None and fixed is None:
             patch["area"] = area_for(area)
         i = store.update_item(int(id), **patch)
-        return f"Item #{i['id']} \"{i['title']}\": {i['status']}, {labels.get(i['area'], i['area'])}" + (
+        return f"Item #{i['id']} \"{i['title']}\": {i['status']}, {labels.get(i['area'], i['area'])}" + _board(i) + (
             f", due {i['due_date']}." if i["due_date"] else "."
         )
 
@@ -201,17 +207,19 @@ def build_life_tools(store: LifeStore, clock: Clock, areas: list[Area], fixed: A
     p, req = with_area(
         {
             "kind": {"type": "string", "enum": list(ITEM_KINDS),
-                     "description": "task = something to do; goal = an outcome being worked towards; note = reference info"},
+                     "description": "task = something to do; goal = an outcome being worked towards; note = "
+                                    "reference info; project = a multi-step effort tracked on his board"},
             "title": {"type": "string"},
             "details": {"type": "string"},
             "priority": {"type": "integer", "enum": [1, 2, 3], "description": "1 high, 2 normal (default), 3 low"},
             "due_date": {"type": "string", "description": 'optional "YYYY-MM-DD"'},
+            **_BOARD_PROPS,
         },
         ["kind", "title"],
     )
     tools.append(Tool(
         name="life_add_item",
-        description=f"Add a task, goal or note{scope}.",
+        description=f"Add a task, goal, note or board project{scope}.",
         parameters={"type": "object", "properties": p, "required": req},
         func=add_item,
     ))
@@ -224,12 +232,14 @@ def build_life_tools(store: LifeStore, clock: Clock, areas: list[Area], fixed: A
         "priority": {"type": "integer", "enum": [1, 2, 3]},
         "due_date": {"type": "string", "description": '"YYYY-MM-DD", or "none" to clear'},
         "kind": {"type": "string", "enum": list(ITEM_KINDS)},
+        **_BOARD_PROPS,
     }
     if fixed is None:
         item["area"] = {"type": "string", "enum": ids}
     tools.append(Tool(
         name="life_update_item",
-        description=f"Edit, complete (status done), reopen or archive a task, goal or note{scope} by id.",
+        description=(f"Edit, complete (status done), reopen or archive a task, goal, note or project{scope} by id. "
+                     "For a project, keep stage and next_step current as things move."),
         parameters={"type": "object", "properties": item, "required": ["id"]},
         func=update_item,
     ))
@@ -262,3 +272,21 @@ def build_life_tools(store: LifeStore, clock: Clock, areas: list[Area], fixed: A
         func=get_logs,
     ))
     return tools
+
+
+# the board: a project's stage and its one concrete next step
+_BOARD_PROPS = {
+    "stage": {"type": "string", "enum": ["todo", "doing", "waiting"],
+              "description": "projects only: todo (not started), doing (active), waiting (blocked on someone "
+                             "or something); finished projects get status done"},
+    "next_step": {"type": "string",
+                  "description": 'projects only: the one concrete next action, a few words ("Send draft to Sam"); '
+                                 '"none" clears it'},
+}
+
+
+def _board(item: dict) -> str:
+    if item.get("kind") != "project":
+        return ""
+    stage = "done" if item["status"] == "done" else item.get("stage") or "todo"
+    return f", {stage}" + (f", next: {item['next_step']}" if item.get("next_step") else "")

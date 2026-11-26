@@ -19,8 +19,10 @@ from pathlib import Path
 
 from .clock import RECURRENCES, UTC, Clock, from_iso, to_iso, utc_now
 
-ITEM_KINDS = ("task", "goal", "note")
+ITEM_KINDS = ("task", "goal", "note", "project")
 ITEM_STATUSES = ("open", "done", "archived")
+# projects (the board): where an open project stands; "done" is status=done
+PROJECT_STAGES = ("todo", "doing", "waiting")
 REMINDER_STATUSES = ("pending", "sending", "sent", "done", "cancelled")
 
 _SCHEMA = """
@@ -40,7 +42,9 @@ create table if not exists items (
   due_date text,
   created_at text not null,
   updated_at text not null,
-  completed_at text
+  completed_at text,
+  stage text,
+  next_step text
 );
 create index if not exists items_area_status on items (area, status);
 create table if not exists reminders (
@@ -86,6 +90,11 @@ class LifeStore:
         with self._db() as c:
             c.execute("pragma journal_mode=wal")
             c.executescript(_SCHEMA)
+            # databases made before the board: add its columns (data untouched)
+            cols = {r[1] for r in c.execute("pragma table_info(items)")}
+            for col in ("stage", "next_step"):
+                if col not in cols:
+                    c.execute(f"alter table items add column {col} text")
 
     @contextmanager
     def _db(self, write: bool = False):
@@ -312,21 +321,30 @@ class LifeStore:
         details: str | None = None,
         priority: int = 2,
         due_date: str | None = None,
+        stage: str | None = None,
+        next_step: str | None = None,
     ) -> dict:
         if kind not in ITEM_KINDS:
             raise ValueError(f"kind must be one of {', '.join(ITEM_KINDS)}")
+        if kind == "project":
+            stage = _stage(stage or "todo")
+            next_step = (next_step or "").strip() or None
+        else:
+            stage = next_step = None  # only projects sit on the board
         now = to_iso(utc_now())
         with self._db() as c:
             cur = c.execute(
-                "insert into items (area, kind, title, details, priority, due_date, created_at, updated_at) "
-                "values (?, ?, ?, ?, ?, ?, ?, ?)",
-                (area, kind, title.strip(), details, _priority(priority), due_date, now, now),
+                "insert into items (area, kind, title, details, priority, due_date, created_at, updated_at, "
+                "stage, next_step) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (area, kind, title.strip(), details, _priority(priority), due_date, now, now, stage, next_step),
             )
             return self._row(c.execute("select * from items where id = ?", (cur.lastrowid,)).fetchone())
 
     def update_item(self, iid: int, **patch) -> dict | None:
         """patch keys: title, details, status, priority, due_date (None clears
-        it), area, kind. Keys that are absent are left unchanged."""
+        it), area, kind, and for projects stage and next_step ("" clears it).
+        Keys that are absent are left unchanged. Moving a finished project to
+        a stage reopens it."""
         with self._db(write=True) as c:
             cur = self._row(c.execute("select * from items where id = ?", (iid,)).fetchone())
             if cur is None:
@@ -351,11 +369,22 @@ class LifeStore:
                     new["completed_at"] = to_iso(utc_now())
                 elif patch["status"] == "open":
                     new["completed_at"] = None
+            if new["kind"] == "project":
+                if patch.get("stage") is not None:
+                    new["stage"] = _stage(patch["stage"])
+                    if new["status"] != "open" and patch.get("status") is None:
+                        new["status"], new["completed_at"] = "open", None
+                new["stage"] = new["stage"] or "todo"
+                if patch.get("next_step") is not None:
+                    new["next_step"] = patch["next_step"].strip() or None
+            else:
+                new["stage"] = new["next_step"] = None
             c.execute(
                 "update items set title = ?, details = ?, area = ?, kind = ?, priority = ?, due_date = ?, "
-                "status = ?, completed_at = ?, updated_at = ? where id = ?",
+                "status = ?, completed_at = ?, stage = ?, next_step = ?, updated_at = ? where id = ?",
                 (new["title"], new["details"], new["area"], new["kind"], new["priority"],
-                 new["due_date"], new["status"], new["completed_at"], to_iso(utc_now()), iid),
+                 new["due_date"], new["status"], new["completed_at"], new["stage"], new["next_step"],
+                 to_iso(utc_now()), iid),
             )
             return self._row(c.execute("select * from items where id = ?", (iid,)).fetchone())
 
@@ -369,6 +398,17 @@ class LifeStore:
                 "select * from items where status = 'open' and (? is null or area = ?) "
                 "order by due_date is null, due_date, priority, updated_at desc limit ?",
                 (area, area, limit),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def projects(self, area: str | None = None) -> list[dict]:
+        """Open projects for the board: Doing first, then Waiting, then To do."""
+        with self._db() as c:
+            rows = c.execute(
+                "select * from items where kind = 'project' and status = 'open' and (? is null or area = ?) "
+                "order by case stage when 'doing' then 0 when 'waiting' then 1 else 2 end, "
+                "due_date is null, due_date, priority, updated_at desc limit 200",
+                (area, area),
             ).fetchall()
         return [dict(r) for r in rows]
 
@@ -404,6 +444,29 @@ class LifeStore:
                 (area, metric, value, unit, note, to_iso(logged_at or utc_now())),
             )
             return self._row(c.execute("select * from logs where id = ?", (cur.lastrowid,)).fetchone())
+
+    def _today_log(self, area: str, metric: str) -> dict | None:
+        today = self.clock.today()
+        for entry in self.get_logs(area, metric, days=2, limit=20):  # newest first
+            if self.clock.local(entry["logged_at"]).date() == today:
+                return entry
+        return None
+
+    def today_value(self, area: str, metric: str) -> float | None:
+        """Today's value of a once-a-day metric (sleep, mood…), else None."""
+        entry = self._today_log(area, metric)
+        return entry["value"] if entry else None
+
+    def set_today_log(self, area: str, metric: str, value: float, unit: str | None = None) -> dict:
+        """Once-a-day metrics from a tap: re-tapping changes today's value
+        instead of adding a second entry (also corrects a typed one)."""
+        metric = metric.strip().lower().replace(" ", "_")
+        entry = self._today_log(area, metric)
+        if entry is None:
+            return self.add_log(area, metric, value, unit, "tap")
+        with self._db() as c:
+            c.execute("update logs set value = ?, unit = coalesce(?, unit) where id = ?", (value, unit, entry["id"]))
+            return self._row(c.execute("select * from logs where id = ?", (entry["id"],)).fetchone())
 
     def get_logs(self, area: str | None = None, metric: str | None = None, days: int = 30, limit: int = 200) -> list[dict]:
         since = to_iso(utc_now() - timedelta(days=days))
@@ -459,6 +522,7 @@ class LifeStore:
                 {k: v for k, v in {
                     "id": i["id"], "area": i["area"], "kind": i["kind"], "title": i["title"],
                     "details": i["details"], "priority": i["priority"], "due_date": i["due_date"],
+                    "stage": i.get("stage"), "next_step": i.get("next_step"),
                 }.items() if v is not None}
                 for i in items
             ],
@@ -499,6 +563,10 @@ class LifeStore:
         if due:
             lines += ["", "Due today or overdue:"]
             lines += [f"• {i['title']} ({area_label(i['area'])}, {i['due_date']})" for i in due]
+        doing = [p for p in self.projects() if p["stage"] == "doing"]
+        if doing:
+            lines += ["", "Doing:"]
+            lines += [f"▶ {p['title']}" + (f" → {p['next_step']}" if p["next_step"] else "") for p in doing]
         return "\n".join(lines)
 
     # ---------------- backup ----------------
@@ -540,3 +608,11 @@ def since_label(clock: Clock, iso: str | None) -> str | None:
 
 
 __all__ = ["LifeStore", "ITEM_KINDS", "ITEM_STATUSES", "REMINDER_STATUSES", "UTC", "since_label"]
+
+
+def _stage(value) -> str:
+    v = str(value or "").strip().lower().replace(" ", "").replace("_", "")
+    v = {"todo": "todo", "doing": "doing", "inprogress": "doing", "waiting": "waiting", "blocked": "waiting"}.get(v, v)
+    if v not in PROJECT_STAGES:
+        raise ValueError("stage must be todo, doing or waiting (finished projects: status done)")
+    return v
