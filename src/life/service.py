@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from datetime import timedelta
 
 from ..context import Conversation
-from . import board
+from . import board, coach as coaching
 from .areas import ensure_folders, folder_status, full_disk_access_target, workspace_root
 from .clock import from_iso, parse_days, to_iso, utc_now
 from .telegram import TelegramClient, TelegramError, reminder_keyboard
@@ -31,6 +31,10 @@ log = logging.getLogger("jarvis.life")
 INFLIGHT = "inflight_turns"  # Telegram messages whose reply is being worked on
 RESUME_WINDOW = timedelta(minutes=20)  # older than this, just tell him instead
 STRAVA_EVERY = timedelta(minutes=30)
+MENU_NEWS = {  # what the one-off message says when the menu bar changes
+    1: "Buttons are ready below. 📋 Board for your projects, 📝 Log for sleep, mood and training.",
+    2: "New: 🏋 Train. Six taps set up your program; then each day shows the session to do.",
+}
 STRAVA_SETUP = (
     "Strava needs a free API app first (2 minutes):\n"
     "1. strava.com/settings/api: create an app. Category: Training. Website: anything. "
@@ -47,6 +51,7 @@ STRAVA_CONNECT = (
 HELP = (
     "I'm Jarvis. Tap the buttons below, or just text me.\n"
     "📋 Board: your projects by area. Tap one for its tracker; tap a task to tick it off\n"
+    "🏋 Train: today's workout. Tap ✓ hit, ⤴ easy, ↓ missed per lift, ⚖ to set a weight, then Finish\n"
     "➕ Add: a new project\n"
     "📅 Today: what's on\n"
     "📝 Log: sleep, mood, training in one tap\n"
@@ -92,6 +97,7 @@ class LifeService:
         self._inflight: dict[str, dict] = {}
         self._inflight_lock = asyncio.Lock()
         self._running_checkins: set[str] = set()
+        self._coach_ticked = None
         self.text_lock = asyncio.Lock()
         self.checkins = [
             CheckIn(
@@ -279,6 +285,10 @@ class LifeService:
         if text.startswith("/strava") or self._strava() and self._strava().looks_like_callback(text):
             await self._on_strava(chat_id, text)
             return
+        if (text == board.MENU_TRAIN or text.startswith("/train")) and self._coach():
+            await asyncio.to_thread(self.store.log_message, "in", "command", text)
+            await self.tg.send(chat_id, *(await asyncio.to_thread(coaching.today_card, self._coach())))
+            return
         if text == board.MENU_BOARD or text.startswith("/board"):
             await self.send_board(chat_id)
             return
@@ -357,6 +367,72 @@ class LifeService:
     def _strava(self):
         return getattr(self.life, "strava", None)
 
+    def _coach(self):
+        return getattr(self.life, "coach", None)
+
+    async def _on_coach_button(self, q: dict, message: dict, chat_id: int, action: str, rest: str) -> None:
+        """Training taps: setup (co), lift outcome (cx), weight (cw), finish
+        (cf), week (cv), today (ct), run done/skipped (cr)."""
+        c, mid = self._coach(), message.get("message_id")
+        parts = rest.split(":")
+        if action == "co":
+            i, value = int(parts[0]), (parts[1] if len(parts) > 1 else "")
+            draft = (await asyncio.to_thread(self.store.get_setting, "coach_draft") or {}) if value else {}
+            if value:
+                draft[coaching.SETUP_STEPS[i][0]] = value
+                i += 1
+            await asyncio.to_thread(self.store.set_setting, "coach_draft", draft)
+            await self.tg.answer_callback(q["id"])
+            if i < len(coaching.SETUP_STEPS):
+                await self.tg.edit_text(chat_id, mid, *coaching.setup_step(i))
+                return
+            overview = await asyncio.to_thread(lambda: c.setup(
+                goal=draft["goal"], lift_days=int(draft["lift_days"]), run_days=int(draft["run_days"]),
+                equipment=draft["equipment"], experience=draft["experience"], minutes=int(draft["minutes"])))
+            await asyncio.to_thread(self.store.log_message, "in", "button", "Training program set up", c.area)
+            text, kb = await asyncio.to_thread(coaching.today_card, c)
+            await self.tg.edit_text(chat_id, mid, f"✅ Program ready\n{overview}\n\n{text}", kb)
+            return
+        if action == "cx":
+            sid, key, o = int(parts[0]), parts[1], parts[2]
+            await asyncio.to_thread(c.record, sid, key, coaching.OUTCOMES[o])
+            await self.tg.answer_callback(q["id"], f"{coaching.MARK[coaching.OUTCOMES[o]]} {coaching.LIB[key].short}")
+        elif action == "cw":
+            sid, key = int(parts[0]), parts[1]
+            await self.tg.answer_callback(q["id"])
+            await self._ask_input(chat_id, {"kind": "lift_weight", "key": key, "card": mid},
+                                  f"Working weight for {coaching.LIB[key].name}, in kg?", "e.g. 62.5")
+            return
+        elif action == "cf":
+            summary = await asyncio.to_thread(c.finish, int(parts[0]))
+            await asyncio.to_thread(self.store.log_message, "in", "button", f"Finished lifting: {summary}", c.area)
+            await self.tg.answer_callback(q["id"], "✅ Logged")
+            text, kb = await asyncio.to_thread(coaching.today_card, c)
+            await self.tg.edit_text(chat_id, mid, f"{text}\n\n{summary}", kb)
+            return
+        elif action == "cr":
+            await asyncio.to_thread(c.complete_run, int(parts[0]), parts[1] if parts[1] in ("done", "skipped") else "done")
+            await self.tg.answer_callback(q["id"], "✅" if parts[1] == "done" else "⏭")
+        elif action == "cv":
+            await self.tg.answer_callback(q["id"])
+            await self.tg.edit_text(chat_id, mid, *(await asyncio.to_thread(coaching.week_card, c, int(parts[0] or 0))))
+            return
+        else:
+            await self.tg.answer_callback(q["id"])
+        await self.tg.edit_text(chat_id, mid, *(await asyncio.to_thread(coaching.today_card, c)))
+
+    async def _coach_tick(self) -> None:
+        """Keep this week's sessions on the calendar and tick off runs Strava saw."""
+        c = self._coach()
+        if c is None or not c.profile():
+            return
+        now = utc_now()
+        if self._coach_ticked and now - self._coach_ticked < timedelta(minutes=10):
+            return
+        self._coach_ticked = now
+        await asyncio.to_thread(c.plan_week, coaching.monday(self.clock.today()))
+        await asyncio.to_thread(c.autocomplete_runs)
+
     async def _on_strava(self, chat_id: int, text: str) -> None:
         """/strava connects (or reports and syncs); the pasted localhost
         address from Strava's consent page finishes connecting."""
@@ -397,6 +473,7 @@ class LifeService:
             return
         try:
             await asyncio.to_thread(strava.sync)
+            self._coach_ticked = None  # new runs: tick off planned ones now
         except Exception as e:  # quiet: the next sweep tries again
             log.warning("strava sync failed: %s", e)
             await asyncio.to_thread(self.store.set_setting, "strava_last_sync", to_iso(utc_now()))
@@ -415,6 +492,12 @@ class LifeService:
         action, _, rest = (q.get("data") or "").partition(":")
         if action in ("done", "snooze"):
             await self._on_reminder_button(q, message, chat_id, action, rest)
+        elif action in ("co", "cx", "cw", "cf", "cv", "ct", "cr") and self._coach():
+            try:
+                await self._on_coach_button(q, message, chat_id, action, rest)
+            except Exception as e:
+                log.exception("coach button %r failed", q.get("data"))
+                await self.tg.answer_callback(q["id"], f"Couldn't: {e}"[:190])
         elif action in ("bd", "pj", "ps", "pn", "pa", "pc", "lg", "tk"):
             try:
                 await self._on_board_button(q, message, chat_id, action, rest)
@@ -458,8 +541,7 @@ class LifeService:
                 return
             if await asyncio.to_thread(self.store.get_setting, "menu_version") == board.MENU_VERSION:
                 return
-            await self.tg.send(self.owner_chat, "Buttons are ready below. 📋 Board for your projects, "
-                               "📝 Log for sleep, mood and training.", board.menu_keyboard())
+            await self.tg.send(self.owner_chat, MENU_NEWS.get(board.MENU_VERSION, MENU_NEWS[1]), board.menu_keyboard())
             await asyncio.to_thread(self.store.set_setting, "menu_version", board.MENU_VERSION)
         except Exception as e:
             log.warning("could not send the menu bar: %s", e)
@@ -498,6 +580,15 @@ class LifeService:
                 await self.tg.send(chat_id, "That project no longer exists.")
                 return True
             await self.tg.send(chat_id, *(await self._card(item)))
+        elif pending["kind"] == "lift_weight":
+            c = self._coach()
+            try:
+                kg = float(text.lower().replace("kg", "").replace(",", ".").strip())
+                await asyncio.to_thread(c.set_weight, pending["key"], kg)
+            except (ValueError, TypeError) as e:
+                await self.tg.send(chat_id, f"Couldn't set that: {e}. Tap ⚖ again.")
+                return True
+            await self.tg.send(chat_id, *(await asyncio.to_thread(coaching.today_card, c)))
         elif pending["kind"] == "new_project":
             title = " ".join(text.split())[:120]
             if pending.get("area") and self._area(pending["area"]):
@@ -605,6 +696,7 @@ class LifeService:
                 await self._due_checkins()
                 await self._maybe_backup()
                 await self._maybe_sync_strava()
+                await self._coach_tick()
             except asyncio.CancelledError:
                 raise
             except Exception:

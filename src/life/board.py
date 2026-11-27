@@ -20,8 +20,9 @@ from __future__ import annotations
 from datetime import date
 
 MENU_BOARD, MENU_ADD, MENU_TODAY, MENU_LOG = "📋 Board", "➕ Add", "📅 Today", "📝 Log"
-MENU_TEXTS = (MENU_BOARD, MENU_ADD, MENU_TODAY, MENU_LOG)
-MENU_VERSION = 1  # bump to re-send the menu bar after changing it
+MENU_TRAIN = "🏋 Train"
+MENU_TEXTS = (MENU_BOARD, MENU_TRAIN, MENU_ADD, MENU_TODAY, MENU_LOG)
+MENU_VERSION = 2  # bump to re-send the menu bar after changing it
 
 STAGE_ICON = {"todo": "○", "doing": "▶", "waiting": "⏸", "done": "✅"}
 STAGE_NAME = {"todo": "To do", "doing": "Doing", "waiting": "Waiting", "done": "Done"}
@@ -37,7 +38,8 @@ LOG_ROWS = {
 
 def menu_keyboard() -> dict:
     return {
-        "keyboard": [[{"text": MENU_BOARD}, {"text": MENU_ADD}], [{"text": MENU_TODAY}, {"text": MENU_LOG}]],
+        "keyboard": [[{"text": MENU_BOARD}, {"text": MENU_TRAIN}],
+                     [{"text": MENU_TODAY}, {"text": MENU_LOG}, {"text": MENU_ADD}]],
         "is_persistent": True,
         "resize_keyboard": True,
     }

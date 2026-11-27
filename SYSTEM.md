@@ -234,6 +234,17 @@ you (Telegram / voice / website) ──► Jarvis ── delegate (parallel) ─
   with `project` gives the area agent that project's own folder
   (`<Area>/<Project>/`, created with a `CONTEXT.md` brief the first time), its
   brief and its tracker, and the agent works there and keeps them current.
+- **The coach** (`src/life/coach.py`): a program to follow, not just a
+  log. Six taps (🏋 Train) set goal, lifting days, runs, equipment,
+  experience and session length; it picks a split (full body, upper/lower,
+  push/pull/legs) and places runs around it. 4-week blocks (reps in reserve
+  3/2/1, then a deload week). Lifts progress by double progression per
+  exercise (✓ hit / ⤴ easy / ↓ missed taps, ⚖ sets the weight, Finish
+  applies it). Run time builds 10%/week from his real Strava average, with
+  paces from his own runs. Readiness (last night's sleep, mood,
+  7-day vs 28-day load ratio) swaps or trims sessions. The weekly review
+  compares his weight trend with the goal's rate and moves the calorie
+  adjustment `fuel_targets` uses. Tables `coach_sessions`, `coach_lifts`.
 - **Strava** (`src/life/strava.py`, ported from MacroClaw): `/strava` on
   Telegram links an account (OAuth to a localhost address that is pasted
   back); activities then sync every 30 minutes into Fitness `workout` logs,

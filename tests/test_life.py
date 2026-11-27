@@ -8,7 +8,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -1517,3 +1517,238 @@ def test_strava_on_telegram(cfg, store, clock, monkeypatch, tmp_path):
     http.activities.append(_activity(2, 0))
     asyncio.run(svc._maybe_sync_strava())
     assert len(store.get_logs("fitness", "workout", 7)) == 2
+
+
+# ---------------------------------------------------------------- the coach
+
+
+def _coach(store, clock, **profile):
+    from src.life.coach import Coach
+
+    c = Coach(store, clock, "fitness")
+    c.setup(**{"goal": "muscle", "lift_days": 4, "run_days": 3, "equipment": "gym", "experience": "mid",
+               "minutes": 60, **profile})
+    return c
+
+
+def _lift_today(store, coach, clock, template="upper_a"):
+    """Make today a lifting day regardless of the weekday."""
+    p = coach.profile()
+    p["first_day"] = (clock.today() + timedelta(days=1)).isoformat()  # the planner leaves today alone
+    coach._save_profile(p)
+    with store._db() as c:
+        c.execute("delete from coach_sessions where day = ?", (clock.today().isoformat(),))
+        cur = c.execute("insert into coach_sessions (day, kind, template, minutes) values (?, 'lift', ?, 60)",
+                        (clock.today().isoformat(), template))
+        return cur.lastrowid
+
+
+def test_coach_progression_rules():
+    from src.life.coach import LIB, Coach
+
+    bench, pushup = LIB["bench"], LIB["pushup"]  # 6-10 reps, +2.5 kg; bodyweight 8-20
+    s = {"exercise": "bench", "load": 60.0, "reps": 8, "misses": 0, "history": []}
+    assert Coach.progress(bench, s, "hit")["reps"] == 9
+    assert Coach.progress(bench, s, "easy")["reps"] == 10
+    top = Coach.progress(bench, {**s, "reps": 10}, "hit")
+    assert (top["load"], top["reps"]) == (62.5, 6)  # top of the range: heavier, back to the bottom
+    once = Coach.progress(bench, s, "missed")
+    assert (once["load"], once["reps"], once["misses"]) == (60.0, 8, 1)
+    twice = Coach.progress(bench, once, "missed")
+    assert (twice["load"], twice["reps"], twice["misses"]) == (55.0, 6, 0)  # 54 rounds to 55
+    assert Coach.progress(bench, {**once}, "hit")["misses"] == 0
+    bw = {"exercise": "pushup", "load": None, "reps": 20, "misses": 0, "history": []}
+    assert Coach.progress(pushup, bw, "hit")["reps"] == 20  # bodyweight tops out on reps
+    assert Coach.progress(bench, {**s, "load": None}, "hit")["reps"] == 9  # no weight yet: reps only
+
+
+def test_coach_week_layout_and_runs(store, clock):
+    from src.life import coach as co
+
+    c = _coach(store, clock)
+    mon = co.monday(clock.today())
+    week = c.desired_week(mon)
+    lifts = [(date.fromisoformat(d).weekday(), t) for d, k, t, _ in week if k == "lift"]
+    runs = {t: (date.fromisoformat(d).weekday(), m) for d, k, t, m in week if k == "run"}
+    assert lifts == [(0, "upper_a"), (1, "lower_a"), (3, "upper_b"), (4, "lower_b")]
+    # long run Sunday, intervals Wednesday (not the day before a leg day), easy Saturday
+    assert runs["long"][0] == 6 and runs["intervals"][0] == 2 and runs["easy"][0] == 5
+    assert c.run_base(0) == 90  # no Strava runs yet: the default for 1-3 years
+    assert (runs["long"][1], runs["intervals"][1], runs["easy"][1]) == (35, 30, 30)  # 40/25/35% of 90
+    store.add_log_once("strava:lonely", "fitness", "workout", 49, "min", "Run: 5.0 km, 9:42/km.", utc_now())
+    assert _coach(store, clock, lift_days=2).run_base(0) == 90  # one stray run isn't a baseline
+
+    # with Strava history the base follows what he really ran: 4 runs × 50 min in 4 weeks
+    for i in range(4):
+        store.add_log_once(f"strava:{i}", "fitness", "workout", 50, "min", "Run: 8.0 km, 6:15/km. \"r\"",
+                           utc_now() - timedelta(days=3 + 6 * i))
+    c2 = _coach(store, clock, lift_days=3, run_days=2)  # a new split re-bases
+    assert c2.run_base(0) == 60 and c2.typical_pace() == 375  # (4 x 50 + the 49 above) / 4 weeks
+    assert "6:45/km or slower" in c2.run_plan({"template": "easy", "minutes": 30, "day": clock.today().isoformat()})
+    p = c2.profile()
+    p["run_bases"]["0"] = 100
+    c2._save_profile(p)
+    assert c2.run_base(1) == 90  # ran less than planned: next block only -10%
+    c2.setup(goal="muscle", lift_days=3, run_days=2, equipment="gym", experience="mid", minutes=45)
+    assert c2.profile()["run_bases"].get("0") == 100  # a tweak keeps the block
+
+    layouts = {n: [date.fromisoformat(d).weekday() for d, k, *_ in _coach(store, clock, lift_days=n, run_days=r)
+                   .desired_week(mon)] for n, r in ((2, 4), (6, 1), (5, 2))}
+    assert all(len(v) == len(set(v)) or n == 6 for n, v in layouts.items())  # no double days unless needed
+
+
+def test_coach_session_readiness_and_blocks(store, clock):
+    from src.life import coach as co
+
+    c = _coach(store, clock, equipment="dumbbells", minutes=45)
+    day = clock.today()
+    plan = c.lift_plan("upper_a", day)
+    assert [x["key"] for x in plan] == ["db_bench", "db_row", "db_ohp", "pullup", "lateral"]  # 45 min: 5
+    assert plan[0]["load"] is None and "pick a weight" in co.Coach._prescription(plan[0])
+    c.set_weight("db_bench", 24)
+    p = c.profile()
+    weeks = (co.monday(day) - date.fromisoformat(p["start"])).days // 7
+    assert c.block_week(day) == (0, 0) and weeks == 0
+    for wk, rir in ((1, 2), (2, 1), (3, 4)):
+        p["start"] = (co.monday(day) - timedelta(weeks=wk)).isoformat()
+        c._save_profile(p)
+        x = c.lift_plan("upper_a", day)[0]
+        assert x["rir"] == rir
+        if wk == 2:
+            assert x["sets"] == 4  # peak week: a set more on the main lifts
+        if wk == 3:
+            assert x["sets"] == 2 and x["load"] == 22 and x["deload"]  # ~60% of sets, 10% lighter
+    p["start"] = co.monday(day).isoformat()
+    c._save_profile(p)
+
+    assert c.readiness()[0] == "green"
+    store.add_log("health", "sleep_hours", 5, "hours")
+    level, why = c.readiness()
+    assert level == "red" and "sleep 5h" in why
+    assert c.lift_plan("upper_a", day, "red")[0]["sets"] == 2 and c.lift_plan("upper_a", day, "red")[0]["rir"] == 4
+    run = {"template": "intervals", "minutes": 40, "day": day.isoformat()}
+    assert "intervals swapped out" in c.run_plan(run, "amber")
+    assert "6 × 2 min hard" in c.run_plan(run, "green")
+
+
+def test_coach_tracking_finish_and_review(store, clock):
+    from src.life import coach as co
+
+    c = _coach(store, clock, goal="lean")
+    sid = _lift_today(store, c, clock)
+    c.set_weight("bench", 60)
+    keys = [x["key"] for x in c.lift_plan("upper_a", clock.today())]
+    assert keys[:4] == ["bench", "row", "ohp", "pulldown"]
+    c.record(sid, "bench", "hit")
+    c.record(sid, "row", "missed")
+    c.record(sid, "ohp", "easy")
+    c.record(sid, "ohp", "hit")  # a re-tap corrects it before Finish
+    assert "✓ 1. Bench press 3×6 @ 60 kg" in c.today_text() and "↓ 2. Barbell row" in c.today_text()
+    out = c.finish(sid)
+    assert out.startswith("Done. Next time:") and "Bench 60 kg × 7" in out
+    assert c.lift("row")["misses"] == 1 and c.lift("ohp")["reps"] == 7
+    assert c.finish(sid) == "Already finished."
+    assert store.get_logs("fitness", "strength", 1)[0]["value"] == 60
+    with pytest.raises(ValueError):
+        c.set_weight("pushup", 10)  # bodyweight
+
+    # Strava ticks off a planned run
+    with store._db() as con:
+        rid = con.execute("insert into coach_sessions (day, kind, template, minutes) values (?, 'run', 'easy', 30)",
+                          (clock.today().isoformat(),)).lastrowid
+    store.add_log_once("strava:77", "fitness", "workout", 32, "min", "Run: 5.1 km, 6:16/km. \"x\"", utc_now())
+    assert c.autocomplete_runs() == 1 and c.session(rid)["status"] == "done"
+
+    # physique loop: on a cut, weight going UP is above target; twice in a row moves calories
+    for d, w in ((20, 80.0), (18, 80.1), (16, 80.0), (6, 80.6), (4, 80.8), (2, 80.7)):
+        store.add_log("health", "weight", w, "kg", None, utc_now() - timedelta(days=d))
+    rate, avg = c.weight_trend()
+    assert rate > 0 and avg == 80.7
+    r1 = c.review()
+    assert "above target" in r1 and "Progressed:" in r1 and "Bench 60 kg × 6 → 60 kg × 7" in r1
+    assert "2 of" in r1 or "of" in r1
+    assert c.profile()["kcal_adjust"] == 0 and c.profile()["off_target"] == 1
+    c.review()
+    assert c.profile()["off_target"] == 1  # asked twice in one week: counted once
+    p = c.profile()
+    p["reviewed_week"] = "2000-01-03"
+    c._save_profile(p)
+    assert "Calories -150/day" in c.review() and c.profile()["kcal_adjust"] == -150
+
+    from src.life.strava import Strava
+
+    fuel = Strava(store, clock, Path("/nonexistent/strava.json")).fuel_targets()
+    assert fuel.startswith("Goal cut") and "calories -150/day" in fuel
+
+    # deload week: results logged, loads stay
+    p = c.profile()
+    p["start"] = (co.monday(clock.today()) - timedelta(weeks=3)).isoformat()
+    c._save_profile(p)
+    sid2 = _lift_today(store, c, clock, "upper_b")
+    c.record(sid2, "lateral", "easy")
+    before = c.lift("lateral")
+    assert "Loads stay put" in c.finish(sid2) and c.lift("lateral")["reps"] == before["reps"]
+
+
+def test_coach_on_telegram(cfg, store, clock, monkeypatch):
+    from src.life import board, coach as co
+
+    svc = _service(cfg, store, clock, monkeypatch)
+    svc.life.coach = co.Coach(store, clock, "fitness")
+    assert board.MENU_TRAIN in json.dumps(board.menu_keyboard(), ensure_ascii=False)
+    asyncio.run(svc._on_message({"chat": {"id": 42}, "text": board.MENU_TRAIN}))
+    text, kb = svc.tg.sent[-1][1], svc.tg.sent[-1][2]
+    assert "Six taps" in text and "co:0:muscle" in _buttons(kb)
+
+    tap = lambda data, mid=50: asyncio.run(svc._on_button(  # noqa: E731
+        {"id": "cb", "data": data, "message": {"chat": {"id": 42}, "message_id": mid}}))
+    for data in ("co:0:recomp", "co:1:4", "co:2:2", "co:3:gym", "co:4:mid", "co:5:60"):
+        tap(data)
+    assert svc.tg.edits[-1].startswith("✅ Program ready") and "Upper A / Lower A / Upper B / Lower B" in svc.tg.edits[-1]
+    c = svc.life.coach
+    assert c.profile()["goal"] == "recomp" and c.profile()["run_days"] == 2
+
+    sid = _lift_today(store, c, clock)
+    asyncio.run(svc._on_message({"chat": {"id": 42}, "text": "/train"}))
+    kb = _buttons(svc.tg.sent[-1][2])
+    assert kb[f"cx:{sid}:bench:h"] == "✓ Bench" and kb[f"cw:{sid}:bench"] == "⚖" and kb[f"cf:{sid}"].startswith("✅")
+    tap(f"cw:{sid}:bench")
+    prompt_id = len(svc.tg.sent)
+    asyncio.run(svc._on_message({"chat": {"id": 42}, "text": "62,5 kg", "message_id": 99,
+                                 "reply_to_message": {"message_id": prompt_id}}))
+    assert c.lift("bench")["load"] == 62.5 and "3×6 @ 62.5 kg" in svc.tg.sent[-1][1]
+    tap(f"cx:{sid}:bench:h")
+    assert svc.tg.answers[-1] == "✓ Bench" and "✓ 1. Bench press" in svc.tg.edits[-1]
+    tap(f"cf:{sid}")
+    assert "Next time: Bench 62.5 kg × 7" in svc.tg.edits[-1]
+    tap("cv:1")
+    assert svc.tg.edits[-1].startswith("📅 Week of") and "Mon: Upper A" in svc.tg.edits[-1]
+    assert svc.session.calls == []  # all taps, no model
+
+    tools = {t.name: t for t in co.build_coach_tools(c)}
+    sid3 = _lift_today(store, c, clock, "upper_b")
+    out, err = tools["coach_log"].run({"exercise": "squat", "outcome": "hit", "weight_kg": 100})
+    assert not err and "100 kg" in out and "isn't in today's session (Upper B" in out
+    assert c.session(sid3)["results"] == {} and c.lift("squat")["load"] == 100
+    out, err = tools["coach_log"].run({"exercise": "rows", "outcome": "hit"})
+    assert not err and "Seated cable row: hit" in out
+    out, err = tools["coach_log"].run({"exercise": "incline", "outcome": "easy", "weight_kg": 26})
+    assert not err and "Incline dumbbell press: working weight 26 kg" in out
+    assert c.session(sid3)["results"] == {"cable_row": "hit", "incline_db": "easy"}
+    assert tools["coach_finish"].run({})[0].startswith("Done.")
+
+
+def test_last_tool_round_asks_for_an_answer():
+    from src.llm.base import LLMResponse
+
+    calls = [SimpleNamespace(id=f"c{i}", name="get_datetime", arguments={}) for i in range(12)]
+    script = [LLMResponse(text="", model="m", tier="t", tool_calls=[calls[i]]) for i in range(12)]
+    llm = ScriptedLLM(script)
+    s = _bare_session([Tool("get_datetime", "now", {"type": "object", "properties": {}}, lambda: "noon")], llm)
+    s.cfg["llm"]["max_tool_rounds"] = {"coordinator": 3}
+    resp = asyncio.run(s.turn("dig", conversation=Conversation(4), tier="coordinator", learn=False))
+    assert resp.extra["tool_rounds"] == 3 and len(llm.calls) == 4
+    last_results = llm.calls[-1]["messages"][-1]["content"]
+    assert "That was the last tool call this turn" in last_results[-1]["out"]
+    assert "last tool call" not in json.dumps(llm.calls[-2]["messages"][-1]["content"])
+    assert resp.text == "Sorry, I couldn't finish working that one out."  # it still called a tool: fallback
