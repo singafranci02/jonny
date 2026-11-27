@@ -69,6 +69,11 @@ llm:
 
   # USD per 1M tokens (Sonnet 5 intro pricing through 2026-08-31,
   # then 3.00 / 15.00; cache write = 1.25x input, cache read = 0.1x)
+  # tool rounds per turn by tier (default 5): text chats on the coordinator
+  # tier may read folders and delegate in several steps
+  max_tool_rounds:
+    coordinator: 10
+
   pricing:
     claude-sonnet-5:  { input: 2.00, output: 10.00, cache_write: 2.50, cache_read: 0.20 }
     claude-haiku-4-5: { input: 1.00, output: 5.00,  cache_write: 1.25, cache_read: 0.10 }
@@ -185,9 +190,15 @@ life:
         as the value, distance, pace and heart rate in the note); log anything
         else the same way. Use training_load before planning or reviewing
         (load trend, intensity, long runs) and fuel_targets for calories and
-        macros on training and rest days; keep his fuel goal (performance,
-        lean_bulk or cut) and recent weight in CONTEXT.md. Keep the current
-        plan in training-plan.md.
+        macros on training and rest days. His training program is run by the
+        coach (coach_today, coach_week, coach_log, coach_finish, coach_setup,
+        coach_review): it prescribes every session and progresses the lifts
+        and runs by fixed rules, so follow it rather than writing your own
+        plan, and change it with coach_setup when his schedule or goal
+        changes. In the weekly review, run coach_review and report adherence,
+        what progressed, the load ratio and the weight trend. Ask him to
+        weigh in 3+ times a week (life_log metric "weight"): the coach's
+        calorie adjustment depends on it.
     - id: health
       name: Health
       emoji: "🩺"
@@ -220,8 +231,10 @@ life:
       task: >-
         Morning brief. Call life_overview, then text him today's plan in a
         few short lines: what's due today (area emoji + item + time), anything
-        overdue, the next step of each project in stage doing, and one line
-        naming the thing to focus on. Skip empty parts; if nothing is on, one
+        overdue, the next step of each project in stage doing, today's
+        workout in one line from coach_today (session name and the main
+        lift's target, or the run; skip on rest days), and one line naming
+        the thing to focus on. Skip empty parts; if nothing is on, one
         line saying so. On Mondays, add one line with this week's deadlines
         and any project waiting for more than a week.
     - key: evening-checkin

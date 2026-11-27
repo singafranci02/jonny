@@ -133,7 +133,9 @@ class Session:
         token = _turn_state.set(state)
         try:
             resp = await self._agent_loop(
-                tier, scratch, on_text=timed_on_text, use_tools=not fast
+                tier, scratch, on_text=timed_on_text, use_tools=not fast,
+                # text turns (Telegram, dashboard) may dig deeper than voice
+                max_rounds=((self.cfg.get("llm", {}) or {}).get("max_tool_rounds", {}) or {}).get(tier, 5),
             )
         except Exception:
             convo.messages.pop()  # keep history consistent
@@ -226,6 +228,12 @@ class Session:
             # one round's calls run concurrently (e.g. delegating to several
             # area agents at once); results go back together, in call order
             results = list(await asyncio.gather(*(run_one(c) for c in resp.tool_calls)))
+            if totals["rounds"] >= max_rounds and results:
+                # last allowed round: ask for the answer instead of more calls,
+                # so running out of rounds never ends in an empty reply
+                call, output, is_error = results[-1]
+                results[-1] = (call, f"{output}\n\n[That was the last tool call this turn: answer now "
+                                     "from what you have, and say what you couldn't check.]", is_error)
             scratch.extend(self.llm.tool_messages(resp, results))
             resp = await self.llm.chat(
                 self.system_prompt, scratch, tier=tier, tools=tools, on_text=live_on_text

@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from .agents import AreaAgents
 from .areas import Area, load_areas
 from .clock import Clock
+from .coach import Coach, build_coach_tools
 from .sources import Source, build_source_tools, load_sources
 from .store import LifeStore
 from .strava import Strava, build_strava_tools
@@ -34,6 +35,7 @@ class LifeContext:
     agents: AreaAgents
     sources: list[Source] | None = None
     strava: Strava | None = None
+    coach: Coach | None = None
 
 
 def system_timezone() -> str | None:
@@ -69,8 +71,10 @@ def make_context(cfg: dict, base_tools: list) -> LifeContext:
     strava_area = lcfg.get("strava_area", "fitness")
     strava = Strava(store, clock, ROOT / "data" / "strava.json", strava_area if strava_area in ids else ids[0])
     agents = AreaAgents(cfg, store, clock, areas, base_tools, ROOT / "data" / "life_agents.log", sources)
-    agents.strava = strava
-    return LifeContext(clock=clock, store=store, areas=areas, agents=agents, sources=sources, strava=strava)
+    coach = Coach(store, clock, strava.area)
+    agents.strava, agents.coach = strava, coach
+    return LifeContext(clock=clock, store=store, areas=areas, agents=agents, sources=sources, strava=strava,
+                       coach=coach)
 
 
 def attach(session) -> LifeContext:
@@ -79,5 +83,6 @@ def attach(session) -> LifeContext:
     session.tools.extend(build_life_tools(ctx.store, ctx.clock, ctx.areas))
     session.tools.extend(build_source_tools(ctx.sources or []))
     session.tools.extend(build_strava_tools(ctx.strava))
+    session.tools.extend(build_coach_tools(ctx.coach))
     session.tools.append(ctx.agents.delegate_tool())
     return ctx

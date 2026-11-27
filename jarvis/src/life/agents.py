@@ -27,6 +27,7 @@ from pathlib import Path
 from ..tools import Tool, run_tool
 from .areas import Area, ensure_project_folder, read_context, workspace_root
 from .clock import Clock
+from .coach import build_coach_tools
 from .sources import Source, build_source_tools
 from .store import LifeStore
 from .strava import build_strava_tools
@@ -97,7 +98,8 @@ class AreaAgents:
         self.base_tools = base_tools
         self.log_path = log_path
         self.sources = sources or []
-        self.strava = None  # set by make_context; its tools go to the Strava area's agent
+        self.strava = None  # set by make_context; its tools (and the coach's) go to the Strava area's agent
+        self.coach = None
         lcfg = cfg.get("life", {}) or {}
         self.owner = lcfg.get("owner", "the user")
         self.tier_name = lcfg.get("area_tier", "area")
@@ -131,6 +133,7 @@ class AreaAgents:
             *build_life_tools(self.store, self.clock, self.areas, fixed=area),
             *build_source_tools(self.sources, area),  # read-only: this area's projects only
             *(build_strava_tools(self.strava) if self.strava and self.strava.area == area.id else []),
+            *(build_coach_tools(self.coach) if self.coach and self.coach.area == area.id else []),
             *shared,
         ]
 

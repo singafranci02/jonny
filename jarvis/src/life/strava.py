@@ -160,8 +160,9 @@ def base_calories(goal: str, weight_kg: float | None) -> int:
     return BASE_KCAL_DEFAULT.get(goal, 2500)
 
 
-def day_targets(goal: str, weight_kg: float | None, feature: dict | None) -> dict:
-    adj = 0
+def day_targets(goal: str, weight_kg: float | None, feature: dict | None, adjust: int = 0) -> dict:
+    """adjust: the coach's calorie adjustment from his bodyweight trend."""
+    adj = adjust
     if feature and feature.get("minutes"):
         adj += 500 if feature["intensity"] >= 7 else 300 if feature["intensity"] >= 4 else 0
         adj += 200 if feature.get("long_run") else 0
@@ -359,8 +360,13 @@ class Strava:
             return float(rows[0]["value"]), self.clock.when(rows[0]["logged_at"])
         return None
 
-    def fuel_targets(self, goal: str = "performance", weight_kg: float | None = None) -> str:
-        goal = goal if goal in PROTEIN_RATIO else "performance"
+    def fuel_targets(self, goal: str | None = None, weight_kg: float | None = None) -> str:
+        profile = self.store.get_setting("coach_profile") or {}
+        adjust = int(profile.get("kcal_adjust", 0) or 0)
+        if goal not in PROTEIN_RATIO:
+            from .coach import GOALS
+
+            goal = GOALS[profile["goal"]][1] if profile.get("goal") in GOALS else "performance"
         source = "given"
         if not weight_kg:
             w = self.latest_weight()
@@ -370,17 +376,18 @@ class Strava:
         if self.connected():
             today_feature = day_features(self.activities(int(time.time()) - 86400)).get(
                 self.clock.today().isoformat())
-        rest = day_targets(goal, weight_kg, None)
-        moderate = day_targets(goal, weight_kg, {"minutes": 45, "intensity": 5})
-        hard = day_targets(goal, weight_kg, {"minutes": 60, "intensity": 7})
-        lines = [f"Goal {goal}, " + (f"weight {weight_kg:g} kg ({source})." if weight_kg
-                                     else "no weight logged, so reference values (log a weight for better ones)."),
+        rest = day_targets(goal, weight_kg, None, adjust)
+        moderate = day_targets(goal, weight_kg, {"minutes": 45, "intensity": 5}, adjust)
+        hard = day_targets(goal, weight_kg, {"minutes": 60, "intensity": 7}, adjust)
+        lines = [f"Goal {goal}, " + (f"weight {weight_kg:g} kg ({source})" if weight_kg
+                                     else "no weight logged, so reference values (log a weight for better ones)")
+                 + (f", calories {adjust:+d}/day from the coach's weight-trend check." if adjust else "."),
                  f"Rest day: {_targets_line(rest)}",
                  f"Moderate session: {_targets_line(moderate)}",
                  f"Hard session (intensity 7+): {_targets_line(hard)}",
                  "Long run (over 75 min or 15 km): +200 kcal on top, as carbs."]
         if today_feature:
-            t = day_targets(goal, weight_kg, today_feature)
+            t = day_targets(goal, weight_kg, today_feature, adjust)
             lines.append(f"Today ({today_feature['minutes']} min, intensity {today_feature['intensity']}/10): "
                          f"{_targets_line(t)}" + (f"; {t['timing']}" if t.get("timing") else ""))
         lines.append("Estimates from a simple formula (MacroClaw's), not medical advice.")
@@ -428,9 +435,9 @@ def build_strava_tools(strava: Strava | None) -> list[Tool]:
                          "Estimates; weight comes from his latest weight log unless given."),
             parameters={"type": "object", "properties": {
                 "goal": {"type": "string", "enum": ["performance", "lean_bulk", "cut"],
-                         "description": "default performance (maintenance)"},
+                         "description": "default: from his training program's goal, else performance"},
                 "weight_kg": {"type": "number"}}},
-            func=lambda goal="performance", weight_kg=None: strava.fuel_targets(goal, weight_kg),
+            func=lambda goal=None, weight_kg=None: strava.fuel_targets(goal, weight_kg),
             timeout=45,
         ),
     ]
