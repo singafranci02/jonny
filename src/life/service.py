@@ -137,6 +137,8 @@ class LifeService:
             self._tasks.append(asyncio.ensure_future(self._poll_loop()))
             self._tasks.append(asyncio.ensure_future(self.announce_menu()))
             self._tasks.append(asyncio.ensure_future(self.resume_cut_off()))
+        if self.life.index is not None:  # build the index now, in its own thread
+            self.life.index.refresh_soon(min_age=0)
         self._tasks.append(asyncio.ensure_future(self._scheduler_loop()))
 
     async def stop(self) -> None:
@@ -697,6 +699,8 @@ class LifeService:
                 await self._maybe_backup()
                 await self._maybe_sync_strava()
                 await self._coach_tick()
+                if self.life.index is not None:  # never blocks: refreshes in its own thread when stale
+                    await asyncio.to_thread(self.life.index.refresh_soon)
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -834,6 +838,7 @@ class LifeService:
             "folder": folder_status(self.cfg),
             "full_disk_access_target": full_disk_access_target(),
             "timezone": self.clock.tz_name,
+            "index": self.life.index.status() if self.life.index is not None else None,
             "coordinator_model": self.cfg["llm"]["tiers"][self.coordinator_tier]["model"],
             "area_model": self.cfg["llm"]["tiers"].get(self.life.agents.tier_name, {}).get("model"),
             "checkins": [

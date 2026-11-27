@@ -686,6 +686,47 @@ class LifeStore:
 
     # ---------------- overview ----------------
 
+    # ---------------- search (the index's `find` reads this) ----------------
+
+    def search_text(self, stems: list[str], area: str | None = None, chat: bool = False,
+                    days: int = 365) -> list[dict]:
+        """Board items, reminders, log notes, agent reports and (chat=True)
+        the chat, where they mention the words: `stems` are lowercase word
+        stems, matched anywhere in the text. Each hit: kind, id, area, text
+        (what to show), when (ISO), score (how many stems matched)."""
+        stems = [s for s in dict.fromkeys(stems) if s][:8]
+        if not stems:
+            return []
+        since = to_iso(utc_now() - timedelta(days=days))
+        out: list[dict] = []
+
+        def scan(kind: str, sql: str, cols: tuple[str, ...], args: tuple, label) -> None:
+            hay = " || ' ' || ".join(f"coalesce({c}, '')" for c in cols)
+            where = " or ".join(f"lower({hay}) like ?" for _ in stems)
+            with self._db() as c:
+                rows = c.execute(f"{sql} and ({where}) limit 300", (*args, *(f"%{s}%" for s in stems))).fetchall()
+            for r in rows:
+                text = " ".join(str(r[c] or "") for c in cols).lower()
+                score = sum(1 for s in stems if s in text)
+                out.append({"kind": kind, "id": r["id"], "area": r["area"], "score": score, **label(r)})
+
+        a = (area, area)
+        scan("item", "select * from items where (? is null or area = ?)", ("title", "details", "next_step"), a,
+             lambda r: {"when": r["updated_at"], "row": dict(r)})
+        scan("reminder", "select * from reminders where (? is null or area = ?) and (status = 'pending' or "
+             "updated_at > ?)", ("text",), (*a, since), lambda r: {"when": r["due_at"], "row": dict(r)})
+        scan("log", "select * from logs where (? is null or area = ?) and logged_at > ? and note is not null",
+             ("metric", "note"), (*a, since), lambda r: {"when": r["logged_at"], "row": dict(r)})
+        scan("run", "select * from agent_runs where (? is null or area = ?) and started_at > ? and "
+             "status = 'done'", ("task", "report"), (*a, since), lambda r: {"when": r["started_at"], "row": dict(r)})
+        if chat:
+            scan("chat", "select * from messages where created_at > ? and source in "
+                 "('user', 'chat', 'checkin')", ("text",), (since,),
+                 lambda r: {"when": r["created_at"], "row": dict(r)})
+        # best match first; among equals, the newest
+        out.sort(key=lambda h: (h["score"], h["when"] or ""), reverse=True)
+        return out
+
     def overview(self, area: str | None = None) -> dict:
         when = self.clock.when
         items = self.open_items(area, limit=60)

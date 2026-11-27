@@ -20,20 +20,19 @@ from __future__ import annotations
 
 import base64
 import concurrent.futures
-import io
 import json
 import logging
 import re
 import shutil
 import subprocess
 import time
-import zipfile
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from xml.etree import ElementTree as ET
+from urllib.parse import quote
 
 from ..tools import Tool
+from ..tools.documents import document_text, part_text
 
 log = logging.getLogger(__name__)
 
@@ -159,135 +158,7 @@ def _tilde(p: Path) -> str:
 
 def _part(text: str, part: int = 1, size: int = MAX_CHARS) -> str:
     """One numbered part of a long text, cut at a line break."""
-    chunks, rest = [], text
-    while len(rest) > size:
-        cut = rest.rfind("\n", 0, size)
-        cut = cut if cut > size // 2 else size
-        chunks.append(rest[:cut])
-        rest = rest[cut:].lstrip("\n")
-    chunks.append(rest)
-    if len(chunks) == 1:
-        return text
-    part = max(1, min(int(part or 1), len(chunks)))
-    tail = f"\n… part {part} of {len(chunks)}" + (f"; read part {part + 1} for more" if part < len(chunks) else "")
-    return chunks[part - 1] + tail
-
-
-# ---------------------------------------------------------------- documents
-
-
-_NS = {"m": "http://schemas.openxmlformats.org/spreadsheetml/2006/main",
-       "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships"}
-_M = "{" + _NS["m"] + "}"
-
-
-def _col(ref: str) -> int:
-    n = 0
-    for ch in re.match(r"[A-Z]+", ref).group(0):
-        n = n * 26 + ord(ch) - 64
-    return n - 1
-
-
-def _date_styles(z: zipfile.ZipFile) -> set[int]:
-    """Indexes of cell styles that show a date (so 46326 reads 2026-10-31)."""
-    if "xl/styles.xml" not in z.namelist():
-        return set()
-    root = ET.fromstring(z.read("xl/styles.xml"))
-    custom = {}
-    for nf in root.iter(f"{_M}numFmt"):
-        code = re.sub(r'"[^"]*"|\[[^\]]*\]|\\.', "", nf.get("formatCode", "").lower())
-        custom[int(nf.get("numFmtId"))] = code
-    out = set()
-    xfs = root.find("m:cellXfs", _NS)
-    for i, xf in enumerate(xfs if xfs is not None else []):
-        fid = int(xf.get("numFmtId", 0))
-        code = custom.get(fid, "")
-        if 14 <= fid <= 22 or fid in (45, 46, 47) or ("d" in code or "y" in code):
-            out.add(i)
-    return out
-
-
-def xlsx_text(src, max_rows: int = 80) -> str:
-    """Every sheet as text rows ("a | b | c"), dates as dates. Stdlib only."""
-    z = zipfile.ZipFile(src)
-    shared = []
-    if "xl/sharedStrings.xml" in z.namelist():
-        for si in ET.fromstring(z.read("xl/sharedStrings.xml")).findall("m:si", _NS):
-            shared.append("".join(t.text or "" for t in si.iter(f"{_M}t")))
-    dates = _date_styles(z)
-    rels = {r.get("Id"): r.get("Target") for r in ET.fromstring(z.read("xl/_rels/workbook.xml.rels"))}
-    out = []
-    for sh in ET.fromstring(z.read("xl/workbook.xml")).find("m:sheets", _NS):
-        target = rels[sh.get(f"{{{_NS['r']}}}id")].lstrip("/")
-        target = target if target.startswith("xl/") else f"xl/{target}"
-        out.append(f"== sheet: {sh.get('name')}")
-        rows = 0
-        for row in ET.fromstring(z.read(target)).iter(f"{_M}row"):
-            cells: dict[int, str] = {}
-            for c in row.findall("m:c", _NS):
-                v, inline = c.find("m:v", _NS), c.find("m:is", _NS)
-                if c.get("t") == "s" and v is not None:
-                    val = shared[int(v.text)]
-                elif inline is not None:
-                    val = "".join(t.text or "" for t in inline.iter(f"{_M}t"))
-                elif v is not None and v.text is not None:
-                    val = v.text
-                    if c.get("t") in (None, "n") and int(c.get("s", -1)) in dates:
-                        try:
-                            val = (datetime(1899, 12, 30) + timedelta(days=float(val))).strftime("%Y-%m-%d")
-                        except (ValueError, OverflowError):
-                            pass
-                    elif re.fullmatch(r"-?\d+\.\d{5,}", val):
-                        val = f"{float(val):.4g}"
-                else:
-                    continue
-                val = " ".join(val.split())
-                if val and c.get("r"):
-                    cells[_col(c.get("r"))] = val
-            if not cells:
-                continue
-            first, last = min(cells), max(cells)
-            out.append(" | ".join(cells.get(i, "") for i in range(first, last + 1)))
-            rows += 1
-            if rows >= max_rows:
-                out.append("… (more rows)")
-                break
-    return "\n".join(out)
-
-
-def pdf_text(src, max_pages: int = 20) -> str:
-    from pypdf import PdfReader
-
-    reader = PdfReader(src)
-    pages = [(p.extract_text() or "").strip() for p in reader.pages[:max_pages]]
-    text = "\n\n".join(f"[page {i + 1}]\n{t}" for i, t in enumerate(pages) if t)
-    more = f"\n… ({len(reader.pages)} pages in all)" if len(reader.pages) > max_pages else ""
-    return (text or "(no text in this PDF: it is probably all images)") + more
-
-
-def docx_text(src) -> str:
-    root = ET.fromstring(zipfile.ZipFile(src).read("word/document.xml"))
-    w = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
-    paras = ["".join(t.text or "" for t in p.iter(f"{w}t")) for p in root.iter(f"{w}p")]
-    return "\n".join(p for p in paras if p.strip())
-
-
-def document_text(name: str, data: bytes) -> str:
-    """Text of one file's bytes: spreadsheets, PDFs and Word files are
-    converted; other binaries are refused."""
-    ext = Path(name).suffix.lower()
-    try:
-        if ext in (".xlsx", ".xlsm"):
-            return xlsx_text(io.BytesIO(data))
-        if ext == ".pdf":
-            return pdf_text(io.BytesIO(data))
-        if ext == ".docx":
-            return docx_text(io.BytesIO(data))
-    except Exception as e:
-        return f"(couldn't read this {ext} file: {type(e).__name__})"
-    if b"\0" in data[:8000]:
-        return f"(binary file, {len(data) // 1024} KB: can't show it)"
-    return data.decode("utf-8", errors="replace")
+    return part_text(text, part, size)
 
 
 # ---------------------------------------------------------------- git / gh
@@ -365,9 +236,11 @@ def last_activity(s: Source, ttl: float = 600) -> str:
     return out
 
 
-def build_source_tools(sources: list[Source], area=None) -> list[Tool]:
+def build_source_tools(sources: list[Source], area=None, suggest=None) -> list[Tool]:
     """project_* tools over `sources`; an area agent only sees its own
-    area's projects, and gets no tools at all if it has none."""
+    area's projects, and gets no tools at all if it has none. `suggest`
+    (name, path) -> close paths, from the index: a wrong guess at a path
+    comes back with the likely right ones instead of a dead end."""
     mine = [s for s in sources if area is None or s.area == area.id]
     if not mine:
         return []
@@ -418,7 +291,13 @@ def build_source_tools(sources: list[Source], area=None) -> list[Tool]:
         for p in parts:
             if p == ".." or is_secret_name(p) or p in SKIP_DIRS:
                 raise ValueError(f"can't read {rel}: outside the project, or a secret or build folder")
-        text = _read_local(s, parts) if s.path else _read_github(s, "/".join(parts))
+        try:
+            text = _read_local(s, parts) if s.path else _read_github(s, "/".join(parts))
+        except (ValueError, RuntimeError) as e:
+            close = suggest(s.name, rel) if (suggest and rel) else []
+            if close:
+                raise ValueError(f"{e}. Did you mean: " + "; ".join(close)) from None
+            raise
         return _part(text, part)
 
     tools = [
@@ -445,8 +324,10 @@ def build_source_tools(sources: list[Source], area=None) -> list[Tool]:
         Tool(
             name="project_read",
             description=("Read inside one project: path empty or a folder lists it; a file returns its text. "
-                         "Spreadsheets (.xlsx), PDFs and Word files come back as text, so a tracker or plan can "
-                         "be read directly. Read-only; secrets (.env, keys) are never shown."),
+                         "Spreadsheets (.xlsx), PDFs, Word files and slides come back as text, so a tracker or "
+                         "plan can be read directly. Read-only; secrets (.env, keys) are never shown. To look "
+                         "for a fact or a file, call find first and open the hit it gives you (path and part); "
+                         "don't hunt through folders one level at a time."),
             parameters={"type": "object", "properties": {
                 "name": {"type": "string", "enum": names},
                 "path": {"type": "string", "description": 'inside the project, e.g. "README.md" or "docs"; '
@@ -476,7 +357,9 @@ def _read_local(s: Source, parts: list[str]) -> str:
             if e.is_dir():
                 lines.append(f"{e.name}/")
             else:
-                lines.append(f"{e.name} ({max(1, e.stat().st_size // 1024)} KB)")
+                st = e.stat()
+                lines.append(f"{e.name} ({max(1, st.st_size // 1024)} KB, "
+                             f"{datetime.fromtimestamp(st.st_mtime):%Y-%m-%d})")
             if len(lines) >= 200:
                 lines.append("… (more)")
                 break
@@ -488,7 +371,7 @@ def _read_local(s: Source, parts: list[str]) -> str:
 
 
 def _read_github(s: Source, path: str) -> str:
-    data = _gh(f"repos/{s.github}/contents/{path}")
+    data = _gh(f"repos/{s.github}/contents/{quote(path)}")
     if isinstance(data, list):
         lines = [f"{e['name']}/" if e["type"] == "dir" else f"{e['name']} ({max(1, e.get('size', 0) // 1024)} KB)"
                  for e in sorted(data, key=lambda e: (e["type"] != "dir", e["name"].lower()))

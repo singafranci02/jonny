@@ -261,6 +261,43 @@ you (Telegram / voice / website) ──► Jarvis ── delegate (parallel) ─
   PDFs and Word files come back as text. `.env` files, keys and credential
   files are refused, and key-like strings in any text are masked. GitHub goes
   through the `gh` CLI's own login.
+- **Where things are: the index** (`src/life/index.py`). One index covers
+  everything Jarvis and the agents can read: the Jarvis folder and every
+  project folder and repo, including the text inside documents,
+  spreadsheets, PDFs, slides, notes and code. It exists because agents used to
+  hunt folder by folder. One question about a contract spent all its tool
+  rounds opening one folder, then the folder inside it, then the next, and
+  never answered. There are three tools:
+  - `find` searches all of it in one call, plus the board, reminders, logs,
+    past agent reports and, for Jarvis only, the chat. It returns the best
+    files, the matching lines, and the exact `project_read` or
+    `ws_read_file` call to open each, including which part of a long file.
+  - `map` gives an outline of a place: folders, file counts, dates, titles and
+    notes. Each area agent also gets **WHERE THINGS ARE** with every task: its
+    own folder, one line per project it can read, and the full map of any
+    project the task names.
+  - `map_note` lets an agent leave one line on a file or folder its name
+    doesn't explain. Find searches notes and map shows them. A note is
+    flagged when the file changes after it, and dropped when the file goes.
+
+  Each agent sees only its own area. Wrong paths in `project_read` come back
+  with the closest real ones.
+
+  The index makes no model calls. It lives in `data/index.db` (SQLite FTS5,
+  porter stemming), which can be rebuilt at any time, is never backed up and
+  is never in git. Refreshes are incremental: a file is read again only
+  when its size or date changes.
+  - The first build runs on start (about 40s for 15 places and 1,800 files).
+  - After that, the scheduler refreshes it every 10 minutes.
+  - The Jarvis folder is re-checked before a search if it is over a minute
+    old.
+  - GitHub-only repos are re-checked every 6 hours. Only their file list and
+    their docs (README and nearby .md files) are indexed, not their code's
+    text.
+
+  Secret files are never read, and key-like strings are masked. Document
+  reading (`src/tools/documents.py`) is shared, so a hit's "part 2" is the
+  same part 2 the reader shows.
 - **Memory that survives restarts** (ideas from LangGraph, without the
   library): each area agent's runs are recorded in `agent_runs` as they
   happen (task, every verified change, report), and the agent sees its last
@@ -377,7 +414,8 @@ Jarvis/  (the brain)
     main.py              the turn loop + Mac voice loop + warmup
     server.py            HTTP brain for the website (/chat_stream, /stt, /tts…)
     llm/                 tiered models (haiku/sonnet/qwen), router, tools loop
-    tools/               web_search, fetch_page, datetime, calculate, memory…
+    tools/               web_search, fetch_page, datetime, calculate, memory…,
+                         documents.py (PDF/Word/sheet/slides as text, in parts)
     stt/                 speech-in (faster-whisper) + mic-test diagnostic
     tts/                 speech-out (Kokoro voice, macOS `say` fallback) + streamer
     memory/              Mem0 store + CLI (facts it learns)
@@ -385,7 +423,8 @@ Jarvis/  (the brain)
     profile.py           the editable "About Me"
     research/            plan → gather → cite → save pipeline
     life/                Life HQ: area agents + delegate, reminders/tasks/logs (SQLite),
-                         Telegram polling, scheduler + check-ins, /life/* API, `make life`
+                         Telegram polling, scheduler + check-ins, /life/* API, `make life`,
+                         index.py (find/map/map_note: where everything is)
   tests/                 `make test` (no network): the life organiser + turn-loop hooks
     context.py           assembles profile + memories + knowledge into the prompt
     wakeword/            "hey jarvis" gate + conversation window
