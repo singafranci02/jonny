@@ -149,6 +149,10 @@ life:
   # his other projects (folders, GitHub repos) that Jarvis and the area agents may
   # READ: private list, kept out of git. Format: project_sources.example.yaml
   sources_file: data/project_sources.yaml
+  # where things are: a full-text index of every readable file (the Jarvis
+  # folder + the projects above) behind find/map/map_note. Rebuildable, never
+  # backed up; refreshed on start and every 10 minutes. Code: src/life/index.py
+  index_db: data/index.db
   inbox: Inbox
   backup_keep: 14             # nightly copies of the database in Jarvis/_backups
   coordinator_tier: coordinator   # Jarvis on Telegram, the dashboard and check-ins

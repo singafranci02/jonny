@@ -28,6 +28,7 @@ from ..tools import Tool, run_tool
 from .areas import Area, ensure_project_folder, read_context, workspace_root
 from .clock import Clock
 from .coach import build_coach_tools
+from .index import build_index_tools
 from .sources import Source, build_source_tools
 from .store import LifeStore
 from .strava import build_strava_tools
@@ -66,6 +67,8 @@ Projects on {owner}'s board that belong to your area are items of kind project, 
 
 When a task names one of your projects, you get its own folder, its brief (CONTEXT.md in that folder) and its tracker (the project's tasks). Then you work on that project for {owner}: research, plans, drafts, documents, decisions; whatever the task asks, done properly. Save what you make in the project's folder. Keep the brief current (what it is, where it stands, decisions, next) and the tracker as the list of concrete tasks: add them with life_add_item (kind task, project = its id, a due date when there is one), tick them off with life_update_item (status done), and keep the project's next step equal to the most important open task.
 
+Finding things: an index covers everything you can read (your folder, your projects' folders and repos with the text inside their documents, spreadsheets, PDFs and slides, and your area's board, reminders, logs and past runs). WHERE THINGS ARE, with each task, maps it for you. To look up a fact, a figure, a date or a document, call find first with a few distinctive words; it returns the files that match, the lines that match and the exact call to open each, so open only the best hit (the part it names). Use map to see inside a project or folder; never hunt by listing folders one level at a time. When you work out what a file or folder holds that its name doesn't say, leave a one-line map_note so the next search lands on it.
+
 {_projects_line(owner) if projects else ""}Do the task fully, then reply to Jarvis in this shape (plain text, no headings or tables):
 Line 1: the answer for {owner} in one short sentence; Jarvis may pass it on word for word.
 Then, only if needed, up to 4 short lines of detail Jarvis needs.
@@ -75,8 +78,9 @@ Don't list what you changed: a verified list of your changes is attached to your
 
 def _projects_line(owner: str) -> str:
     return (f"Some of {owner}'s projects live outside your folder, in their own folders and GitHub repos. "
-            "project_list, project_activity and project_read read them (never change them). Check them before "
-            "saying where a project stands, and quote dates and owners from the source, not from memory.\n\n")
+            "project_list, project_activity and project_read read them (never change them); find searches "
+            "inside them. Check them before saying where a project stands, and quote dates, figures and owners "
+            "from the source, not from memory.\n\n")
 
 
 class AreaAgents:
@@ -100,6 +104,7 @@ class AreaAgents:
         self.sources = sources or []
         self.strava = None  # set by make_context; its tools (and the coach's) go to the Strava area's agent
         self.coach = None
+        self.index = None  # set by make_context: find/map/map_note and the map with each task
         lcfg = cfg.get("life", {}) or {}
         self.owner = lcfg.get("owner", "the user")
         self.tier_name = lcfg.get("area_tier", "area")
@@ -131,7 +136,9 @@ class AreaAgents:
         return [
             *workspace.build(area_cfg),  # confined to this area's folder
             *build_life_tools(self.store, self.clock, self.areas, fixed=area),
-            *build_source_tools(self.sources, area),  # read-only: this area's projects only
+            *build_source_tools(self.sources, area, suggest=self.index.suggest if self.index else None),
+            *(build_index_tools(self.index, self.index.scope_for(area.id, area.folder, self.owner), author=area.id)
+              if self.index else []),
             *(build_strava_tools(self.strava) if self.strava and self.strava.area == area.id else []),
             *(build_coach_tools(self.coach) if self.coach and self.coach.area == area.id else []),
             *shared,
@@ -189,6 +196,19 @@ class AreaAgents:
             out.append(f"{head} Task: {task}\nYour report: {_squash(prose, 500)}\nChanges: {changes or 'none'}")
         return "YOUR RECENT RUNS in this area (oldest first; for continuity, don't redo them):\n" + "\n\n".join(out)
 
+    def where_things_are(self, area: Area, task: str, project_text: str = "") -> str:
+        """The map that comes with each task: the agent's folder, its
+        projects, and the full map of any project the task names. A help,
+        never a blocker."""
+        if self.index is None:
+            return ""
+        try:
+            return self.index.briefing(self.index.scope_for(area.id, area.folder, self.owner), task,
+                                       also=[project_text[:200]] if project_text else None)
+        except Exception as e:
+            log.warning("index briefing failed: %s", e)
+            return ""
+
     # ---------------- the subagent loop ----------------
 
     def project_block(self, area: Area, project) -> str:
@@ -230,6 +250,7 @@ class AreaAgents:
         started = time.monotonic()
         deadline = started + self.timeout_s
         recent = self.recent_work(area)  # read before this run is recorded
+        where = self.where_things_are(area, task, project_text)
         run_id = self._record(self.store.start_agent_run, area.id, task)
         model_cfg = self.model_cfg()
         tools = self.tools_for(area)
@@ -254,6 +275,7 @@ class AreaAgents:
                     f"CURRENT TIME: {self.clock.label_now()}\n\n"
                     f"YOUR CONTEXT.md ({area.folder}/CONTEXT.md):\n{read_context(self.cfg, area)}\n\n"
                     + (f"{recent}\n\n" if recent else "")
+                    + (f"{where}\n\n" if where else "")
                     + (f"{project_text}\n\n" if project_text else "")
                     + f"TASK FROM JARVIS:\n{task}"
                     + (f"\n\nYOUR REPORT MUST INCLUDE: {expected_output}" if expected_output else "")

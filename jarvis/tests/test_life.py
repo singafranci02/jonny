@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import time
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -1325,6 +1326,333 @@ def test_area_agents_get_their_own_projects(cfg, store, clock, tmp_path):
     agents.run("projects", "where is the site at?")
     system = fake.requests[1]["system"][0]["text"]
     assert "project_list, project_activity and project_read" in system and "strike it through" in system
+
+
+# ---------------------------------------------------------------- the index (where things are)
+
+
+def _docx(path: Path, *paras: str) -> Path:
+    import zipfile
+
+    w = 'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"'
+    body = "".join(f"<w:p><w:r><w:t>{p}</w:t></w:r></w:p>" for p in paras)
+    with zipfile.ZipFile(path, "w") as z:
+        z.writestr("word/document.xml", f"<w:document {w}><w:body>{body}</w:body></w:document>")
+    return path
+
+
+def _pptx(path: Path, *slides: str) -> Path:
+    import zipfile
+
+    a = 'xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"'
+    with zipfile.ZipFile(path, "w") as z:
+        for i, text in enumerate(slides, 1):
+            z.writestr(f"ppt/slides/slide{i}.xml", f"<p:sld xmlns:p=\"p\" {a}><a:p><a:r><a:t>{text}</a:t></a:r></a:p></p:sld>")
+    return path
+
+
+@pytest.fixture
+def indexed(cfg, store, tmp_path):
+    """A Jarvis folder and one project folder, indexed."""
+    from src.life.index import Index
+    from src.life.sources import Source
+
+    ensure_folders(cfg)
+    ws = Path(cfg["workspace"]["path"])
+    (ws / "Fitness" / "plan.md").write_text("# Training plan\n\n" + "\n".join(f"filler line {i} " + "x" * 70
+                                                                             for i in range(90))
+                                           + "\n\n## Deadlift\nWork up to 140 kg for 5.\n")
+    (ws / "Work" / "brief.md").write_text("# Work brief\nQuarterly targets and the hiring plan.\n")
+    (ws / "Work" / "_trash").mkdir()
+    (ws / "Work" / "_trash" / "old.md").write_text("hiring plan, an old version")
+    proj = tmp_path / "proj"
+    (proj / "docs").mkdir(parents=True)
+    (proj / "node_modules").mkdir()
+    (proj / "node_modules" / "lib.js").write_text("hiring plan inside a dependency")
+    (proj / "README.md").write_text("# Proj\nA pottery shop.")
+    _docx(proj / "docs" / "agreement.docx", "Partnership terms",
+          "Each partner pays up to 500 towards the kiln before launch.")
+    _xlsx(proj / "tracker.xlsx")
+    _pptx(proj / "deck.pptx", "The shop", "Pitch: handmade mugs for cafes")
+    (proj / ".env").write_text("ANTHROPIC_API_KEY=sk-ant-api03-abcdefghijklmnopqrstuvwxyz")
+    (proj / "config.py").write_text('API_KEY = "sk-ant-api03-abcdefghijklmnopqrstuvwxyz0123"\nretries = 3\n')
+    srcs = [Source("proj", "work", "My pottery shop", proj)]
+    idx = Index(tmp_path / "index.db", ws, srcs, store)
+    idx.refresh_soon = lambda *a, **k: False  # tests refresh by hand
+    stats = idx.refresh()
+    return SimpleNamespace(idx=idx, ws=ws, proj=proj, srcs=srcs, stats=stats)
+
+
+def test_index_finds_inside_documents_and_says_where_to_open(indexed):
+    idx = indexed.idx
+    everything = idx.scope_all("Francesco")
+    assert indexed.stats["proj"] == 5 and indexed.stats["folder"] >= 5  # briefs, plan, brief; not the trash
+
+    hit = idx.find(everything, "partner pays")
+    assert "1. proj › docs/agreement.docx (Word" in hit and '"Partnership terms"' in hit
+    assert "«partner» «pays» up to 500" in hit
+    assert 'open: project_read name="proj" path="docs/agreement.docx"' in hit
+
+    deadlift = idx.find(everything, "deadlift")  # deep in a long file: the hit names the part to open
+    assert "Jarvis folder › Fitness/plan.md" in deadlift and "part 2, § Deadlift: «Deadlift» Work up to 140 kg" in deadlift
+    assert 'open: ws_read_file name="Fitness/plan.md" part=2' in deadlift
+    from src.tools import workspace as W
+
+    assert "Work up to 140 kg" in W.read_file({"workspace": {"path": str(indexed.ws)}}, "Fitness/plan.md", part=2)
+
+    assert "sheet Tracker: …" in idx.find(everything, "agree contributions") or \
+        "sheet Tracker:" in idx.find(everything, "agree contributions")
+    assert "slide 2: «Pitch»" in idx.find(everything, "pitch mugs")
+    assert "proj › tracker.xlsx" in idx.find(everything, "tracker")  # file names count too
+
+    # never indexed: secrets, dependencies, the trash
+    assert "Nothing anywhere" in idx.find(everything, "abcdefghijklmnopqrstuvwxyz")
+    with idx._db() as c:
+        assert not c.execute("select 1 from pieces where body like '%sk-ant%'").fetchall()
+        assert c.execute("select count(*) from chunks where chunks match 'kiln'").fetchone()[0] == 1
+        paths = {r["path"] for r in c.execute("select path from files")}
+    assert ".env" not in paths and "node_modules/lib.js" not in paths and "Work/_trash/old.md" not in paths
+    assert "config.py" in paths and "retries" in idx.find(everything, "retries")
+    assert "Give find a few words" in idx.find(everything, "  ")
+
+
+def test_index_scopes_each_agent_to_its_own(indexed):
+    idx = indexed.idx
+    fit = idx.scope_for("fitness", "Fitness", "Francesco")
+    assert fit.places == ["folder"]  # the project belongs to work
+    hit = idx.find(fit, "deadlift")
+    assert "your folder › plan.md" in hit and 'ws_read_file name="plan.md" part=2' in hit
+    assert "Nothing" in idx.find(fit, "hiring") and "Nothing" in idx.find(fit, "partner")
+    assert "plan.md" in idx.find(fit, "hiring plan")  # no file has both words: the closest have one
+    work = idx.scope_for("work", "Work", "Francesco")
+    assert "your folder › brief.md" in idx.find(work, "hiring plan") and "proj ›" in idx.find(work, "partner")
+    assert "proj ›" in idx.find(work, "pottery", place="proj") and "brief.md" not in idx.find(work, "pottery", place="proj")
+    with pytest.raises(ValueError):
+        idx.find(fit, "partner", place="proj")
+    tools = {t.name: t for t in __import__("src.life.index", fromlist=["x"]).build_index_tools(idx, fit)}
+    assert tools["find"].parameters["properties"]["place"]["enum"] == ["folder"]
+    out, err = tools["map"].run({"place": "proj"})
+    assert err and "no place 'proj'" in out
+
+
+def test_index_refreshes_only_what_changed(indexed):
+    idx, ws = indexed.idx, indexed.ws
+    assert idx.refresh() == {"folder": 0, "proj": 0}  # nothing changed: nothing re-read
+    (ws / "Fitness" / "plan.md").write_text("# Training plan\n## Squat\nFive by five.\n")
+    (ws / "Work" / "brief.md").unlink()
+    assert idx.refresh()["folder"] == 1
+    everything = idx.scope_all()
+    assert "Nothing" in idx.find(everything, "deadlift") and "Squat" in idx.find(everything, "five squat")
+    assert "Work/brief.md" not in idx.find(everything, "hiring plan")
+    idx._lock.acquire()  # a refresh already running: a second one doesn't start
+    try:
+        assert idx.refresh() == {"busy": True}
+    finally:
+        idx._lock.release()
+
+
+def test_index_two_refreshers_never_double_a_file(indexed, store):
+    """The server and a `make life` command may refresh at once: the file
+    is forgotten and stored again inside one write transaction."""
+    import threading
+
+    from src.life.index import Index
+
+    idx = indexed.idx
+    other = Index(idx.path, indexed.ws, indexed.srcs, store)
+    with idx._db() as c:
+        before = c.execute("select count(*) from pieces").fetchone()[0]
+    threads = [threading.Thread(target=i.refresh, kwargs={"force": True}) for i in (idx, other, idx, other)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    with idx._db() as c:
+        assert c.execute("select count(*) from pieces").fetchone()[0] == before
+        assert c.execute("select count(*) from chunks where chunks match 'kiln'").fetchone()[0] == 1
+    other.set_note(other.scope_all(), "proj", "README.md", "the pitch")
+    reopened = Index(idx.path, indexed.ws, indexed.srcs, store)  # same schema: nothing rebuilt, note kept
+    assert "note: the pitch" in reopened.outline(reopened.scope_all(), "proj")
+
+
+def test_index_survives_a_hanging_or_unreadable_place(indexed, monkeypatch):
+    """macOS blocks a read of ~/Desktop until someone answers its permission
+    prompt: that place times out, the others still refresh, and an
+    unreadable folder is an error, never an empty place."""
+    import threading
+
+    idx, ws = indexed.idx, indexed.ws
+    gate = threading.Event()
+    real = idx._refresh_local
+
+    def slow(p, force):
+        if p.name == "proj":
+            gate.wait(10)
+        return real(p, force)
+
+    monkeypatch.setattr(idx, "_refresh_local", slow)
+    (ws / "Work" / "new.md").write_text("fresh notes")
+    stats = idx.refresh(wait=0.5)
+    assert stats == {"folder": 1, "proj": "timed out"}
+    assert "Jarvis folder › Work/new.md" in idx.find(idx.scope_all(), "fresh notes")
+    assert "allow access" in idx.places_text(idx.scope_all())
+    assert idx.refresh(wait=0.5)["proj"] == "still reading"  # not a second stuck thread
+    gate.set()
+    idx._stuck["proj"].join(5)
+    assert idx.refresh(wait=5)["proj"] == 0 and "allow access" not in idx.places_text(idx.scope_all())
+
+    monkeypatch.setattr(idx, "_refresh_local", real)
+    monkeypatch.setattr("src.life.index.os.scandir", lambda d: (_ for _ in ()).throw(PermissionError(1, "denied")))
+    assert idx.refresh(force=True)["proj"] == "error"
+    with idx._db() as c:
+        assert c.execute("select count(*) from files where place = 'proj'").fetchone()[0] == 5  # nothing wiped
+
+
+def test_index_notes_and_maps(indexed):
+    idx, proj = indexed.idx, indexed.proj
+    everything = idx.scope_all()
+    assert "noted on proj › docs/agreement.docx" in idx.set_note(everything, "proj", "docs/agreement.docx",
+                                                                  "the signed terms, with the studio rent")
+    hit = idx.find(everything, "studio rent")  # found by its note, not its name or text
+    assert "proj › docs/agreement.docx" in hit and "note: the signed terms" in hit
+    assert "changed since" not in hit
+    idx.set_note(everything, "proj", "docs", "legal papers")
+    folder_hit = idx.find(everything, "legal papers")
+    assert "proj › docs/ (folder)" in folder_hit and 'see inside: map place="proj" path="docs"' in folder_hit
+    with pytest.raises(ValueError, match="Did you mean"):
+        idx.set_note(everything, "proj", "docs/agrement.docx", "typo")
+
+    full = idx.outline(everything, "proj")
+    assert full.startswith("proj (") and "5 files" in full
+    assert "docs/ — note: legal papers" in full and "agreement.docx · " in full and "note: the signed" in full
+    assert "deck.pptx" in full and '"sheets: Tracker"' in full
+    small = idx.outline(everything, "proj", budget=3)
+    assert "top level:" in small and "docs/ (1 file)" in small
+    assert "Nothing indexed under proj › nope" in idx.outline(everything, "proj", "nope")
+    assert "- proj: My pottery shop · " in idx.places_text(everything) and "docs/" in idx.places_text(everything)
+
+    time.sleep(0.01)
+    _docx(proj / "docs" / "agreement.docx", "Partnership terms, second draft")
+    import os
+
+    os.utime(proj / "docs" / "agreement.docx", (time.time() + 5, time.time() + 5))
+    idx.refresh()
+    assert "(file changed since" in idx.outline(everything, "proj")
+    (proj / "docs" / "agreement.docx").unlink()
+    idx.refresh()
+    with idx._db() as c:
+        assert [r["path"] for r in c.execute("select path from notes")] == []  # gone with the file and folder
+    assert idx.set_note(everything, "proj", "README.md", "") == "note removed from proj › README.md"
+
+
+def test_project_read_suggests_paths_from_the_index(indexed):
+    from src.life.sources import build_source_tools
+
+    tools = {t.name: t for t in build_source_tools(indexed.srcs, suggest=indexed.idx.suggest)}
+    out, err = tools["project_read"].run({"name": "proj", "path": "docs/agrement.docx"})
+    assert err and 'Did you mean: "docs/agreement.docx"' in out
+    listing = tools["project_read"].run({"name": "proj", "path": "docs"})[0]
+    assert re.search(r"agreement\.docx \(1 KB, \d{4}-\d\d-\d\d\)", listing)
+
+
+def test_index_find_covers_the_board_logs_and_chat(indexed, store):
+    from src.life.clock import to_iso
+
+    idx = indexed.idx
+    store.add_item("work", "task", "Approve the supplier contract", due_date="2026-11-30")
+    store.add_log("fitness", "workout", 42, note="Run: 5 km by the harbour")
+    old = to_iso(utc_now() - timedelta(days=2))
+    with store._db() as c:
+        for direction, source, text in (("in", "user", "what's the supplier contract cap?"),
+                                        ("out", "chat", "The supplier contract caps you at 500."),
+                                        ("in", "user", "the supplier contract is signed")):
+            c.execute("insert into messages (direction, source, text, created_at) values (?, ?, ?, ?)",
+                      (direction, source, text, old))
+        c.execute("insert into messages (direction, source, text, created_at) values ('in', 'user', "
+                  "'supplier contract news', ?)", (to_iso(utc_now()),))
+    hit = idx.find(idx.scope_all("Francesco"), "supplier contract")
+    assert "board #" in hit and "[work] task (open): Approve the supplier contract; due 2026-11-30" in hit
+    assert 'Jarvis: "The supplier contract caps you at 500."' in hit and 'Francesco: "the supplier contract is signed"' in hit
+    assert "cap?" not in hit and "contract news" not in hit  # questions and this turn's own message aren't answers
+    assert "harbour" in idx.find(idx.scope_all(), "harbour")
+    fit = idx.find(idx.scope_for("fitness", "Fitness"), "supplier contract")
+    assert "board #" not in fit and "chat" not in fit  # another area's board; the chat is Jarvis's
+    assert "log " in idx.find(idx.scope_for("fitness", "Fitness"), "harbour")
+
+
+def test_index_github_only_repos(cfg, store, tmp_path, monkeypatch):
+    import base64
+
+    from src.life import sources
+    from src.life.index import Index
+    from src.life.sources import Source
+
+    calls = []
+
+    def fake_gh(endpoint):
+        calls.append(endpoint)
+        if "git/trees/HEAD" in endpoint:
+            return {"sha": "t1", "tree": [
+                {"path": "README.md", "type": "blob", "size": 40},
+                {"path": "src", "type": "tree"},
+                {"path": "src/billing.ts", "type": "blob", "size": 900},
+                {"path": ".env", "type": "blob", "size": 10},
+                {"path": "docs/Design Notes.md", "type": "blob", "size": 50},
+            ]}
+        if "commits?per_page=1" in endpoint:
+            return [{"commit": {"author": {"date": "2026-11-20T10:00:00Z"}}}]
+        if endpoint.endswith("contents/README.md"):
+            return {"content": base64.b64encode(b"# Remote\nStripe billing for teams").decode()}
+        if endpoint.endswith("contents/docs/Design%20Notes.md"):
+            return {"content": base64.b64encode(b"# Design\nQueue retries").decode()}
+        raise AssertionError(endpoint)
+
+    monkeypatch.setattr(sources, "_gh", fake_gh)
+    ensure_folders(cfg)
+    idx = Index(tmp_path / "i.db", Path(cfg["workspace"]["path"]), [Source("remote", "work", "Remote", github="o/r")])
+    assert idx.refresh()["remote"] == 3  # the .env never makes it in
+    every = idx.scope_all()
+    assert 'project_read name="remote" path="README.md"' in idx.find(every, "stripe billing")
+    assert "docs/Design Notes.md" in idx.find(every, "queue retries")
+    assert "src/billing.ts" in idx.find(every, "billing")  # code: its name, not its text
+    assert "last commit 2026-11-20" in idx.places_text(every)
+    n = len(calls)
+    idx.refresh()
+    assert len(calls) == n  # checked within the last 6 hours: no calls at all
+    idx.refresh(force=True)
+    assert len(calls) > n
+
+
+def test_agents_get_the_map_and_the_find_tools(cfg, store, clock, indexed):
+    fake = FakeAnthropic([_resp("end_turn", _block("text", text="ok"))] * 2)
+    agents = _agents(cfg, store, clock, fake)
+    agents.index, agents.sources = indexed.idx, indexed.srcs
+    assert {"find", "map", "map_note"} <= {t.name for t in agents.tools_for(agents.by_id["fitness"])}
+    agents.run("work", "Check what proj needs next")
+    first = fake.requests[0]
+    msg = first["messages"][0]["content"]
+    assert "WHERE THINGS ARE" in msg and "Your folder (Work/):" in msg and "brief.md" in msg
+    assert "- proj: My pottery shop" in msg and "Map of proj:" in msg and "agreement.docx" in msg
+    assert "call find first" in first["system"][0]["text"]
+    agents.run("fitness", "Plan the week")
+    msg = fake.requests[1]["messages"][0]["content"]
+    assert "plan.md" in msg and "proj" not in msg and "brief.md" not in msg
+
+
+def test_workspace_reads_documents_in_parts(tmp_path):
+    from src.tools import workspace as W
+
+    cfg = {"workspace": {"path": str(tmp_path / "ws")}}
+    (tmp_path / "ws").mkdir()
+    _docx(tmp_path / "ws" / "letter.docx", "Dear Francesco", "The lease renews in March.")
+    assert "The lease renews in March." in W.read_file(cfg, "letter.docx")
+    (tmp_path / "ws" / "long.md").write_text("\n".join(f"row {i} " + "y" * 90 for i in range(200)))
+    first = W.read_file(cfg, "long.md")
+    assert first.startswith("row 0") and "part 1 of" in first and "read part 2" in first
+    assert W.read_file(cfg, "long.md", part=2).startswith("row ")
+    (tmp_path / "ws" / "broken.pdf").write_bytes(b"not a pdf")
+    with pytest.raises(W.WorkspaceError, match="couldn't read"):
+        W.read_file(cfg, "broken.pdf")
 
 
 # ---------------------------------------------------------------- project trackers + folders

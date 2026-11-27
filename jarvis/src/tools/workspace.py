@@ -141,15 +141,27 @@ def edit_file(cfg: dict, name: str, find: str, replace: str) -> str:
     return f"edited {path.name}"
 
 
-def read_file(cfg: dict, name: str) -> str:
+def read_file(cfg: dict, name: str, part: int = 1) -> str:
+    """A file's text; PDFs, Word files, spreadsheets and slides as text too.
+    Long files come in numbered parts of _MAX_READ characters (the same
+    parts the index points to)."""
+    from .documents import DOC_EXT, document_text, is_text, part_text
+
     path = _resolve(cfg, name)
     if not path.exists():
         raise WorkspaceError(f"{path.name} doesn't exist")
+    if path.is_dir():
+        raise WorkspaceError(f"{path.name} is a folder; ws_list shows what's in it")
     data = path.read_bytes()
-    if b"\x00" in data[:8192]:
+    if path.suffix.lower() in DOC_EXT:
+        text = document_text(path.name, data)
+        if not is_text(text):
+            raise WorkspaceError(f"{path.name}: {text.strip('()')}")
+    elif b"\x00" in data[:8192]:
         raise WorkspaceError(f"{path.name} is a binary file; open it in Finder instead")
-    text = data.decode(errors="replace")
-    return text[:_MAX_READ] + ("\n...(truncated)" if len(text) > _MAX_READ else "")
+    else:
+        text = data.decode(errors="replace")
+    return part_text(text, part, _MAX_READ)
 
 
 def _listed(rel_parts: tuple[str, ...], trash: str) -> bool:
@@ -244,13 +256,17 @@ def build(cfg: dict) -> list[Tool]:
         ),
         Tool(
             name="ws_read_file",
-            description=f"Read a file from {loc}. Call before editing, or when asked what's in a file.",
+            description=(f"Read a file from {loc}; PDFs, Word files, spreadsheets and slides come back as "
+                         "text. Call before editing, or when asked what's in a file. Long files come in parts."),
             parameters={
                 "type": "object",
-                "properties": {"name": {"type": "string"}},
+                "properties": {
+                    "name": {"type": "string"},
+                    "part": {"type": "integer", "description": "for long files: which part, default 1"},
+                },
                 "required": ["name"],
             },
-            func=lambda name: read_file(cfg, name),
+            func=lambda name, part=1: read_file(cfg, name, part),
         ),
         Tool(
             name="ws_list",
