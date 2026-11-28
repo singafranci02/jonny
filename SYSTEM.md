@@ -298,6 +298,31 @@ you (Telegram / voice / website) ──► Jarvis ── delegate (parallel) ─
   Secret files are never read, and key-like strings are masked. Document
   reading (`src/tools/documents.py`) is shared, so a hit's "part 2" is the
   same part 2 the reader shows.
+- **Mac jobs: Claude Code does the work on the Mac** (`src/life/mac.py`).
+  Jarvis can read files, but can't change code or run things. `mac_task`
+  hands that kind of work to Claude Code, the CLI on the Mac mini. It runs
+  unattended in the project's folder, then reports back on Telegram:
+  - **Folders it can work in:** any project in the sources list that has a
+    local folder, plus `jarvis` (this code), `folder` (the iCloud folder) and
+    `mac` (the home folder).
+  - **Starting:** a job Jarvis proposes waits for a ▶ Start tap, unless his
+    message asked for it outright. `/mac project: task` starts one at once,
+    and `/mac` lists the jobs.
+  - **While it runs:** one card shows the live steps and a ■ Stop button.
+    When the job ends, the summary arrives as a reply to that card.
+  - **Follow-ups:** replying to the card or the summary continues the same
+    Claude Code session. Each job is an ordinary Claude Code session, so
+    `claude --resume <id>` in its folder opens it on the Mac too.
+  - **Limits:** auto permission mode with nobody to answer prompts. A deny
+    list blocks git push, `make push`/`install-*`, launchctl, sudo,
+    osascript and more, and a brief says to leave changes local and
+    uncommitted. One job runs per folder (two at most overall), and a job is
+    stopped after 60 minutes.
+  - **Account:** the CLI uses his Claude sign-in, never Jarvis's API key,
+    and the job's environment carries none of Jarvis's keys.
+  - **Restarts:** jobs are detached from the server, so a restart doesn't
+    stop them. The new server picks them up again from `life.db` and
+    `data/mac_jobs/<id>.jsonl`.
 - **Memory that survives restarts** (ideas from LangGraph, without the
   library): each area agent's runs are recorded in `agent_runs` as they
   happen (task, every verified change, report), and the agent sees its last
@@ -425,6 +450,7 @@ Jarvis/  (the brain)
     life/                Life HQ: area agents + delegate, reminders/tasks/logs (SQLite),
                          Telegram polling, scheduler + check-ins, /life/* API, `make life`,
                          index.py (find/map/map_note: where everything is)
+                         mac.py (mac_task: Claude Code jobs on the Mac, from Telegram)
   tests/                 `make test` (no network): the life organiser + turn-loop hooks
     context.py           assembles profile + memories + knowledge into the prompt
     wakeword/            "hey jarvis" gate + conversation window

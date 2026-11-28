@@ -434,10 +434,11 @@ class FakeTelegram:
         self.edit_keyboards, self.keyboard_edits = [], []
         self.fail = False
 
-    async def send(self, chat_id, text, keyboard=None):
+    async def send(self, chat_id, text, keyboard=None, reply_to=None):
         if self.fail:
             raise RuntimeError("telegram down")
         self.sent.append((chat_id, text, keyboard))
+        self.replies_to = [*getattr(self, "replies_to", []), reply_to]
         return len(self.sent)
 
     async def typing(self, chat_id):
@@ -2080,3 +2081,243 @@ def test_last_tool_round_asks_for_an_answer():
     assert "That was the last tool call this turn" in last_results[-1]["out"]
     assert "last tool call" not in json.dumps(llm.calls[-2]["messages"][-1]["content"])
     assert resp.text == "Sorry, I couldn't finish working that one out."  # it still called a tool: fallback
+
+
+# ---------------------------------------------------------------- Mac jobs (Claude Code on the Mac)
+
+FAKE_CLAUDE = r"""#!{python}
+# stands in for the Claude Code CLI: records how it was started, then acts out the brief
+import json, os, sys, time
+brief = sys.stdin.read()
+with open(os.environ["FAKE_CLAUDE_LOG"], "a") as f:
+    f.write(json.dumps({{"argv": sys.argv[1:], "cwd": os.getcwd(), "brief": brief,
+                         "env": sorted(os.environ)}}) + "\n")
+def say(e):
+    print(json.dumps(e), flush=True)
+if "fail" in brief:
+    print("Not logged in · Please run /login", file=sys.stderr)
+    sys.exit(1)
+say({{"type": "system", "subtype": "init", "model": "claude-opus-5-5", "permissionMode": "auto"}})
+path = os.path.join(os.getcwd(), "notes.txt")
+say({{"type": "assistant", "message": {{"content": [
+    {{"type": "tool_use", "name": "Bash", "input": {{"command": "ls", "description": "Look around"}}}},
+    {{"type": "tool_use", "name": "Edit", "input": {{"file_path": path}}}}]}}}})
+open(path, "w").write("hi")
+if "sleep" in brief:
+    time.sleep(30)
+if "background" in brief:  # answers, waits on a background task, answers again: one run
+    say({{"type": "result", "subtype": "success", "is_error": False, "result": "Waiting on the build."}})
+    time.sleep(1)
+say({{"type": "assistant", "message": {{"content": [{{"type": "text", "text": "Working on it."}}]}}}})
+say({{"type": "result", "subtype": "success", "is_error": False, "result": "Added notes.txt. Nothing left for you.",
+      "total_cost_usd": 0.12, "num_turns": 3}})
+"""
+
+
+@pytest.fixture
+def mac_env(tmp_path, cfg, store, clock, monkeypatch):
+    import sys
+
+    from src.life.mac import MacJobs
+    from src.life.sources import Source
+
+    claude = tmp_path / "bin" / "claude"
+    claude.parent.mkdir()
+    claude.write_text(FAKE_CLAUDE.format(python=sys.executable))
+    claude.chmod(0o755)
+    log = tmp_path / "claude-calls.jsonl"
+    monkeypatch.setenv("FAKE_CLAUDE_LOG", str(log))
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-not-for-jobs")
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "not-for-jobs")
+    shop, root = tmp_path / "shop", tmp_path / "Jarvis"
+    shop.mkdir(), root.mkdir()
+    cfg["life"]["mac"] = {"claude": str(claude), "jobs_dir": str(tmp_path / "jobs")}
+    mac = MacJobs(store, clock, root, [Source("shop", "projects", "My pottery shop", shop),
+                                       Source("jarvis", "projects", "Jarvis", tmp_path / "public-copy")],
+                  cfg, folder=Path(cfg["workspace"]["path"]), owner="Francesco")
+
+    def calls():
+        return [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
+
+    return SimpleNamespace(mac=mac, shop=shop, root=root, calls=calls)
+
+
+def _until(mac, job_id, statuses, timeout=15.0):
+    end = time.monotonic() + timeout
+    while time.monotonic() < end:
+        mac.tick()
+        job = mac.get(job_id)
+        if job["status"] in statuses:
+            return job
+        time.sleep(0.05)
+    raise AssertionError(f"job {job_id} still {mac.get(job_id)['status']}")
+
+
+def test_mac_job_runs_claude_code_unattended_and_reports(mac_env):
+    from src.life import mac as macjobs
+
+    mac = mac_env.mac
+    tools = {t.name: t for t in macjobs.build_mac_tools(mac)}
+    out, err = tools["mac_task"].run({"task": "add a note", "project": "shop", "run_now": True})
+    assert not err and "Mac job #1 in shop: starting now" in out
+    job = _until(mac, 1, ("done", "failed"))
+    assert job["status"] == "done", job
+    assert job["summary"] == "Added notes.txt. Nothing left for you."
+    assert job["files"] == ["notes.txt"] and job["steps"] == 2 and (mac_env.shop / "notes.txt").exists()
+
+    call = mac_env.calls()[0]
+    argv = call["argv"]
+    assert call["cwd"] == str(mac_env.shop.resolve()) and call["brief"] == "add a note"
+    assert argv[:1] == ["-p"] and "add a note" not in argv  # the brief goes in on stdin
+    assert argv[argv.index("--permission-mode") + 1] == "auto"
+    assert argv[argv.index("--permission-prompts") + 1] == "none"
+    assert argv[argv.index("--session-id") + 1] == job["session_id"]
+    deny = json.loads(argv[argv.index("--settings") + 1])["permissions"]["deny"]
+    assert "Bash(git push:*)" in deny and "Bash(launchctl:*)" in deny
+    rules = argv[argv.index("--append-system-prompt") + 1]
+    assert "unattended on Francesco's Mac mini" in rules and "Never push, deploy" in rules
+    # none of Jarvis's keys reach the job (an API key would also bill the API, not his plan)
+    assert "ANTHROPIC_API_KEY" not in call["env"] and "TELEGRAM_BOT_TOKEN" not in call["env"]
+
+    text, kb = macjobs.card(job)
+    assert text.startswith("🖥 #1 shop · ✅ done in") and "2 steps" in text and kb is None
+    assert macjobs.report(job).startswith("✅ #1 shop\nAdded notes.txt.") and "reply to keep going" in macjobs.report(job)
+    out, _ = tools["mac_jobs"].run({"job_id": 1})
+    assert "Changed: notes.txt" in out and f"claude --resume {job['session_id']}" in out
+    assert "#1 shop · done" in tools["mac_jobs"].run({})[0]
+
+    targets = mac.targets()
+    assert targets["jarvis"].cwd == mac_env.root and targets["mac"].cwd == Path.home()
+    assert targets["jarvis"].extra and "folder" in targets
+    out, err = tools["mac_task"].run({"task": "x", "project": "nope"})
+    assert err and "one of: mac, folder, shop, jarvis" in out
+
+
+def test_mac_job_waits_for_a_tap_one_per_folder_and_stops(mac_env):
+    import os
+
+    mac = mac_env.mac
+    job = mac.create("shop", "sleep on it")
+    mac.tick()
+    assert mac.get(job["id"])["status"] == "proposed" and mac_env.calls() == []  # nothing runs untapped
+    assert mac.approve(job["id"])["status"] == "queued"
+    running = _until(mac, job["id"], ("running",))
+    second = mac.follow_up(running, "and then tidy up")  # same folder: waits its turn
+    mac.tick()
+    assert mac.get(second["id"])["status"] == "queued"
+    _until(mac, job["id"], ("running",))
+    end = time.monotonic() + 10
+    while mac.get(job["id"])["steps"] < 2 and time.monotonic() < end:
+        mac.tick()
+        time.sleep(0.05)
+    stopped = mac.stop(job["id"])
+    assert stopped["status"] == "stopped" and stopped["reported"] == 1 and stopped["files"] == ["notes.txt"]
+    with pytest.raises(ProcessLookupError):
+        os.kill(running["pid"], 0)
+    nxt = _until(mac, second["id"], ("done",))  # the folder is free: the follow-up starts
+    assert nxt["session_id"] == job["session_id"] and len(mac_env.calls()) == 2
+    argv = mac_env.calls()[-1]["argv"]
+    assert argv[argv.index("--resume") + 1] == job["session_id"] and "--session-id" not in argv
+    assert mac_env.calls()[-1]["brief"] == "and then tidy up"
+
+
+def test_mac_job_follow_ups_and_failures(mac_env):
+    mac = mac_env.mac
+    proposed = mac.create("jarvis", "fix the test")
+    same = mac.follow_up(proposed, "and the docs")
+    assert same["id"] == proposed["id"] and same["task"] == "fix the test\n\nAlso: and the docs"
+
+    bad = mac.create("mac", "fail please", start=True)
+    bad = _until(mac, bad["id"], ("failed",))
+    assert "isn't signed in on the Mac" in bad["error"] and bad["reported"] == 0
+    from src.life.mac import report
+
+    assert report(bad).startswith("⚠ #2 mac: Claude Code isn't signed in")
+    cancelled = mac.cancel(proposed["id"])
+    assert cancelled["status"] == "cancelled" and cancelled["reported"] == 1
+    assert [j["id"] for j in mac.to_show()] == [bad["id"]]  # ended + unreported: its summary is still owed
+
+    bg = mac.create("shop", "background build", start=True)
+    mac.tick()
+    out, end = mac.dir / f"{bg['id']}.jsonl", time.monotonic() + 10
+    while not (out.exists() and "Waiting on the build" in out.read_text()):
+        assert time.monotonic() < end
+        time.sleep(0.05)
+    mac.tick()
+    assert mac.get(bg["id"])["status"] == "running"  # its first answer isn't the end
+    bg = _until(mac, bg["id"], ("done",))
+    assert bg["summary"] == "Added notes.txt. Nothing left for you."  # the last answer is the summary
+
+    mac.claude_path = str(mac_env.root / "missing")
+    gone = mac.create("shop", "anything", start=True)
+    gone = _until(mac, gone["id"], ("failed",))
+    assert "isn't installed" in gone["error"]
+
+
+def test_service_runs_mac_jobs_on_telegram(mac_env, cfg, store, clock, monkeypatch):
+    svc = _service(cfg, store, clock, monkeypatch)
+    svc.mac = svc.life.mac = mac_env.mac
+    mac = mac_env.mac
+
+    def sweep_until(job_id, statuses):
+        end = time.monotonic() + 15
+        while time.monotonic() < end:
+            asyncio.run(svc.mac_sweep())
+            if mac.get(job_id)["status"] in statuses:
+                asyncio.run(svc.mac_sweep())
+                return mac.get(job_id)
+            time.sleep(0.05)
+        raise AssertionError(mac.get(job_id))
+
+    job = mac.create("shop", "add a note")  # what Jarvis's mac_task makes
+    svc._replying = 1
+    asyncio.run(svc.mac_sweep())
+    assert svc.tg.sent == []  # Jarvis's reply goes first
+    svc._replying = 0
+    asyncio.run(svc.mac_sweep())
+    _, text, kb = svc.tg.sent[0]
+    assert text == "🖥 #1 shop\nadd a note"
+    assert [b["callback_data"] for b in kb["inline_keyboard"][0]] == ["mj:1:go", "mj:1:x"]
+    card_id = mac.get(job["id"])["card_id"]
+
+    tap = {"id": "q1", "data": "mj:1:go", "message": {"message_id": card_id, "chat": {"id": 42}}}
+    asyncio.run(svc._on_button(tap))
+    assert svc.tg.answers[-1] == "▶ Starting"
+    done = sweep_until(job["id"], ("done",))
+    assert svc.tg.edits[-1].startswith("🖥 #1 shop · ✅ done")
+    report_text = svc.tg.sent[-1][1]
+    assert report_text.startswith("✅ #1 shop\nAdded notes.txt") and svc.tg.replies_to[-1] == card_id
+    assert done["reported"] == 1 and done["result_id"] == len(svc.tg.sent)
+    asyncio.run(svc.mac_sweep())
+    assert sum(1 for _, t, _ in svc.tg.sent if t.startswith("✅")) == 1  # the summary goes once
+    assert [m["source"] for m in store.unseen_outbound()] == ["mac"]  # Jarvis sees it with the next message
+
+    # a reply to the summary is the job's next instruction, in the same session
+    msg = {"message_id": 99, "chat": {"id": 42}, "text": "now make it say hello",
+           "reply_to_message": {"message_id": done["result_id"]}}
+    asyncio.run(svc._on_message(msg))
+    follow = mac.recent(1)[0]
+    assert follow["parent_id"] == job["id"] and follow["resume"] == 1 and follow["status"] == "queued"
+    sweep_until(follow["id"], ("done",))
+    assert mac_env.calls()[-1]["brief"] == "now make it say hello"
+    assert svc.session.calls == []  # no Jarvis turn for any of it
+
+    # /mac project: task starts at once (typing it is the go-ahead); /mac alone lists
+    asyncio.run(svc._on_message({"message_id": 100, "chat": {"id": 42}, "text": "/mac shop: tidy the folder"}))
+    direct = mac.recent(1)[0]
+    assert direct["target"] == "shop" and direct["task"] == "tidy the folder" and direct["status"] == "queued"
+    sweep_until(direct["id"], ("done",))
+    asyncio.run(svc._on_message({"message_id": 101, "chat": {"id": 42}, "text": "/mac"}))
+    assert "Projects: mac, folder, shop, jarvis" in svc.tg.sent[-1][1] and "#3 shop · done" in svc.tg.sent[-1][1]
+    assert svc.status_dict()["mac"]["claude"].endswith("claude")
+
+
+def test_mac_command_parsing():
+    from src.life.mac import parse_command
+
+    names = {"mac", "shop", "jarvis"}
+    assert parse_command("/mac shop: tidy up", names) == ("shop", "tidy up")
+    assert parse_command("/mac jarvis fix the test", names) == ("jarvis", "fix the test")
+    assert parse_command("/mac clean my downloads", names) == (None, "clean my downloads")
+    assert parse_command("/mac note: buy milk", names) == (None, "note: buy milk")
+    assert parse_command("/mac@Bot", names) == (None, "")

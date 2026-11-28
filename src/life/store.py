@@ -618,7 +618,7 @@ class LifeStore:
         return out
 
     def unseen_outbound(self) -> list[dict]:
-        """Check-ins and reminders sent since the user last wrote (within 24h):
+        """Check-ins, reminders and Mac job summaries sent since the user last wrote (within 24h):
         the text conversation never saw these, so they ride along as context
         with the next message ("7h, ran 30 min" makes sense after the check-in)."""
         since = to_iso(utc_now() - timedelta(hours=24))
@@ -628,7 +628,7 @@ class LifeStore:
                 "select max(id) as id from messages where direction = 'in' and source = 'user'"
             ).fetchone()["id"] or 0
             rows = c.execute(
-                "select * from messages where direction = 'out' and source in ('checkin', 'reminder') "
+                "select * from messages where direction = 'out' and source in ('checkin', 'reminder', 'mac') "
                 "and id > ? and created_at > ? order by id asc limit 6",
                 (last_in, since),
             ).fetchall()
