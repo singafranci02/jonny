@@ -153,6 +153,15 @@ life:
   # folder + the projects above) behind find/map/map_note. Rebuildable, never
   # backed up; refreshed on start and every 10 minutes. Code: src/life/index.py
   index_db: data/index.db
+  # Mac jobs: what he texts Jarvis, done by Claude Code on this Mac (src/life/mac.py).
+  # The claude CLI, signed in with his Claude account (never Jarvis's API key),
+  # works unattended in the project's folder; push/deploy/restart are always denied.
+  mac:
+    enabled: true
+    claude: ""                # path to the claude CLI; empty = PATH, then the VS Code extension's copy
+    model: ""                 # empty = Claude Code's own default
+    max_minutes: 60           # a job still running after this is stopped
+    max_running: 2            # and never two in the same folder
   inbox: Inbox
   backup_keep: 14             # nightly copies of the database in Jarvis/_backups
   coordinator_tier: coordinator   # Jarvis on Telegram, the dashboard and check-ins

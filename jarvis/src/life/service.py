@@ -15,11 +15,13 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
+import time
 from dataclasses import dataclass
 from datetime import timedelta
 
 from ..context import Conversation
-from . import board, coach as coaching
+from . import board, coach as coaching, mac as macjobs
 from .areas import ensure_folders, folder_status, full_disk_access_target, workspace_root
 from .clock import from_iso, parse_days, to_iso, utc_now
 from .telegram import TelegramClient, TelegramError, reminder_keyboard
@@ -31,6 +33,8 @@ log = logging.getLogger("jarvis.life")
 INFLIGHT = "inflight_turns"  # Telegram messages whose reply is being worked on
 RESUME_WINDOW = timedelta(minutes=20)  # older than this, just tell him instead
 STRAVA_EVERY = timedelta(minutes=30)
+MAC_BUSY_S, MAC_IDLE_S = 3, 15  # how often the Mac jobs are looked at, with and without one running
+MAC_EDIT_EVERY = 8  # seconds between edits of a running job's card
 MENU_NEWS = {  # what the one-off message says when the menu bar changes
     1: "Buttons are ready below. 📋 Board for your projects, 📝 Log for sleep, mood and training.",
     2: "New: 🏋 Train. Six taps set up your program; then each day shows the session to do.",
@@ -55,9 +59,10 @@ HELP = (
     "➕ Add: a new project\n"
     "📅 Today: what's on\n"
     "📝 Log: sleep, mood, training in one tap\n"
-    "/strava: connect Strava, so workouts log themselves\n\n"
+    "/strava: connect Strava, so workouts log themselves\n"
+    "/mac: jobs for Claude Code on the Mac mini (\"/mac jarvis: fix the failing test\" starts one)\n\n"
     "Text works too: \"remind me to call mum Sunday 6pm\", \"plan my training week\", "
-    "\"work on YardBird: draft the founder contributions note\""
+    "\"work on YardBird: draft the founder contributions note\", \"on the Mac: tidy my Downloads\""
 )
 
 
@@ -123,6 +128,10 @@ class LifeService:
             "last_poll": None,
         }
         self._tasks: list[asyncio.Task] = []
+        self.mac = getattr(self.life, "mac", None)
+        self._mac_kick = asyncio.Event()
+        self._mac_shown: dict[int, tuple[str, float]] = {}  # card text last shown, and when
+        self._replying = 0  # Jarvis replies in flight: a new job's card waits for the reply to go first
 
     # ---------------- lifecycle ----------------
 
@@ -140,6 +149,8 @@ class LifeService:
         if self.life.index is not None:  # build the index now, in its own thread
             self.life.index.refresh_soon(min_age=0)
         self._tasks.append(asyncio.ensure_future(self._scheduler_loop()))
+        if self.mac is not None and self.mac.enabled:
+            self._tasks.append(asyncio.ensure_future(self._mac_loop()))
 
     async def stop(self) -> None:
         for t in self._tasks:
@@ -169,10 +180,8 @@ class LifeService:
                 "life_overview before adding or changing anything so nothing is duplicated, then reply as normal."
             )
         if outside:
-            lines = [
-                f"- {'reminder' if m['source'] == 'reminder' else 'check-in'}: {m['text'][:600]}"
-                for m in outside
-            ]
+            kinds = {"reminder": "reminder", "mac": "Mac job report"}
+            lines = [f"- {kinds.get(m['source'], 'check-in')}: {m['text'][:600]}" for m in outside]
             parts.append("Since your last exchange, the user was sent:\n" + "\n".join(lines))
         parts.append(
             f"[{self.clock.label_now()}] Channel: {channel} (text chat, not voice). Text like a person "
@@ -301,9 +310,17 @@ class LifeService:
         if text == board.MENU_LOG:
             await self.tg.send(chat_id, "Log today:", board.log_keyboard(await self._log_values()))
             return
+        if self.mac is not None and re.match(r"/mac(@\w+)?(\s|$)", text, re.I):
+            await self._on_mac_command(chat_id, text)
+            return
         reply_to = (msg.get("reply_to_message") or {}).get("message_id")
         if reply_to and await self._answer_prompt(chat_id, reply_to, text):
             return
+        if reply_to and self.mac is not None:
+            job = await asyncio.to_thread(self.mac.by_message, reply_to)
+            if job is not None:  # a reply to a job's card or summary: the job's next instruction
+                await self._mac_follow_up(chat_id, job, text)
+                return
         if text == board.MENU_TODAY or text.startswith("/today"):
             await asyncio.to_thread(self.store.log_message, "in", "command", text)
             summary = await asyncio.to_thread(self.store.today_text, lambda a: self.labels.get(a, a))
@@ -318,22 +335,27 @@ class LifeService:
         checkpoint is still there when Jarvis starts again (resume_cut_off)."""
         await self._checkpoint(key, {"key": key, "text": text, "at": to_iso(utc_now()), "resumed": resumed})
         typing = asyncio.ensure_future(self._keep_typing())
+        self._replying += 1
         try:
-            reply = await self.chat(text, "telegram", resumed=resumed)
-        except Exception as e:
-            log.exception("chat turn failed")
-            reply = f"Sorry, something went wrong on my side ({type(e).__name__}). Try again in a moment."
+            try:
+                reply = await self.chat(text, "telegram", resumed=resumed)
+            except Exception as e:
+                log.exception("chat turn failed")
+                reply = f"Sorry, something went wrong on my side ({type(e).__name__}). Try again in a moment."
+            finally:
+                typing.cancel()
+            # skipped when a shutdown cancels the turn: the checkpoint stays
+            await self._checkpoint(key, None)
+            try:
+                await self.tg.send(chat_id, reply)  # retries transient failures itself
+            except Exception as e:
+                log.error("reply not delivered: %s", e)
+                await asyncio.to_thread(
+                    self.store.log_message, "out", "system", f"(This reply couldn't be delivered to Telegram: {e})"
+                )
         finally:
-            typing.cancel()
-        # skipped when a shutdown cancels the turn: the checkpoint stays
-        await self._checkpoint(key, None)
-        try:
-            await self.tg.send(chat_id, reply)  # retries transient failures itself
-        except Exception as e:
-            log.error("reply not delivered: %s", e)
-            await asyncio.to_thread(
-                self.store.log_message, "out", "system", f"(This reply couldn't be delivered to Telegram: {e})"
-            )
+            self._replying -= 1
+            self._mac_kick.set()  # a job this turn made: its card goes now, after the reply
 
     async def _checkpoint(self, key: str, entry: dict | None) -> None:
         async with self._inflight_lock:
@@ -500,6 +522,12 @@ class LifeService:
             except Exception as e:
                 log.exception("coach button %r failed", q.get("data"))
                 await self.tg.answer_callback(q["id"], f"Couldn't: {e}"[:190])
+        elif action == "mj" and self.mac is not None:
+            try:
+                await self._on_mac_button(q, message, chat_id, rest)
+            except Exception as e:
+                log.exception("mac button %r failed", q.get("data"))
+                await self.tg.answer_callback(q["id"], f"Couldn't: {e}"[:190])
         elif action in ("bd", "pj", "ps", "pn", "pa", "pc", "lg", "tk"):
             try:
                 await self._on_board_button(q, message, chat_id, action, rest)
@@ -532,6 +560,116 @@ class LifeService:
         await asyncio.to_thread(
             self.store.log_message, "in", "button", f"{status}: {reminder['text']}", reminder["area"]
         )
+
+    # ---------------- Mac jobs: Claude Code on this Mac (see mac.py) ----------------
+
+    async def _mac_loop(self) -> None:
+        while True:
+            try:
+                await self.mac_sweep()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("mac sweep failed")
+            try:
+                busy = await asyncio.to_thread(self.mac.busy)
+                await asyncio.wait_for(self._mac_kick.wait(), timeout=MAC_BUSY_S if busy else MAC_IDLE_S)
+            except asyncio.TimeoutError:
+                pass
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                await asyncio.sleep(MAC_IDLE_S)
+            self._mac_kick.clear()
+
+    async def mac_sweep(self) -> None:
+        """Run the jobs (start, follow, end), then bring Telegram up to date:
+        each active job's card, and each ended job's summary, once."""
+        await asyncio.to_thread(self.mac.tick)
+        if not self.can_message():
+            return
+        for job in await asyncio.to_thread(self.mac.to_show):
+            await self._mac_card(job)
+            if job["status"] in macjobs.ENDED and not job["reported"]:
+                await self._mac_report(job)
+
+    async def _mac_card(self, job: dict, force: bool = False) -> None:
+        text, keyboard = macjobs.card(job)
+        if job["card_id"] is None:
+            if job["status"] not in macjobs.ACTIVE or self._replying:
+                return  # an ended job just gets its summary; a new one waits for Jarvis's reply
+            mid = await self.tg.send(self.owner_chat, text, keyboard)
+            await asyncio.to_thread(self.mac.update, job["id"], card_id=mid)
+            self._mac_shown[job["id"]] = (text, time.monotonic())
+            return
+        shown, at = self._mac_shown.get(job["id"], (None, 0.0))
+        if text == shown:
+            return
+        if job["status"] == "running" and not force and time.monotonic() - at < MAC_EDIT_EVERY:
+            return
+        await self.tg.edit_text(self.owner_chat, job["card_id"], text, keyboard)
+        self._mac_shown[job["id"]] = (text, time.monotonic())
+
+    async def _mac_report(self, job: dict) -> None:
+        text = macjobs.report(job)
+        mid = await self.tg.send(self.owner_chat, text, reply_to=job["card_id"])
+        await asyncio.to_thread(self.mac.update, job["id"], reported=1, result_id=mid)
+        await asyncio.to_thread(self.store.log_message, "out", "mac", text)
+        self._mac_shown.pop(job["id"], None)
+
+    async def _on_mac_button(self, q: dict, message: dict, chat_id: int, rest: str) -> None:
+        jid, _, op = rest.partition(":")
+        job = await asyncio.to_thread(self.mac.get, int(jid)) if jid.isdigit() else None
+        if job is None:
+            await self.tg.answer_callback(q["id"], "That job no longer exists.")
+            return
+        if job["card_id"] is None:
+            await asyncio.to_thread(self.mac.update, job["id"], card_id=message.get("message_id"))
+        before = job["status"]
+        if op == "go":
+            job = await asyncio.to_thread(self.mac.approve, job["id"])
+        elif op == "x":
+            job = await asyncio.to_thread(self.mac.cancel, job["id"])
+        elif op == "stop":
+            job = await asyncio.to_thread(self.mac.stop, job["id"])
+        label = {"queued": "▶ Starting", "cancelled": "✖ Cancelled", "stopped": "■ Stopped"}.get(job["status"])
+        if job["status"] == before or label is None:
+            label = f"It's {job['status']} already"
+        else:
+            await asyncio.to_thread(self.store.log_message, "in", "button", f"{label}: Mac job #{job['id']}")
+        await self.tg.answer_callback(q["id"], label)
+        await self._mac_card({**job, "card_id": message.get("message_id")}, force=True)
+        self._mac_kick.set()
+
+    async def _mac_follow_up(self, chat_id: int, job: dict, text: str) -> None:
+        await asyncio.to_thread(self.store.log_message, "in", "mac", f"(to Mac job #{job['id']}) {text}")
+        try:
+            new = await asyncio.to_thread(self.mac.follow_up, job, text, True)
+        except Exception as e:
+            await self.tg.send(chat_id, f"Couldn't: {e}")
+            return
+        if new["id"] == job["id"]:  # not started yet: it went into the brief
+            await self._mac_card(new, force=True)
+        self._mac_kick.set()
+
+    async def _on_mac_command(self, chat_id: int, text: str) -> None:
+        """/mac lists the jobs; /mac [project:] task starts one now (typing it is the go-ahead)."""
+        await asyncio.to_thread(self.store.log_message, "in", "command", text)
+        targets = self.mac.targets()
+        project, task = macjobs.parse_command(text, targets)
+        if not task:
+            jobs = await asyncio.to_thread(self.mac.recent, 5)
+            lines = [f"#{j['id']} {j['target']} · {j['status']}: {macjobs._short(j['task'], 60)}" for j in jobs]
+            await self.tg.send(chat_id, (
+                "/mac project: task, and Claude Code does it on the Mac now. Projects: " + ", ".join(targets)
+                + "\n\n" + ("\n".join(lines) or "No jobs yet.")))
+            return
+        try:
+            await asyncio.to_thread(self.mac.create, project or macjobs.GENERAL, task, True)
+        except Exception as e:
+            await self.tg.send(chat_id, f"Couldn't: {e}")
+            return
+        self._mac_kick.set()
 
     # ---------------- board, menu and tap-to-log (no model calls) ----------------
 
@@ -839,6 +977,7 @@ class LifeService:
             "full_disk_access_target": full_disk_access_target(),
             "timezone": self.clock.tz_name,
             "index": self.life.index.status() if self.life.index is not None else None,
+            "mac": self.mac.status() if self.mac is not None else None,
             "coordinator_model": self.cfg["llm"]["tiers"][self.coordinator_tier]["model"],
             "area_model": self.cfg["llm"]["tiers"].get(self.life.agents.tier_name, {}).get("model"),
             "checkins": [

@@ -9,8 +9,9 @@
 attach(session) gives a Session the life tools, the delegate tool, the
 read-only project_* tools over his other projects (sources.py; each area
 agent sees only its own area's) and find/map/map_note over the index of
-everything readable (index.py). The server additionally runs LifeService
-(Telegram + scheduler); see service.py.
+everything readable (index.py), and mac_task/mac_jobs to hand work to Claude
+Code on the Mac (mac.py). The server additionally runs LifeService
+(Telegram + scheduler, and it runs the Mac jobs); see service.py.
 """
 
 from __future__ import annotations
@@ -23,6 +24,7 @@ from .areas import Area, load_areas, workspace_root
 from .clock import Clock
 from .coach import Coach, build_coach_tools
 from .index import Index, build_index_tools
+from .mac import MacJobs, build_mac_tools
 from .sources import Source, build_source_tools, load_sources
 from .store import LifeStore
 from .strava import Strava, build_strava_tools
@@ -39,6 +41,7 @@ class LifeContext:
     strava: Strava | None = None
     coach: Coach | None = None
     index: Index | None = None
+    mac: MacJobs | None = None
 
 
 def system_timezone() -> str | None:
@@ -79,8 +82,10 @@ def make_context(cfg: dict, base_tools: list) -> LifeContext:
     # search from anywhere else refreshes it lazily when it's stale
     index = Index(ROOT / lcfg.get("index_db", "data/index.db"), workspace_root(cfg), sources, store)
     agents.strava, agents.coach, agents.index = strava, coach, index
+    # work for Claude Code on this Mac: jobs live in life.db; only the server runs them
+    mac = MacJobs(store, clock, ROOT, sources, cfg, folder=workspace_root(cfg), owner=lcfg.get("owner", "the user"))
     return LifeContext(clock=clock, store=store, areas=areas, agents=agents, sources=sources, strava=strava,
-                       coach=coach, index=index)
+                       coach=coach, index=index, mac=mac)
 
 
 def attach(session) -> LifeContext:
@@ -92,5 +97,6 @@ def attach(session) -> LifeContext:
     session.tools.extend(build_index_tools(ctx.index, ctx.index.scope_all(owner)))
     session.tools.extend(build_strava_tools(ctx.strava))
     session.tools.extend(build_coach_tools(ctx.coach))
+    session.tools.extend(build_mac_tools(ctx.mac))
     session.tools.append(ctx.agents.delegate_tool())
     return ctx

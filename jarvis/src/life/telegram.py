@@ -84,9 +84,10 @@ class TelegramClient:
                     raise
                 await asyncio.sleep(RETRY_DELAYS[attempt])
 
-    async def send(self, chat_id: int, text: str, keyboard: dict | None = None) -> int | None:
+    async def send(self, chat_id: int, text: str, keyboard: dict | None = None,
+                   reply_to: int | None = None) -> int | None:
         """Plain text (no parse_mode, so agent text can't break formatting).
-        Buttons go on the last chunk."""
+        Buttons go on the last chunk; reply_to threads it under that message."""
         parts = chunks(text)
         last = None
         for i, part in enumerate(parts):
@@ -95,6 +96,8 @@ class TelegramClient:
                 text=part,
                 link_preview_options={"is_disabled": True},
                 reply_markup=keyboard if i == len(parts) - 1 else None,
+                reply_parameters={"message_id": reply_to, "allow_sending_without_reply": True}
+                if reply_to and i == 0 else None,
             )
             last = msg.get("message_id") if isinstance(msg, dict) else None
         return last
